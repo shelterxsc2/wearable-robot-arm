@@ -1,6 +1,4 @@
-DM-J4310-2EC-master/
-dm-mc02-master/
-LFD-01M舵机/
+
 # Build artifacts
 *.o
 *.out
@@ -37,3 +35,18 @@ host-rk3588/calib/images/
 # OS
 .DS_Store
 Thumbs.db
+
+# Documentation folder
+docs/
+
+# Keil MDK build artifacts
+*.crf
+*.d
+*.dep
+*.lnp
+*.sct
+*.map
+*.htm
+*.axf
+*.iex
+*.lst
