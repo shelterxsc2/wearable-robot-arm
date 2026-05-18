@@ -194,7 +194,7 @@ void Robotic_Arm_Control(void)
     }
     else if (Joint_Fore_Start_Complete == 1)
     {
-        LK4005_Motor_Handle[0].Motor_Position_Target = 3.14f + floorf(LK4005_Motor_Handle[0].Motor_Position_PID_Control_Handle.Motor_Position_Actual / (2.0f * PI)) * 2.0f * PI;
+        LK4005_Motor_Handle[0].Motor_Position_Target = 1.57f + floorf(LK4005_Motor_Handle[0].Motor_Position_PID_Control_Handle.Motor_Position_Actual / (2.0f * PI)) * 2.0f * PI;
         LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
         Joint_Fore_Start_Complete = 2;
     }

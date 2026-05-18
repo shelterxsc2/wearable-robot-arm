@@ -10,9 +10,8 @@ extern uint8_t Usart_Used0_Rx_Buff[];
 #define Communication_Usart_Instance_Used0 USART1
 #define Usart_Used0_Rx_Buff_Length 10
 #define Usart_Used0_Tx_Buff_Length 64
-#define Usart_Used0_Transmit_Cycle 20
 
 void Communication_Usart_Init(void);
-void Communication_Test(void);
+void Communication_Usart(void);
 
 #endif

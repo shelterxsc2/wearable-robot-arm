@@ -26,6 +26,22 @@ typedef enum
 
 typedef struct
 {
+    float Roll_Target;
+    float Pitch_Target;
+    float Yaw_Target;
+    float X_Target;
+    float Y_target;
+    float Z_target;
+    float Roll_Actual;
+    float Pitch_Actual;
+    float Yaw_Actual;
+    float X_Actual;
+    float Y_Actual;
+    float Z_Actual;
+} FaceBased_Data_t;
+
+typedef struct
+{
     float Accel_X;
     float Accel_Y;
     float Accel_Z;

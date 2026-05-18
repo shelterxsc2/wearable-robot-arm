@@ -184,3 +184,13 @@ void Coordinate_Inverse_Settlement(float X, float Y, float Z, float Servo_Angle,
         *Joint_Fore_Angle = Normalize_Angle(temp + Angle_Joint_Fore_Offset - L2_Angle_Virtual);
     }
 }
+
+void Face_Coordinate_Settlement(FaceBased_Data_t FaceBased_Data, float *Gimbal_Angle_Target, float *Joint_Upper_Angle_Target, float *Joint_Fore_Angle_Target,float *Servo_Pitch_Angle_Target,float *Servo_Yaw_Angle_Target)
+{
+    /*
+    具体加减符号根据坐标系确定,还未定下来
+    */
+    *Servo_Pitch_Angle_Target += FaceBased_Data.Pitch_Target - FaceBased_Data.Pitch_Actual;
+    *Servo_Yaw_Angle_Target += FaceBased_Data.Yaw_Target - FaceBased_Data.Yaw_Actual;
+
+}

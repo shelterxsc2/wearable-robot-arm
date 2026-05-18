@@ -1,6 +1,6 @@
 Dependencies for Project 'RoboticArmControlProject', Target 'RoboticArmControlProject': (DO NOT MODIFY !)
 F (startup_stm32h723xx.s)(0x69FC5ABD)(--cpu Cortex-M7.fp.dp -g --apcs=interwork -I.\RTE\_RoboticArmControlProject-IF:\ARM\PACK\ARM\CMSIS\5.0.1\CMSIS\Include-IF:\ARM\PACK\Keil\STM32H7xx_DFP\3.1.1\Drivers\CMSIS\Device\ST\STM32H7xx\Include--pd "__UVISION_VERSION SETA 524" --pd "_RTE_ SETA 1" --pd "STM32H723xx SETA 1"--list startup_stm32h723xx.lst --xref -o roboticarmcontrolproject\startup_stm32h723xx.o --depend roboticarmcontrolproject\startup_stm32h723xx.d)
-F (../Core/Src/main.c)(0x6A05DC47)(--c99 -c --cpu Cortex-M7.fp.dp -g -O3 --apcs=interwork --split_sections -I ../Core/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc/Legacy -I ../Drivers/CMSIS/Device/ST/STM32H7xx/Include -I ../Drivers/CMSIS/Include -I ../RoboticArmControlSDK/API -I ../RoboticArmControlSDK/Config -I ../RoboticArmControlSDK/Core -I ../RoboticArmControlSDK/Port-I.\RTE\_RoboticArmControlProject-IF:\ARM\PACK\ARM\CMSIS\5.0.1\CMSIS\Include-IF:\ARM\PACK\Keil\STM32H7xx_DFP\3.1.1\Drivers\CMSIS\Device\ST\STM32H7xx\Include-D__UVISION_VERSION="524" -D_RTE_ -DSTM32H723xx -DUSE_PWR_LDO_SUPPLY -DUSE_HAL_DRIVER -DSTM32H723xx-o roboticarmcontrolproject\main.o --omf_browse roboticarmcontrolproject\main.crf --depend roboticarmcontrolproject\main.d)
+F (../Core/Src/main.c)(0x6A0ADD6E)(--c99 -c --cpu Cortex-M7.fp.dp -g -O3 --apcs=interwork --split_sections -I ../Core/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc/Legacy -I ../Drivers/CMSIS/Device/ST/STM32H7xx/Include -I ../Drivers/CMSIS/Include -I ../RoboticArmControlSDK/API -I ../RoboticArmControlSDK/Config -I ../RoboticArmControlSDK/Core -I ../RoboticArmControlSDK/Port-I.\RTE\_RoboticArmControlProject-IF:\ARM\PACK\ARM\CMSIS\5.0.1\CMSIS\Include-IF:\ARM\PACK\Keil\STM32H7xx_DFP\3.1.1\Drivers\CMSIS\Device\ST\STM32H7xx\Include-D__UVISION_VERSION="524" -D_RTE_ -DSTM32H723xx -DUSE_PWR_LDO_SUPPLY -DUSE_HAL_DRIVER -DSTM32H723xx-o roboticarmcontrolproject\main.o --omf_browse roboticarmcontrolproject\main.crf --depend roboticarmcontrolproject\main.d)
 I (../Core/Inc/main.h)(0x6A032E4B)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal.h)(0x696D9BE3)
 I (../Core/Inc/stm32h7xx_hal_conf.h)(0x6A032E4B)
@@ -48,12 +48,12 @@ I (../Core/Inc/usart.h)(0x69EF8480)
 I (../Core/Inc/gpio.h)(0x69EADCFA)
 I (../RoboticArmControlSDK/API/Robotic_Arm_Control_API.h)(0x69F713D0)
 I (../RoboticArmControlSDK/Core/DMJ4310_Motor_Driver.h)(0x6A032E4B)
-I (../RoboticArmControlSDK/Config/Robotic_Arm_Config.h)(0x6A033838)
+I (../RoboticArmControlSDK/Config/Robotic_Arm_Config.h)(0x6A09B6AC)
 I (../RoboticArmControlSDK/Port/Robotic_Arm_Motor_HAL_STM32_Port.h)(0x69EE0505)
 I (../RoboticArmControlSDK/Core/LK4005_Motor_Driver.h)(0x6A05B912)
 I (../RoboticArmControlSDK/Core/LFD01M_Motor_Driver.h)(0x6A03379E)
 I (../RoboticArmControlSDK/Core/Control_Algorithm.h)(0x6A04AD01)
-I (../RoboticArmControlSDK/Port/Robotic_Arm_Communication_HAL_STM32_Port.h)(0x6A05E273)
+I (../RoboticArmControlSDK/Port/Robotic_Arm_Communication_HAL_STM32_Port.h)(0x6A09A5CE)
 F (../Core/Src/gpio.c)(0x6A032E4B)(--c99 -c --cpu Cortex-M7.fp.dp -g -O3 --apcs=interwork --split_sections -I ../Core/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc/Legacy -I ../Drivers/CMSIS/Device/ST/STM32H7xx/Include -I ../Drivers/CMSIS/Include -I ../RoboticArmControlSDK/API -I ../RoboticArmControlSDK/Config -I ../RoboticArmControlSDK/Core -I ../RoboticArmControlSDK/Port-I.\RTE\_RoboticArmControlProject-IF:\ARM\PACK\ARM\CMSIS\5.0.1\CMSIS\Include-IF:\ARM\PACK\Keil\STM32H7xx_DFP\3.1.1\Drivers\CMSIS\Device\ST\STM32H7xx\Include-D__UVISION_VERSION="524" -D_RTE_ -DSTM32H723xx -DUSE_PWR_LDO_SUPPLY -DUSE_HAL_DRIVER -DSTM32H723xx-o roboticarmcontrolproject\gpio.o --omf_browse roboticarmcontrolproject\gpio.crf --depend roboticarmcontrolproject\gpio.d)
 I (../Core/Inc/gpio.h)(0x69EADCFA)
 I (../Core/Inc/main.h)(0x6A032E4B)
@@ -1356,7 +1356,7 @@ I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_tim.h)(0x696D9BE3)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_tim_ex.h)(0x696D9BE3)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_uart.h)(0x696D9BE3)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_uart_ex.h)(0x696D9BE3)
-F (..\RoboticArmControlSDK\API\Robotic_Arm_Control_API.c)(0x6A05D7B8)(--c99 -c --cpu Cortex-M7.fp.dp -g -O3 --apcs=interwork --split_sections -I ../Core/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc/Legacy -I ../Drivers/CMSIS/Device/ST/STM32H7xx/Include -I ../Drivers/CMSIS/Include -I ../RoboticArmControlSDK/API -I ../RoboticArmControlSDK/Config -I ../RoboticArmControlSDK/Core -I ../RoboticArmControlSDK/Port-I.\RTE\_RoboticArmControlProject-IF:\ARM\PACK\ARM\CMSIS\5.0.1\CMSIS\Include-IF:\ARM\PACK\Keil\STM32H7xx_DFP\3.1.1\Drivers\CMSIS\Device\ST\STM32H7xx\Include-D__UVISION_VERSION="524" -D_RTE_ -DSTM32H723xx -DUSE_PWR_LDO_SUPPLY -DUSE_HAL_DRIVER -DSTM32H723xx-o roboticarmcontrolproject\robotic_arm_control_api.o --omf_browse roboticarmcontrolproject\robotic_arm_control_api.crf --depend roboticarmcontrolproject\robotic_arm_control_api.d)
+F (..\RoboticArmControlSDK\API\Robotic_Arm_Control_API.c)(0x6A0ADD4A)(--c99 -c --cpu Cortex-M7.fp.dp -g -O3 --apcs=interwork --split_sections -I ../Core/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc/Legacy -I ../Drivers/CMSIS/Device/ST/STM32H7xx/Include -I ../Drivers/CMSIS/Include -I ../RoboticArmControlSDK/API -I ../RoboticArmControlSDK/Config -I ../RoboticArmControlSDK/Core -I ../RoboticArmControlSDK/Port-I.\RTE\_RoboticArmControlProject-IF:\ARM\PACK\ARM\CMSIS\5.0.1\CMSIS\Include-IF:\ARM\PACK\Keil\STM32H7xx_DFP\3.1.1\Drivers\CMSIS\Device\ST\STM32H7xx\Include-D__UVISION_VERSION="524" -D_RTE_ -DSTM32H723xx -DUSE_PWR_LDO_SUPPLY -DUSE_HAL_DRIVER -DSTM32H723xx-o roboticarmcontrolproject\robotic_arm_control_api.o --omf_browse roboticarmcontrolproject\robotic_arm_control_api.crf --depend roboticarmcontrolproject\robotic_arm_control_api.d)
 I (..\RoboticArmControlSDK\API\Robotic_Arm_Control_API.h)(0x69F713D0)
 I (../RoboticArmControlSDK/Core/DMJ4310_Motor_Driver.h)(0x6A032E4B)
 I (../Core/Inc/main.h)(0x6A032E4B)
@@ -1398,18 +1398,18 @@ I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_tim.h)(0x696D9BE3)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_tim_ex.h)(0x696D9BE3)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_uart.h)(0x696D9BE3)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_uart_ex.h)(0x696D9BE3)
-I (../RoboticArmControlSDK/Config/Robotic_Arm_Config.h)(0x6A033838)
+I (../RoboticArmControlSDK/Config/Robotic_Arm_Config.h)(0x6A09B6AC)
 I (../RoboticArmControlSDK/Port/Robotic_Arm_Motor_HAL_STM32_Port.h)(0x69EE0505)
 I (../Core/Inc/fdcan.h)(0x69F2084F)
 I (../RoboticArmControlSDK/Core/LK4005_Motor_Driver.h)(0x6A05B912)
 I (../RoboticArmControlSDK/Core/LFD01M_Motor_Driver.h)(0x6A03379E)
 I (../Core/Inc/tim.h)(0x69F1C284)
 I (../RoboticArmControlSDK/Core/Control_Algorithm.h)(0x6A04AD01)
-I (../RoboticArmControlSDK/Port/Robotic_Arm_Communication_HAL_STM32_Port.h)(0x6A05E273)
+I (../RoboticArmControlSDK/Port/Robotic_Arm_Communication_HAL_STM32_Port.h)(0x6A09A5CE)
 I (../Core/Inc/usart.h)(0x69EF8480)
 F (..\RoboticArmControlSDK\Port\Robotic_Arm_Motor_HAL_STM32_Port.c)(0x69F713F9)(--c99 -c --cpu Cortex-M7.fp.dp -g -O3 --apcs=interwork --split_sections -I ../Core/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc/Legacy -I ../Drivers/CMSIS/Device/ST/STM32H7xx/Include -I ../Drivers/CMSIS/Include -I ../RoboticArmControlSDK/API -I ../RoboticArmControlSDK/Config -I ../RoboticArmControlSDK/Core -I ../RoboticArmControlSDK/Port-I.\RTE\_RoboticArmControlProject-IF:\ARM\PACK\ARM\CMSIS\5.0.1\CMSIS\Include-IF:\ARM\PACK\Keil\STM32H7xx_DFP\3.1.1\Drivers\CMSIS\Device\ST\STM32H7xx\Include-D__UVISION_VERSION="524" -D_RTE_ -DSTM32H723xx -DUSE_PWR_LDO_SUPPLY -DUSE_HAL_DRIVER -DSTM32H723xx-o roboticarmcontrolproject\robotic_arm_motor_hal_stm32_port.o --omf_browse roboticarmcontrolproject\robotic_arm_motor_hal_stm32_port.crf --depend roboticarmcontrolproject\robotic_arm_motor_hal_stm32_port.d)
 I (..\RoboticArmControlSDK\Port\Robotic_Arm_Motor_HAL_STM32_Port.h)(0x69EE0505)
-I (../RoboticArmControlSDK/Config/Robotic_Arm_Config.h)(0x6A033838)
+I (../RoboticArmControlSDK/Config/Robotic_Arm_Config.h)(0x6A09B6AC)
 I (../Core/Inc/main.h)(0x6A032E4B)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal.h)(0x696D9BE3)
 I (../Core/Inc/stm32h7xx_hal_conf.h)(0x6A032E4B)
@@ -1456,10 +1456,10 @@ I (../Core/Inc/tim.h)(0x69F1C284)
 I (../RoboticArmControlSDK/Core/LK4005_Motor_Driver.h)(0x6A05B912)
 I (../RoboticArmControlSDK/API/Robotic_Arm_Control_API.h)(0x69F713D0)
 I (../RoboticArmControlSDK/Core/Control_Algorithm.h)(0x6A04AD01)
-I (../RoboticArmControlSDK/Port/Robotic_Arm_Communication_HAL_STM32_Port.h)(0x6A05E273)
+I (../RoboticArmControlSDK/Port/Robotic_Arm_Communication_HAL_STM32_Port.h)(0x6A09A5CE)
 I (../Core/Inc/usart.h)(0x69EF8480)
-F (..\RoboticArmControlSDK\Port\Robotic_Arm_Communication_HAL_STM32_Port.c)(0x6A05E393)(--c99 -c --cpu Cortex-M7.fp.dp -g -O3 --apcs=interwork --split_sections -I ../Core/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc/Legacy -I ../Drivers/CMSIS/Device/ST/STM32H7xx/Include -I ../Drivers/CMSIS/Include -I ../RoboticArmControlSDK/API -I ../RoboticArmControlSDK/Config -I ../RoboticArmControlSDK/Core -I ../RoboticArmControlSDK/Port-I.\RTE\_RoboticArmControlProject-IF:\ARM\PACK\ARM\CMSIS\5.0.1\CMSIS\Include-IF:\ARM\PACK\Keil\STM32H7xx_DFP\3.1.1\Drivers\CMSIS\Device\ST\STM32H7xx\Include-D__UVISION_VERSION="524" -D_RTE_ -DSTM32H723xx -DUSE_PWR_LDO_SUPPLY -DUSE_HAL_DRIVER -DSTM32H723xx-o roboticarmcontrolproject\robotic_arm_communication_hal_stm32_port.o --omf_browse roboticarmcontrolproject\robotic_arm_communication_hal_stm32_port.crf --depend roboticarmcontrolproject\robotic_arm_communication_hal_stm32_port.d)
-I (..\RoboticArmControlSDK\Port\Robotic_Arm_Communication_HAL_STM32_Port.h)(0x6A05E273)
+F (..\RoboticArmControlSDK\Port\Robotic_Arm_Communication_HAL_STM32_Port.c)(0x6A09B800)(--c99 -c --cpu Cortex-M7.fp.dp -g -O3 --apcs=interwork --split_sections -I ../Core/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc/Legacy -I ../Drivers/CMSIS/Device/ST/STM32H7xx/Include -I ../Drivers/CMSIS/Include -I ../RoboticArmControlSDK/API -I ../RoboticArmControlSDK/Config -I ../RoboticArmControlSDK/Core -I ../RoboticArmControlSDK/Port-I.\RTE\_RoboticArmControlProject-IF:\ARM\PACK\ARM\CMSIS\5.0.1\CMSIS\Include-IF:\ARM\PACK\Keil\STM32H7xx_DFP\3.1.1\Drivers\CMSIS\Device\ST\STM32H7xx\Include-D__UVISION_VERSION="524" -D_RTE_ -DSTM32H723xx -DUSE_PWR_LDO_SUPPLY -DUSE_HAL_DRIVER -DSTM32H723xx-o roboticarmcontrolproject\robotic_arm_communication_hal_stm32_port.o --omf_browse roboticarmcontrolproject\robotic_arm_communication_hal_stm32_port.crf --depend roboticarmcontrolproject\robotic_arm_communication_hal_stm32_port.d)
+I (..\RoboticArmControlSDK\Port\Robotic_Arm_Communication_HAL_STM32_Port.h)(0x6A09A5CE)
 I (../Core/Inc/main.h)(0x6A032E4B)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal.h)(0x696D9BE3)
 I (../Core/Inc/stm32h7xx_hal_conf.h)(0x6A032E4B)
@@ -1503,16 +1503,16 @@ I (../Core/Inc/usart.h)(0x69EF8480)
 I (F:\Keil5\ARM\ARMCC\include\string.h)(0x588B8344)
 I (F:\Keil5\ARM\ARMCC\include\stdio.h)(0x588B8344)
 I (../RoboticArmControlSDK/Core/LFD01M_Motor_Driver.h)(0x6A03379E)
-I (../RoboticArmControlSDK/Config/Robotic_Arm_Config.h)(0x6A033838)
+I (../RoboticArmControlSDK/Config/Robotic_Arm_Config.h)(0x6A09B6AC)
 I (../Core/Inc/tim.h)(0x69F1C284)
 I (../RoboticArmControlSDK/Core/LK4005_Motor_Driver.h)(0x6A05B912)
 I (../RoboticArmControlSDK/Port/Robotic_Arm_Motor_HAL_STM32_Port.h)(0x69EE0505)
 I (../Core/Inc/fdcan.h)(0x69F2084F)
 I (../RoboticArmControlSDK/Core/DMJ4310_Motor_Driver.h)(0x6A032E4B)
 I (../RoboticArmControlSDK/Core/Control_Algorithm.h)(0x6A04AD01)
-F (..\RoboticArmControlSDK\Core\Control_Algorithm.c)(0x6A05CF81)(--c99 -c --cpu Cortex-M7.fp.dp -g -O3 --apcs=interwork --split_sections -I ../Core/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc/Legacy -I ../Drivers/CMSIS/Device/ST/STM32H7xx/Include -I ../Drivers/CMSIS/Include -I ../RoboticArmControlSDK/API -I ../RoboticArmControlSDK/Config -I ../RoboticArmControlSDK/Core -I ../RoboticArmControlSDK/Port-I.\RTE\_RoboticArmControlProject-IF:\ARM\PACK\ARM\CMSIS\5.0.1\CMSIS\Include-IF:\ARM\PACK\Keil\STM32H7xx_DFP\3.1.1\Drivers\CMSIS\Device\ST\STM32H7xx\Include-D__UVISION_VERSION="524" -D_RTE_ -DSTM32H723xx -DUSE_PWR_LDO_SUPPLY -DUSE_HAL_DRIVER -DSTM32H723xx-o roboticarmcontrolproject\control_algorithm.o --omf_browse roboticarmcontrolproject\control_algorithm.crf --depend roboticarmcontrolproject\control_algorithm.d)
+F (..\RoboticArmControlSDK\Core\Control_Algorithm.c)(0x6A0ADB4C)(--c99 -c --cpu Cortex-M7.fp.dp -g -O3 --apcs=interwork --split_sections -I ../Core/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc/Legacy -I ../Drivers/CMSIS/Device/ST/STM32H7xx/Include -I ../Drivers/CMSIS/Include -I ../RoboticArmControlSDK/API -I ../RoboticArmControlSDK/Config -I ../RoboticArmControlSDK/Core -I ../RoboticArmControlSDK/Port-I.\RTE\_RoboticArmControlProject-IF:\ARM\PACK\ARM\CMSIS\5.0.1\CMSIS\Include-IF:\ARM\PACK\Keil\STM32H7xx_DFP\3.1.1\Drivers\CMSIS\Device\ST\STM32H7xx\Include-D__UVISION_VERSION="524" -D_RTE_ -DSTM32H723xx -DUSE_PWR_LDO_SUPPLY -DUSE_HAL_DRIVER -DSTM32H723xx-o roboticarmcontrolproject\control_algorithm.o --omf_browse roboticarmcontrolproject\control_algorithm.crf --depend roboticarmcontrolproject\control_algorithm.d)
 I (..\RoboticArmControlSDK\Core\Control_Algorithm.h)(0x6A04AD01)
-I (../RoboticArmControlSDK/Config/Robotic_Arm_Config.h)(0x6A033838)
+I (../RoboticArmControlSDK/Config/Robotic_Arm_Config.h)(0x6A09B6AC)
 I (../Core/Inc/main.h)(0x6A032E4B)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal.h)(0x696D9BE3)
 I (../Core/Inc/stm32h7xx_hal_conf.h)(0x6A032E4B)
@@ -1558,7 +1558,7 @@ I (../Core/Inc/fdcan.h)(0x69F2084F)
 I (..\RoboticArmControlSDK\Core\LK4005_Motor_Driver.h)(0x6A05B912)
 F (..\RoboticArmControlSDK\Core\LFD01M_Motor_Driver.c)(0x6A033532)(--c99 -c --cpu Cortex-M7.fp.dp -g -O3 --apcs=interwork --split_sections -I ../Core/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc/Legacy -I ../Drivers/CMSIS/Device/ST/STM32H7xx/Include -I ../Drivers/CMSIS/Include -I ../RoboticArmControlSDK/API -I ../RoboticArmControlSDK/Config -I ../RoboticArmControlSDK/Core -I ../RoboticArmControlSDK/Port-I.\RTE\_RoboticArmControlProject-IF:\ARM\PACK\ARM\CMSIS\5.0.1\CMSIS\Include-IF:\ARM\PACK\Keil\STM32H7xx_DFP\3.1.1\Drivers\CMSIS\Device\ST\STM32H7xx\Include-D__UVISION_VERSION="524" -D_RTE_ -DSTM32H723xx -DUSE_PWR_LDO_SUPPLY -DUSE_HAL_DRIVER -DSTM32H723xx-o roboticarmcontrolproject\lfd01m_motor_driver.o --omf_browse roboticarmcontrolproject\lfd01m_motor_driver.crf --depend roboticarmcontrolproject\lfd01m_motor_driver.d)
 I (..\RoboticArmControlSDK\Core\LFD01M_Motor_Driver.h)(0x6A03379E)
-I (../RoboticArmControlSDK/Config/Robotic_Arm_Config.h)(0x6A033838)
+I (../RoboticArmControlSDK/Config/Robotic_Arm_Config.h)(0x6A09B6AC)
 I (../Core/Inc/main.h)(0x6A032E4B)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal.h)(0x696D9BE3)
 I (../Core/Inc/stm32h7xx_hal_conf.h)(0x6A032E4B)
@@ -1599,7 +1599,7 @@ I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_tim_ex.h)(0x696D9BE3)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_uart.h)(0x696D9BE3)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_uart_ex.h)(0x696D9BE3)
 I (../Core/Inc/tim.h)(0x69F1C284)
-F (..\RoboticArmControlSDK\Core\DMJ4310_Motor_Driver.c)(0x6A032E4B)(--c99 -c --cpu Cortex-M7.fp.dp -g -O3 --apcs=interwork --split_sections -I ../Core/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc/Legacy -I ../Drivers/CMSIS/Device/ST/STM32H7xx/Include -I ../Drivers/CMSIS/Include -I ../RoboticArmControlSDK/API -I ../RoboticArmControlSDK/Config -I ../RoboticArmControlSDK/Core -I ../RoboticArmControlSDK/Port-I.\RTE\_RoboticArmControlProject-IF:\ARM\PACK\ARM\CMSIS\5.0.1\CMSIS\Include-IF:\ARM\PACK\Keil\STM32H7xx_DFP\3.1.1\Drivers\CMSIS\Device\ST\STM32H7xx\Include-D__UVISION_VERSION="524" -D_RTE_ -DSTM32H723xx -DUSE_PWR_LDO_SUPPLY -DUSE_HAL_DRIVER -DSTM32H723xx-o roboticarmcontrolproject\dmj4310_motor_driver.o --omf_browse roboticarmcontrolproject\dmj4310_motor_driver.crf --depend roboticarmcontrolproject\dmj4310_motor_driver.d)
+F (..\RoboticArmControlSDK\Core\DMJ4310_Motor_Driver.c)(0x6A0ADAA8)(--c99 -c --cpu Cortex-M7.fp.dp -g -O3 --apcs=interwork --split_sections -I ../Core/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc/Legacy -I ../Drivers/CMSIS/Device/ST/STM32H7xx/Include -I ../Drivers/CMSIS/Include -I ../RoboticArmControlSDK/API -I ../RoboticArmControlSDK/Config -I ../RoboticArmControlSDK/Core -I ../RoboticArmControlSDK/Port-I.\RTE\_RoboticArmControlProject-IF:\ARM\PACK\ARM\CMSIS\5.0.1\CMSIS\Include-IF:\ARM\PACK\Keil\STM32H7xx_DFP\3.1.1\Drivers\CMSIS\Device\ST\STM32H7xx\Include-D__UVISION_VERSION="524" -D_RTE_ -DSTM32H723xx -DUSE_PWR_LDO_SUPPLY -DUSE_HAL_DRIVER -DSTM32H723xx-o roboticarmcontrolproject\dmj4310_motor_driver.o --omf_browse roboticarmcontrolproject\dmj4310_motor_driver.crf --depend roboticarmcontrolproject\dmj4310_motor_driver.d)
 I (..\RoboticArmControlSDK\Core\DMJ4310_Motor_Driver.h)(0x6A032E4B)
 I (../Core/Inc/main.h)(0x6A032E4B)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal.h)(0x696D9BE3)
@@ -1640,11 +1640,11 @@ I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_tim.h)(0x696D9BE3)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_tim_ex.h)(0x696D9BE3)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_uart.h)(0x696D9BE3)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_uart_ex.h)(0x696D9BE3)
-I (../RoboticArmControlSDK/Config/Robotic_Arm_Config.h)(0x6A033838)
+I (../RoboticArmControlSDK/Config/Robotic_Arm_Config.h)(0x6A09B6AC)
 I (../RoboticArmControlSDK/Port/Robotic_Arm_Motor_HAL_STM32_Port.h)(0x69EE0505)
 I (../Core/Inc/fdcan.h)(0x69F2084F)
 I (..\RoboticArmControlSDK\Core\Control_Algorithm.h)(0x6A04AD01)
-F (..\RoboticArmControlSDK\Core\LK4005_Motor_Driver.c)(0x6A05D56B)(--c99 -c --cpu Cortex-M7.fp.dp -g -O3 --apcs=interwork --split_sections -I ../Core/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc/Legacy -I ../Drivers/CMSIS/Device/ST/STM32H7xx/Include -I ../Drivers/CMSIS/Include -I ../RoboticArmControlSDK/API -I ../RoboticArmControlSDK/Config -I ../RoboticArmControlSDK/Core -I ../RoboticArmControlSDK/Port-I.\RTE\_RoboticArmControlProject-IF:\ARM\PACK\ARM\CMSIS\5.0.1\CMSIS\Include-IF:\ARM\PACK\Keil\STM32H7xx_DFP\3.1.1\Drivers\CMSIS\Device\ST\STM32H7xx\Include-D__UVISION_VERSION="524" -D_RTE_ -DSTM32H723xx -DUSE_PWR_LDO_SUPPLY -DUSE_HAL_DRIVER -DSTM32H723xx-o roboticarmcontrolproject\lk4005_motor_driver.o --omf_browse roboticarmcontrolproject\lk4005_motor_driver.crf --depend roboticarmcontrolproject\lk4005_motor_driver.d)
+F (..\RoboticArmControlSDK\Core\LK4005_Motor_Driver.c)(0x6A0ADB45)(--c99 -c --cpu Cortex-M7.fp.dp -g -O3 --apcs=interwork --split_sections -I ../Core/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc/Legacy -I ../Drivers/CMSIS/Device/ST/STM32H7xx/Include -I ../Drivers/CMSIS/Include -I ../RoboticArmControlSDK/API -I ../RoboticArmControlSDK/Config -I ../RoboticArmControlSDK/Core -I ../RoboticArmControlSDK/Port-I.\RTE\_RoboticArmControlProject-IF:\ARM\PACK\ARM\CMSIS\5.0.1\CMSIS\Include-IF:\ARM\PACK\Keil\STM32H7xx_DFP\3.1.1\Drivers\CMSIS\Device\ST\STM32H7xx\Include-D__UVISION_VERSION="524" -D_RTE_ -DSTM32H723xx -DUSE_PWR_LDO_SUPPLY -DUSE_HAL_DRIVER -DSTM32H723xx-o roboticarmcontrolproject\lk4005_motor_driver.o --omf_browse roboticarmcontrolproject\lk4005_motor_driver.crf --depend roboticarmcontrolproject\lk4005_motor_driver.d)
 I (..\RoboticArmControlSDK\Core\LK4005_Motor_Driver.h)(0x6A05B912)
 I (../Core/Inc/main.h)(0x6A032E4B)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal.h)(0x696D9BE3)
@@ -1685,13 +1685,13 @@ I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_tim.h)(0x696D9BE3)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_tim_ex.h)(0x696D9BE3)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_uart.h)(0x696D9BE3)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_uart_ex.h)(0x696D9BE3)
-I (../RoboticArmControlSDK/Config/Robotic_Arm_Config.h)(0x6A033838)
+I (../RoboticArmControlSDK/Config/Robotic_Arm_Config.h)(0x6A09B6AC)
 I (../RoboticArmControlSDK/Port/Robotic_Arm_Motor_HAL_STM32_Port.h)(0x69EE0505)
 I (../Core/Inc/fdcan.h)(0x69F2084F)
 I (..\RoboticArmControlSDK\Core\Control_Algorithm.h)(0x6A04AD01)
 F (..\RoboticArmControlSDK\Core\BMI088_IMU_Driver.c)(0x6A032E4B)(--c99 -c --cpu Cortex-M7.fp.dp -g -O3 --apcs=interwork --split_sections -I ../Core/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc -I ../Drivers/STM32H7xx_HAL_Driver/Inc/Legacy -I ../Drivers/CMSIS/Device/ST/STM32H7xx/Include -I ../Drivers/CMSIS/Include -I ../RoboticArmControlSDK/API -I ../RoboticArmControlSDK/Config -I ../RoboticArmControlSDK/Core -I ../RoboticArmControlSDK/Port-I.\RTE\_RoboticArmControlProject-IF:\ARM\PACK\ARM\CMSIS\5.0.1\CMSIS\Include-IF:\ARM\PACK\Keil\STM32H7xx_DFP\3.1.1\Drivers\CMSIS\Device\ST\STM32H7xx\Include-D__UVISION_VERSION="524" -D_RTE_ -DSTM32H723xx -DUSE_PWR_LDO_SUPPLY -DUSE_HAL_DRIVER -DSTM32H723xx-o roboticarmcontrolproject\bmi088_imu_driver.o --omf_browse roboticarmcontrolproject\bmi088_imu_driver.crf --depend roboticarmcontrolproject\bmi088_imu_driver.d)
 I (..\RoboticArmControlSDK\Core\BMI088_IMU_Driver.h)(0x6A032E4B)
-I (../RoboticArmControlSDK/Config/Robotic_Arm_Config.h)(0x6A033838)
+I (../RoboticArmControlSDK/Config/Robotic_Arm_Config.h)(0x6A09B6AC)
 I (../Core/Inc/main.h)(0x6A032E4B)
 I (../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal.h)(0x696D9BE3)
 I (../Core/Inc/stm32h7xx_hal_conf.h)(0x6A032E4B)

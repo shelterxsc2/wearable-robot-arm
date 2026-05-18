@@ -110,7 +110,7 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     Robotic_Arm_Control();
-    //Communication_Test();
+    //Communication_Usart();
   }
   /* USER CODE END 3 */
 }
