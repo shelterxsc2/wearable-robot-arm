@@ -1,3 +1,39 @@
 DM-J4310-2EC-master/
 dm-mc02-master/
 LFD-01M舵机/
+# Build artifacts
+*.o
+*.out
+*.elf
+*.bin
+*.hex
+cc
+cc_test
+uart_test
+*.exe
+
+# Backup & temp files
+*.bak
+*.old
+*.tmp
+*.swp
+*~
+*.txt.bak
+
+# IDE
+.vscode/
+.idea/
+*.uvguix.*
+*.uvoptx
+*.uvprojx.user
+Debug/
+Release/
+build/
+
+# Large generated data (keep a few samples if needed)
+host-rk3588/calib/images/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
