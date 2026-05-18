@@ -36,8 +36,9 @@ host-rk3588/calib/images/
 .DS_Store
 Thumbs.db
 
-# Documentation folder
-docs/
+# Documentation build artifacts (keep source md files)
+*.pdf
+*.docx
 
 # Keil MDK build artifacts
 *.crf
