@@ -16,6 +16,7 @@
 | [`docs/protocol.md`](docs/protocol.md) | 上下位机 UART 通信协议帧格式 |
 | [`docs/roadmap.md`](docs/roadmap.md) | 开发状态、待办事项、已知问题 |
 | [`docs/calibration.md`](docs/calibration.md) | 相机标定、PnP 问题分析、MJPG/YUYV 对比 |
+| [`docs/workspace-sync.md`](docs/workspace-sync.md) | **工作区与仓库同步规范、目录关系、提交注意事项** |
 | [`host-rk3588/README.md`](host-rk3588/README.md) | 上位机编译、文件说明、模型信息 |
 | [`mcu-stm32/README.md`](mcu-stm32/README.md) | 下位机工程结构、电机配置、导入说明 |
 

@@ -9,18 +9,17 @@ void LK4005_Motor_Control_Init(void)
     LK4005_Motor_Handle[0].Motor_FDCAN_Handle = &hfdcan1;
     LK4005_Motor_Handle[0].Motor_ID = 0x14C;
     LK4005_Motor_Handle[0].Motor_Type = Gimbal;
-    LK4005_Motor_Handle[0].Motor_Position_Target = 3.14f;
     LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.j = 15.5f;
-    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.a_max = 1.5f;
-    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.v_max = 0.45f;
+    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.a_max = 2.5f;
+    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.v_max = 0.75f;
 
     LK4005_Motor_Handle[1].Motor_FDCAN_Handle = &hfdcan2;
     LK4005_Motor_Handle[1].Motor_ID = 0x149;
     LK4005_Motor_Handle[1].Motor_Type = Joint_Fore;
     LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].MIT_Kp = 100.5f;
-    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[1].MIT_Kp = 105.0f;
-    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].MIT_Kd = 3.95f;
-    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[1].MIT_Kd = 1.255f;
+    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[1].MIT_Kp = 115.0f;
+    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].MIT_Kd = 2.05f;
+    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[1].MIT_Kd = 1.45f;
     LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].Motor_Torque_Friction = 0.11f;
     LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[1].Motor_Torque_Friction = 0.02f;
     LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].Output = 0.0f;

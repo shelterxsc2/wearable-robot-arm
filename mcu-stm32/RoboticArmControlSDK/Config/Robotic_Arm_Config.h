@@ -18,6 +18,7 @@ typedef enum
     phase1,
     phase2,
     phase3,
+    phase3_end,
     phase4,
     phase5,
     phase6,
@@ -138,15 +139,15 @@ typedef struct
 #define LFD01M_Motor_Number 2
 #define DMJ4310_Motor_Number 1
 #define LK4005_Motor_Number 2
-#define Robotic_Arm_Mass_L1 0.95f //大臂机械臂的质量,单位为kg
-#define Robotic_Arm_Mass_L2 1.0f // 小臂机械臂的质量,单位为kg
-#define Robotic_Arm_Length_L1 0.45f // 大臂机械臂的长度,单位为m
-#define Robotic_Arm_Length_L2 0.461f // 小臂机械臂的长度,单位为m
+#define Robotic_Arm_Mass_L1 1.05f //大臂机械臂的质量,单位为kg
+#define Robotic_Arm_Mass_L2 1.1f // 小臂机械臂的质量,单位为kg
+#define Robotic_Arm_Length_L1 0.40f // 大臂机械臂的长度,单位为m
+#define Robotic_Arm_Length_L2 0.411f // 小臂机械臂的长度,单位为m
 #define Robotic_Arm_Length_Connect 0.44f //大臂电机与云台连接杆的长度,单位为m   
 #define Robotic_Arm_Mass_Forearm_Motor 0.154f // 小臂电机的质量,单位为kg
 #define Robotic_Arm_Mass_End 0.13f           // 末端舵机,摄像头等的总质量,单位为kg
 #define Robotic_Arm_Angle_Offset 1.571f //整体机械臂(云台)相对于地面的夹角,单位为rad 
-#define Robotic_Arm_Length_End 0.08245f
+#define Robotic_Arm_Length_End 0.07845f
 #define g 9.7913f
 
 #endif
