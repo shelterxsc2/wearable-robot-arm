@@ -9,8 +9,8 @@ void LK4005_Motor_Control_Init(void)
     LK4005_Motor_Handle[0].Motor_FDCAN_Handle = &hfdcan1;
     LK4005_Motor_Handle[0].Motor_ID = 0x14C;
     LK4005_Motor_Handle[0].Motor_Type = Gimbal;
-    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.j = 15.5f;
-    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.a_max = 2.5f;
+    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.j = 8.0f;
+    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.a_max = 3.0f;
     LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.v_max = 0.75f;
 
     LK4005_Motor_Handle[1].Motor_FDCAN_Handle = &hfdcan2;
@@ -24,8 +24,8 @@ void LK4005_Motor_Control_Init(void)
     LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[1].Motor_Torque_Friction = 0.02f;
     LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].Output = 0.0f;
     LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[1].Output = 0.0f;
-    LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.j = 15.5f;
-    LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.a_max = 1.5f;
+    LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.j = 4.5f;
+    LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.a_max = 1.0f;
     LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.v_max = 0.45f;
 
     FDCAN_FilterTypeDef sfilter = {0};
