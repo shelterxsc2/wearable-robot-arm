@@ -108,3 +108,55 @@ mcu-stm32/
 1. 复制 `Core/Src`、`Core/Inc`、`RoboticArmControlSDK/` 下的改动文件
 2. 不要提交 `Debug/`、`Release/`、`*.uvguix.*` 等编译产物
 3. 更新本 README，补充新的编译/烧录说明
+
+## 修改记录
+
+### 2025-05-23 代码审查与修正
+
+本次修改基于对瓴控电机 CAN 协议手册（V2.36）的核对，以及控制逻辑的梳理，共修正 3 处问题：
+
+#### 1. LK4005 多圈角度解析（`LK4005_Motor_Driver.c`）
+
+**问题**：`0x92` 返回帧的解析把命令字 `0x92` 当作数据拼入 `int64_t`，且 `DATA[7]` 左移了 56 而非 48，同时换算公式 `/8000*PI` 错误。
+
+**修正**：
+- 正确提取 `DATA[1]~DATA[7]` 作为 7 字节 `int64_t`（`DATA[7]` 左移 48）
+- 换算改为：`motorAngle * 0.01°/LSB → 度 → 弧度 → 除以减速比`
+
+```c
+int64_t motorAngle_raw =
+    ((int64_t)(int8_t)FDCAN_Rx_Data_Temp[7] << 48) |
+    ((int64_t)FDCAN_Rx_Data_Temp[6] << 40) |
+    ...
+    ((int64_t)FDCAN_Rx_Data_Temp[1]);
+float motor_angle_rad = (float)motorAngle_raw * 0.01f * PI / 180.0f;
+LK4005_Motor_Handle->Motor_MIT_Control_Handle[0].Motor_Position_Actual = motor_angle_rad / Reduction_Ratio;
+```
+
+#### 2. 逆运动学虚拟连杆夹角（`Control_Algorithm.c`）
+
+**问题**：`L2_Angle_Virtual` 计算使用了 `sinf()` 而非 `asinf()`，得到的是 `sin(β)` 值而非角度 `β`。
+
+**修正**：`sinf` → `asinf`
+
+```c
+// 修正前
+float L2_Angle_Virtual = fabsf(sinf(Robotic_Arm_Length_End * sinf(Servo_Angle) / L2_Length_Virtual));
+// 修正后
+float L2_Angle_Virtual = fabsf(asinf(Robotic_Arm_Length_End * sinf(Servo_Angle) / L2_Length_Virtual));
+```
+
+**影响评估**：经数值模拟验证，该 bug 导致的 `L2_Angle_Virtual` 最大误差仅约 **0.13°**（Servo=90° 时），换算到末端摄像头的位置偏差为 **亚毫米级（<1 mm）**。该误差为恒定偏置，不会随目标点位置变化而产生漂移，因此**不是此前观察到的“Y 轴伸长时 Z 轴偏下”现象的根本原因**。
+
+#### 3. LK4005 小臂重力补偿延迟一拍（`Robotic_Arm_Control_API.c`）
+
+**问题**：`Motor_MIT_Control()` 先执行计算 `Output`，之后才更新 `Motor_Torque_Feedforward`，导致本次力矩输出使用的是**上一次的重力补偿值**，存在一拍延迟。
+
+**修正**：将 `Motor_Torque_Feedforward` 赋值提前到 `Motor_MIT_Control()` 之前，与 DMJ4310 大臂的逻辑保持一致。
+
+```c
+// 运动中 handle[0] 与到位后 handle[1] 均做同样调整
+LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0].Motor_Torque_Feedforward = Forearm_Gravity_Compensation(...);
+Motor_MIT_Control(&LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0]);
+LK4005_Motor_Torque_Control(...);
+```

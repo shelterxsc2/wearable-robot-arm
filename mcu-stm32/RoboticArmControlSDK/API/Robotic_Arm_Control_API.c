@@ -108,9 +108,8 @@ void LK4005_Motor_Handle_Update(void)
                 {
                     LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0].Motor_Position_Target = LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle.position_initial + LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle.direction_flag * LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle.s;
                     LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0].Motor_Velocity_Target = LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle.direction_flag * LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle.v;
-                    Motor_MIT_Control(&LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0]);
-
                     LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0].Motor_Torque_Feedforward = Forearm_Gravity_Compensation(Normalize_Angle((3.0f * PI / 2.0f) - Motor_Angle_Temp), Normalize_Angle((3.0f * PI / 2.0f) - Angle_Joint_Fore_Offset + LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0].Motor_Position_Actual));
+                    Motor_MIT_Control(&LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0]);
 
                     LK4005_Motor_Torque_Control(LK4005_Motor_Handle[i], LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0]);
                 }
@@ -118,9 +117,8 @@ void LK4005_Motor_Handle_Update(void)
                 {
                     LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[1].Motor_Position_Target = LK4005_Motor_Handle[i].Motor_Position_Target;
                     LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[1].Motor_Velocity_Target = 0.0f;
-                    Motor_MIT_Control(&LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[1]);
-
                     LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[1].Motor_Torque_Feedforward = Forearm_Gravity_Compensation(Normalize_Angle((3.0f * PI / 2.0f) - Motor_Angle_Temp), Normalize_Angle((3.0f * PI / 2.0f) - Angle_Joint_Fore_Offset + LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[1].Motor_Position_Actual));
+                    Motor_MIT_Control(&LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[1]);
 
                     LK4005_Motor_Torque_Control(LK4005_Motor_Handle[i], LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[1]);
                 }
@@ -198,6 +196,7 @@ void Robotic_Arm_Control(void)
         LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
         Joint_Fore_Start_Complete = 2;
     }
+
     LFD01M_Motor_Handle_Update();
     DMJ4310_Motor_Handle_Update();
     LK4005_Motor_Handle_Update();
