@@ -5,6 +5,116 @@ static uint8_t Joint_Upper_Start_Complete = 0;
 static uint8_t Joint_Fore_Start_Complete = 0;
 static uint8_t Gimbal_Flag = 0;
 
+/* ========== 自动测试状态机 ========== */
+uint8_t Test_Mode_Active = 1;
+
+/* 测试点：距离较远的四个角（单位：m，舵机固定90°） */
+static const float Test_Point[4][4] = {
+    { 0.02f,  0.70f, 0.42f, 1.5708f },   /* 右上  [0] */
+    { 0.02f,  0.70f, 0.38f, 1.5708f },   /* 右下  [1] */
+    {-0.02f,  0.70f, 0.38f, 1.5708f },   /* 左下  [2] */
+    {-0.02f,  0.70f, 0.42f, 1.5708f }    /* 左上  [3] */
+};
+
+#define TEST_POS_THR  0.05f
+#define TEST_CYCLES   10
+
+typedef enum {
+    TEST_IDLE,
+    TEST_MOVE,
+    TEST_WAIT,
+    TEST_DONE
+} Test_State_t;
+
+static Test_State_t Test_State = TEST_IDLE;
+static uint8_t      Test_Point_Idx   = 0;
+static uint8_t      Test_Cycle_Count = 0;
+static uint32_t     Test_Wait_Tick   = 0;
+
+static void Test_Set_Target(uint8_t idx)
+{
+    float gimbal, upper, fore;
+    Coordinate_Inverse_Settlement(Test_Point[idx][0], Test_Point[idx][1],
+                                  Test_Point[idx][2], Test_Point[idx][3],
+                                  &gimbal, &upper, &fore);
+
+    LK4005_Motor_Handle[0].Motor_Position_Target = gimbal;
+    DMJ4310_Motor_Handle[0].Motor_Position_Target = upper;
+    LK4005_Motor_Handle[1].Motor_Position_Target = fore;
+
+    DMJ4310_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+    LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+}
+
+static uint8_t Test_Is_All_Stopped(void)
+{
+    uint8_t upper_done =
+        (DMJ4310_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State == idle) &&
+        (fabsf(DMJ4310_Motor_Handle[0].Motor_MIT_Control_Handle.Motor_Position_Actual -
+               DMJ4310_Motor_Handle[0].Motor_Position_Target) <= TEST_POS_THR);
+
+    uint8_t fore_done =
+        (LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.Speed_Plan_State == idle) &&
+        (fabsf(LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].Motor_Position_Actual -
+               LK4005_Motor_Handle[1].Motor_Position_Target) <= TEST_POS_THR);
+
+    uint8_t gimbal_done =
+        (LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State == idle) &&
+        (fabsf(LK4005_Motor_Handle[0].Motor_Position_PID_Control_Handle.Motor_Position_Actual -
+               LK4005_Motor_Handle[0].Motor_Position_Target) <= TEST_POS_THR);
+
+    return upper_done && fore_done && gimbal_done;
+}
+
+static void Test_Sequence_Run(void)
+{
+    if (!Test_Mode_Active) return;
+    if (!Gimbal_Start_Complete) return;
+
+    switch (Test_State)
+    {
+    case TEST_IDLE:
+        Test_Point_Idx   = 0;
+        Test_Cycle_Count = 0;
+        Test_State = TEST_MOVE;
+        break;
+
+    case TEST_MOVE:
+        Test_Set_Target(Test_Point_Idx);
+        Test_State = TEST_WAIT;
+        break;
+
+    case TEST_WAIT:
+        if (Test_Is_All_Stopped())
+        {
+            Test_Wait_Tick = 0;
+            Test_Point_Idx++;
+            if (Test_Point_Idx >= 4)
+            {
+                Test_Point_Idx = 0;
+                Test_Cycle_Count++;
+                if (Test_Cycle_Count >= TEST_CYCLES)
+                {
+                    Test_State = TEST_DONE;
+                    break;
+                }
+            }
+            Test_State = TEST_MOVE;
+        }
+        break;
+
+    case TEST_DONE:
+        Test_Mode_Active = 0;
+        Test_State = TEST_IDLE;
+        break;
+
+    default:
+        break;
+    }
+}
+/* =================================== */
+
 void LFD01M_Motor_Handle_Update(void)
 {
     uint8_t i = 0;
@@ -200,4 +310,6 @@ void Robotic_Arm_Control(void)
     LFD01M_Motor_Handle_Update();
     DMJ4310_Motor_Handle_Update();
     LK4005_Motor_Handle_Update();
+
+    Test_Sequence_Run();
 }

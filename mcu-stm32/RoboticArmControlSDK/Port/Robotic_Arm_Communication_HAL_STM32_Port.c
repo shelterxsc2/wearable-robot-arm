@@ -5,6 +5,7 @@
 #include "LK4005_Motor_Driver.h"
 #include "DMJ4310_Motor_Driver.h"
 #include "Control_Algorithm.h"
+#include "Robotic_Arm_Control_API.h"
 
 uint8_t Usart_Used0_Rx_Buff[Usart_Used0_Rx_Buff_Length] = {0};
 
@@ -17,6 +18,15 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
     if (huart->Instance == Communication_Usart_Instance_Used0)
     {
+        /* 测试模式期间屏蔽上位机指令 */
+        if (Test_Mode_Active)
+        {
+            HAL_UARTEx_ReceiveToIdle_DMA(Communication_Usart_Handle_Used0,
+                                         Usart_Used0_Rx_Buff,
+                                         Usart_Used0_Rx_Buff_Length);
+            return;
+        }
+
         /* ---------- 滤波与死区参数 ---------- */
         #define POS_DEADZONE_M      0.015f   // 位置死区 1cm (单位: m)
         #define SERVO1_DEADZONE_RAD 0.05f   // 舵机1死区 ≈ 2.9° (单位: rad)

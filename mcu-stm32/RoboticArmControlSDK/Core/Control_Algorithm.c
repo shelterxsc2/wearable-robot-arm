@@ -40,7 +40,7 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
 {
     uint32_t Current_Time = HAL_GetTick();
     float dt = (Current_Time - Speed_Plan_Handle->Time_Stamp) * 0.001f;
-    float v1 = Calc_V1(Speed_Plan_Handle->a_max, Speed_Plan_Handle->j);
+    float v1 = Calc_V1(Speed_Plan_Handle->a_limit, Speed_Plan_Handle->j_limit);
 
     switch (Speed_Plan_Handle->Speed_Plan_State)
     {
@@ -65,6 +65,72 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
             Speed_Plan_Handle->direction_flag = -1.0f;
         }
 
+        /* Adaptive v_limit: pre-compute peak speed for this displacement */
+        {
+            float S = fabsf(Speed_Plan_Handle->error_s);
+            float v1 = Calc_V1(Speed_Plan_Handle->a_max, Speed_Plan_Handle->j);
+            float b = (Speed_Plan_Handle->a_max * Speed_Plan_Handle->a_max) / Speed_Plan_Handle->j;
+            float discriminant = b * b + 4.0f * S * Speed_Plan_Handle->a_max;
+            float v_peak = (-b + sqrtf(discriminant)) / 2.0f;
+
+            if (v_peak < 2.0f * v1)
+            {
+                /* Triangle S-curve: cannot even reach a_max */
+                v_peak = powf(0.5f * Speed_Plan_Handle->j * S * S, 1.0f / 3.0f);
+            }
+
+            /* Short-distance attenuation: further reduce v_limit for small moves */
+            float scale = 1.0f;
+            if (S < 0.03f)
+            {
+                scale = 0.15f;   /* tiny step: 30% */
+            }
+            else if (S < 0.06f)
+            {
+                scale = 0.2f;   /* small step: 40% */
+            }
+            else if (S < 0.15f)
+            {
+                scale = 0.3f;   /* medium step: 60% */
+            }
+            v_peak *= scale;
+
+            Speed_Plan_Handle->v_limit = fminf(v_peak, Speed_Plan_Handle->v_max);
+            if (Speed_Plan_Handle->v_limit < 0.0f)
+            {
+                Speed_Plan_Handle->v_limit = 0.0f;
+            }
+
+            /* Dynamic j_limit for smoother short-distance motion */
+            if (S < 0.03f)
+            {
+                Speed_Plan_Handle->j_limit = 6.0f;
+            }
+            else if (S < 0.06f)
+            {
+                Speed_Plan_Handle->j_limit = 8.0f;
+            }
+            else if (S < 0.15f)
+            {
+                Speed_Plan_Handle->j_limit = 10.0f;
+            }
+            else
+            {
+                Speed_Plan_Handle->j_limit = Speed_Plan_Handle->j;
+            }
+
+            /* Compute effective max accel: ensure v_limit >= 2*v1' */
+            float v1_limit = Calc_V1(Speed_Plan_Handle->a_max, Speed_Plan_Handle->j_limit);
+            if (Speed_Plan_Handle->v_limit < 2.0f * v1_limit)
+            {
+                Speed_Plan_Handle->a_limit = sqrtf(Speed_Plan_Handle->j_limit * Speed_Plan_Handle->v_limit);
+            }
+            else
+            {
+                Speed_Plan_Handle->a_limit = Speed_Plan_Handle->a_max;
+            }
+        }
+
         Speed_Plan_Handle->a = 0;
         Speed_Plan_Handle->s = 0;
 
@@ -73,13 +139,13 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
     }
     case phase1:
     {
-        Speed_Plan_Handle->a += Speed_Plan_Handle->j * dt;
+        Speed_Plan_Handle->a += Speed_Plan_Handle->j_limit * dt;
         Speed_Plan_Handle->v += Speed_Plan_Handle->a * dt;
         Speed_Plan_Handle->s += Speed_Plan_Handle->v * dt;
 
-        if (Speed_Plan_Handle->a >= Speed_Plan_Handle->a_max)
+        if (Speed_Plan_Handle->a >= Speed_Plan_Handle->a_limit)
         {
-            Speed_Plan_Handle->a = Speed_Plan_Handle->a_max;
+            Speed_Plan_Handle->a = Speed_Plan_Handle->a_limit;
             Speed_Plan_Handle->Speed_Plan_State = phase2;
         }
         break;
@@ -89,7 +155,7 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
         Speed_Plan_Handle->v += Speed_Plan_Handle->a * dt;
         Speed_Plan_Handle->s += Speed_Plan_Handle->v * dt;
 
-        if (Speed_Plan_Handle->v >= Speed_Plan_Handle->v_max - v1)
+        if (Speed_Plan_Handle->v >= Speed_Plan_Handle->v_limit - v1)
         {
             Speed_Plan_Handle->Speed_Plan_State = phase3;
         }
@@ -97,22 +163,22 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
     }
     case phase3:
     {
-        Speed_Plan_Handle->a -= Speed_Plan_Handle->j * dt;
+        Speed_Plan_Handle->a -= Speed_Plan_Handle->j_limit * dt;
         Speed_Plan_Handle->v += Speed_Plan_Handle->a * dt;
         Speed_Plan_Handle->s += Speed_Plan_Handle->v * dt;
 
         if (Speed_Plan_Handle->a <= 0)
         {
             Speed_Plan_Handle->a = 0;
-            if (Speed_Plan_Handle->v > Speed_Plan_Handle->v_max)
-                Speed_Plan_Handle->v = Speed_Plan_Handle->v_max;
+            if (Speed_Plan_Handle->v > Speed_Plan_Handle->v_limit)
+                Speed_Plan_Handle->v = Speed_Plan_Handle->v_limit;
             Speed_Plan_Handle->Speed_Plan_State = phase3_end;
         }
         break;
     }
     case phase3_end:
     {
-        float decel_dist = Calc_Decel_Dist(Speed_Plan_Handle->v, Speed_Plan_Handle->a_max, Speed_Plan_Handle->j);
+        float decel_dist = Calc_Decel_Dist(Speed_Plan_Handle->v, Speed_Plan_Handle->a_limit, Speed_Plan_Handle->j_limit);
 
         if (Speed_Plan_Handle->s >= fabsf(Speed_Plan_Handle->error_s) - decel_dist)
         {
@@ -128,7 +194,7 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
     {
         Speed_Plan_Handle->s += Speed_Plan_Handle->v * dt;
 
-        float decel_dist = Calc_Decel_Dist(Speed_Plan_Handle->v, Speed_Plan_Handle->a_max, Speed_Plan_Handle->j);
+        float decel_dist = Calc_Decel_Dist(Speed_Plan_Handle->v, Speed_Plan_Handle->a_limit, Speed_Plan_Handle->j_limit);
 
         if (Speed_Plan_Handle->s >= fabsf(Speed_Plan_Handle->error_s) - decel_dist)
         {
@@ -142,9 +208,9 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
         Speed_Plan_Handle->v += Speed_Plan_Handle->a * dt;
         Speed_Plan_Handle->s += Speed_Plan_Handle->v * dt;
 
-        if (Speed_Plan_Handle->a <= -Speed_Plan_Handle->a_max)
+        if (Speed_Plan_Handle->a <= -Speed_Plan_Handle->a_limit)
         {
-            Speed_Plan_Handle->a = -Speed_Plan_Handle->a_max;
+            Speed_Plan_Handle->a = -Speed_Plan_Handle->a_limit;
             Speed_Plan_Handle->Speed_Plan_State = phase6;
         }
         break;
@@ -162,7 +228,7 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
     }
     case phase7:
     {
-        Speed_Plan_Handle->a += Speed_Plan_Handle->j * dt;
+        Speed_Plan_Handle->a += Speed_Plan_Handle->j_limit * dt;
         Speed_Plan_Handle->v += Speed_Plan_Handle->a * dt;
         Speed_Plan_Handle->s += Speed_Plan_Handle->v * dt;
 

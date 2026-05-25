@@ -15,4 +15,6 @@ void LFD01M_Motor_Handle_Update(void);
 void DMJ4310_Motor_Handle_Update(void);
 void LK4005_Motor_Handle_Update(void);
 
+extern uint8_t Test_Mode_Active;
+
 #endif
