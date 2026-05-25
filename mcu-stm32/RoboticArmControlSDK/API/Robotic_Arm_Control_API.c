@@ -5,8 +5,10 @@ static uint8_t Joint_Upper_Start_Complete = 0;
 static uint8_t Joint_Fore_Start_Complete = 0;
 static uint8_t Gimbal_Flag = 0;
 
+#define TEST_MODE_ENABLE  0
+
 /* ========== 自动测试状态机 ========== */
-uint8_t Test_Mode_Active = 1;
+uint8_t Test_Mode_Active = TEST_MODE_ENABLE;
 
 /* 测试点：距离较远的四个角（单位：m，舵机固定90°） */
 static const float Test_Point[4][4] = {
