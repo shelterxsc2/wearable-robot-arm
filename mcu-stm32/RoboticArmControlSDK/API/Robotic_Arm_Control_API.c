@@ -10,10 +10,10 @@ uint8_t Test_Mode_Active = 1;
 
 /* 测试点：距离较远的四个角（单位：m，舵机固定90°） */
 static const float Test_Point[4][4] = {
-    { 0.02f,  0.70f, 0.42f, 1.5708f },   /* 右上  [0] */
-    { 0.02f,  0.70f, 0.38f, 1.5708f },   /* 右下  [1] */
-    {-0.02f,  0.70f, 0.38f, 1.5708f },   /* 左下  [2] */
-    {-0.02f,  0.70f, 0.42f, 1.5708f }    /* 左上  [3] */
+    { 0.25f,  0.70f, 0.55f, 1.5708f },   /* 右上  [0] */
+    { 0.25f,  0.70f, 0.25f, 1.5708f },   /* 右下  [1] */
+    {-0.25f,  0.70f, 0.25f, 1.5708f },   /* 左下  [2] */
+    {-0.25f,  0.70f, 0.55f, 1.5708f }    /* 左上  [3] */
 };
 
 #define TEST_POS_THR  0.05f
@@ -82,11 +82,12 @@ static void Test_Sequence_Run(void)
 
     case TEST_MOVE:
         Test_Set_Target(Test_Point_Idx);
+        Test_Wait_Tick = HAL_GetTick();
         Test_State = TEST_WAIT;
         break;
 
     case TEST_WAIT:
-        if (Test_Is_All_Stopped())
+        if (HAL_GetTick() - Test_Wait_Tick >= 600)
         {
             Test_Wait_Tick = 0;
             Test_Point_Idx++;
