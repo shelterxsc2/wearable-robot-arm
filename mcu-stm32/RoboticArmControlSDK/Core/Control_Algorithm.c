@@ -204,7 +204,7 @@ void Coordinate_Inverse_Settlement(float X, float Y, float Z, float Servo_Angle,
     {
         *Gimbal_Angle = (PI / 2.0f) + atan2f(Y, X) + floorf(LK4005_Motor_Handle[0].Motor_Position_PID_Control_Handle.Motor_Position_Actual / (2.0f * PI)) * 2.0f * PI;
         float L2_Length_Virtual = sqrtf(Robotic_Arm_Length_L2 * Robotic_Arm_Length_L2 + Robotic_Arm_Length_End * Robotic_Arm_Length_End - 2.0f * Robotic_Arm_Length_End * Robotic_Arm_Length_L2 * cosf(Servo_Angle));
-        float L2_Angle_Virtual = fabsf(sinf(Robotic_Arm_Length_End * sinf(Servo_Angle) / L2_Length_Virtual));
+        float L2_Angle_Virtual = fabsf(asinf(Robotic_Arm_Length_End * sinf(Servo_Angle) / L2_Length_Virtual));
 
         float temp = acosf((Robotic_Arm_Length_L1 * Robotic_Arm_Length_L1 + L2_Length_Virtual * L2_Length_Virtual - X * X - Y * Y - (Z - Robotic_Arm_Length_Connect) * (Z - Robotic_Arm_Length_Connect)) / (2.0f * Robotic_Arm_Length_L1 * L2_Length_Virtual));
         *Joint_Upper_Angle = -Normalize_Angle(asinf(L2_Length_Virtual * sinf(temp) / sqrtf(X * X + Y * Y + (Z - Robotic_Arm_Length_Connect) * (Z - Robotic_Arm_Length_Connect))) + atan2f(Z - Robotic_Arm_Length_Connect, sqrtf(X * X + Y * Y + (Z - Robotic_Arm_Length_Connect) * (Z - Robotic_Arm_Length_Connect))) + Angle_Joint_Upper_Offset);

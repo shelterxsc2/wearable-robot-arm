@@ -94,7 +94,19 @@ void LK4005_Motor_Response_Data_Explain(FDCAN_HandleTypeDef *hfdcan, FDCAN_RxHea
         {
             if (FDCAN_Rx_Data_Temp[0] == 0x92)
             {
-                LK4005_Motor_Handle->Motor_MIT_Control_Handle[0].Motor_Position_Actual = ((float)(((int64_t)FDCAN_Rx_Data_Temp[7] << 56) | ((int64_t)FDCAN_Rx_Data_Temp[6] << 48) | ((int64_t)FDCAN_Rx_Data_Temp[5] << 40) | ((int64_t)FDCAN_Rx_Data_Temp[4] << 32) | ((int64_t)FDCAN_Rx_Data_Temp[3] << 24) | ((int64_t)FDCAN_Rx_Data_Temp[2] << 16) | ((int64_t)FDCAN_Rx_Data_Temp[1] << 8) | ((int64_t)FDCAN_Rx_Data_Temp[0] << 0)) * Position_Conversion_Ratio) * PI / 8000.0f /180.0f * PI;
+                /* 0x92 读取多圈角度：DATA[1]~DATA[7] 为 motorAngle(int64_t) 的 7 个字节，单位 0.01°/LSB */
+                int64_t motorAngle_raw =
+                    ((int64_t)(int8_t)FDCAN_Rx_Data_Temp[7] << 48) |
+                    ((int64_t)FDCAN_Rx_Data_Temp[6] << 40) |
+                    ((int64_t)FDCAN_Rx_Data_Temp[5] << 32) |
+                    ((int64_t)FDCAN_Rx_Data_Temp[4] << 24) |
+                    ((int64_t)FDCAN_Rx_Data_Temp[3] << 16) |
+                    ((int64_t)FDCAN_Rx_Data_Temp[2] << 8)  |
+                    ((int64_t)FDCAN_Rx_Data_Temp[1]);
+
+                /* 0.01°/LSB -> 度 -> 弧度 -> 除以减速比得到输出轴角度 */
+                float motor_angle_rad = (float)motorAngle_raw * 0.01f * PI / 180.0f;
+                LK4005_Motor_Handle->Motor_MIT_Control_Handle[0].Motor_Position_Actual = motor_angle_rad / Reduction_Ratio;
 
                 if (LK4005_Motor_Handle->Motor_Type == Gimbal)
                 {
