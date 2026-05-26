@@ -28,6 +28,9 @@ static pthread_t g_recv_thread;
 static std::atomic<int> g_recv_running{0};
 static uart_pose_callback_t g_pose_cb = NULL;
 
+/* 运动完成状态: 1=完成/空闲, 0=运动中 */
+volatile int g_uart_move_complete = 1;
+
 /* ---------- 工具函数 ---------- */
 static uint8_t crc8(const uint8_t* data, size_t len)
 {
@@ -205,7 +208,14 @@ int uart_send_arm_target(float x, float y, float z, float k1, float k2)
     data[2] = (int16_t)z;
     data[3] = (int16_t)k1;
     data[4] = (int16_t)k2;
-    return uart_send_raw((const uint8_t*)data, sizeof(data));
+    int ret = uart_send_raw((const uint8_t*)data, sizeof(data));
+    if (ret == 0) uart_set_move_pending();
+    return ret;
+}
+
+void uart_set_move_pending(void)
+{
+    g_uart_move_complete = 0;
 }
 
 /* ---------- 接收线程 ---------- */
@@ -215,6 +225,9 @@ static void* recv_thread_func(void* arg)
     uint8_t rx_buf[64];
 
     printf("[UART] receiver thread started (binary mode)\n");
+
+    static char rx_text[128];
+    static int  rx_text_len = 0;
 
     while (g_recv_running.load()) {
         int n = uart_recv_raw(rx_buf, sizeof(rx_buf), 100);
@@ -226,6 +239,25 @@ static void* recv_thread_func(void* arg)
         }
         if (n > 16) printf(" ...");
         printf("\n");
+
+        /* 简单文本缓冲: 检测 "move complete" */
+        int copy = n;
+        if (rx_text_len + copy > (int)sizeof(rx_text) - 1)
+            copy = (int)sizeof(rx_text) - 1 - rx_text_len;
+        for (int i = 0; i < copy; ++i)
+            rx_text[rx_text_len++] = (char)rx_buf[i];
+        rx_text[rx_text_len] = '\0';
+
+        if (strstr(rx_text, "complete") != NULL) {
+            g_uart_move_complete = 1;
+            rx_text_len = 0;
+            rx_text[0] = '\0';
+        }
+        /* 防垃圾堆积 */
+        if (rx_text_len > 80) {
+            rx_text_len = 0;
+            rx_text[0] = '\0';
+        }
     }
 
     printf("[UART] receiver thread stopped\n");

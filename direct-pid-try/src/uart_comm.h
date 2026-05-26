@@ -75,6 +75,12 @@ int uart_send_raw(const uint8_t* data, size_t len);
  */
 int uart_recv_raw(uint8_t* buf, size_t max_len, int timeout_ms);
 
+/* 运动完成状态: 1=空闲/完成, 0=运动中/等待回执 */
+extern volatile int g_uart_move_complete;
+
+/* 调用方在确定发送后调用, 将状态置为运动中 */
+void uart_set_move_pending(void);
+
 #ifdef __cplusplus
 }
 #endif

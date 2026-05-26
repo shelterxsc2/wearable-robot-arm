@@ -652,7 +652,7 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h, const Po
     // ========== 逆解算 + α坐标系变换 结束 ==========
 
     static const double PITCH_OFFSET = -0.10;
-    static const double YAW_OFFSET   =  0.03;
+    static const double YAW_OFFSET   =  0.00;
     rvec_f.at<double>(0) += PITCH_OFFSET;
     rvec_f.at<double>(1) += YAW_OFFSET;
 
@@ -955,14 +955,15 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h, const Po
     // 人脸固定位置 (cm)
     static const float FACE_X_CM = 0.0f;
     static const float FACE_Y_CM = 10.0f;
-    static const float FACE_Z_CM = 35.0f;
+    static const float FACE_Z_CM = 40.0f;
     // 相机始终保持在人脸正前方的水平距离 (cm)
     static const float TRACK_DIST_CM = 57.0f;   // 使得 yaw=0 时相机 y=67
     // 相机比人脸固定高出的高度 (cm)
-    static const float CAM_HEIGHT_OFFSET_CM = 5.0f;  // z = 35 + 5 = 40
+    static const float CAM_HEIGHT_OFFSET_CM = 0.0f;  // z = 35 + 0 = 35
     // 舵机角度固定（上电初始值，验证过程中不变）
-    static const float SERVO1_DEG = 90.0f;
-    static const float SERVO2_DEG = 157.0f;
+    // SERVO1: 360°控速电机，50 = 停止（速度为0）
+    static const float SERVO1_DEG = 50.0f;
+    static const float SERVO2_DEG = 145.0f;
 
     // 从 PnP 获取人脸偏航角/俯仰角（rad）
     //   head_yaw ≈ 0  : 人脸正对前方 (+Y)
@@ -975,88 +976,191 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h, const Po
     float yaw_rad = (float)head_yaw;
     float pitch_rad = -(float)head_pitch;  // 极性取反，实测后确认方向
 
-    // ---------- 偏航方向：带死区的积分跟随 ----------
+    // ---------- 偏航方向：带死区的积分跟随 + 速度前馈 + 大角度P助推 + 冻结停稳 + 死区微调 ----------
     static const float DEAD_ZONE_RAD = 5.0f * (float)M_PI / 180.0f;
-    static const float CHASE_K = 0.08f;
-    static float cum_yaw_offset = 0.0f;
+    static const float CHASE_K     = 0.08f;
+    static const float FINE_K      = 0.008f;                        // 微调系数 (1/10)
+    static const float FINE_MAX_RAD= 5.0f * (float)M_PI / 180.0f;   // 微调量上限 ±5°
+    static const float FF_GAIN     = 0.35f;
+    static const float BOOST_THRESH_RAD = 10.0f * (float)M_PI / 180.0f; // >10°触发
+    static const float BOOST_K     = 0.0125f;                        // 大角度P助推系数 (再减半)
 
-    if (yaw_rad > DEAD_ZONE_RAD) {
-        cum_yaw_offset += CHASE_K * (yaw_rad - DEAD_ZONE_RAD);
-    } else if (yaw_rad < -DEAD_ZONE_RAD) {
-        cum_yaw_offset += CHASE_K * (yaw_rad + DEAD_ZONE_RAD);
+    static float cum_yaw_offset    = 0.0f;
+    static float frozen_yaw_offset = 0.0f;
+    static float fine_offset       = 0.0f;
+    static float prev_yaw          = 0.0f;
+    static int   stable_cnt        = 0;
+    static bool  frozen            = false;
+
+    // 发送周期内各分量累加（用于日志）
+    static float acc_big_integ  = 0.0f;
+    static float acc_ff         = 0.0f;
+    static float acc_boost      = 0.0f;
+    static float acc_fine_integ = 0.0f;
+    static float last_sent_yaw  = 0.0f;
+
+    // 最近两次发送记录（用于显示历史坐标）
+    static float prev1_x=0.0f, prev1_y=0.0f, prev1_z=0.0f, prev1_yaw=0.0f;
+    static float prev2_x=0.0f, prev2_y=0.0f, prev2_z=0.0f, prev2_yaw=0.0f;
+
+    float yaw_delta = yaw_rad - prev_yaw;
+    prev_yaw = yaw_rad;
+    // 限幅：防止 PnP 跳变或首帧异常导致前馈冲击
+    if (yaw_delta > 0.20f) yaw_delta = 0.20f;
+    if (yaw_delta < -0.20f) yaw_delta = -0.20f;
+
+    bool in_dead_zone = (std::abs(yaw_rad) <= DEAD_ZONE_RAD);
+    float big_integ = 0.0f, feedforward = 0.0f, fine_integ = 0.0f, boost = 0.0f;
+
+    if (!in_dead_zone) {
+        // S1: 粗调追踪
+        frozen = false;
+        stable_cnt = 0;
+        fine_offset = 0.0f;
+        float eff_yaw = (yaw_rad > 0.0f) ? (yaw_rad - DEAD_ZONE_RAD)
+                                          : (yaw_rad + DEAD_ZONE_RAD);
+        big_integ = CHASE_K * eff_yaw;
+        feedforward = FF_GAIN * yaw_delta;
+        cum_yaw_offset += big_integ + feedforward;
+        // 大角度额外P助推（持续推力，弥补积分滞后）
+        if (std::abs(yaw_rad) > BOOST_THRESH_RAD) {
+            cum_yaw_offset += BOOST_K * yaw_rad;
+        }
+        frozen_yaw_offset = cum_yaw_offset;
+    } else {
+        // 在死区内
+        if (!frozen) {
+            stable_cnt++;
+            if (stable_cnt >= 3) {
+                // 进入冻结微调
+                frozen = true;
+                frozen_yaw_offset = cum_yaw_offset;
+                fine_offset = 0.0f;
+            } else {
+                // S2: 过渡缓冲，保留前馈
+                feedforward = FF_GAIN * yaw_delta;
+                cum_yaw_offset += feedforward;
+                frozen_yaw_offset = cum_yaw_offset;
+            }
+        }
     }
-    if (cum_yaw_offset > (float)M_PI / 2.0f) cum_yaw_offset = (float)M_PI / 2.0f;
+
+    if (frozen) {
+        // S3: 冻结微调
+        fine_integ = FINE_K * yaw_rad;
+        fine_offset += fine_integ;
+        if (fine_offset > FINE_MAX_RAD)  fine_offset = FINE_MAX_RAD;
+        if (fine_offset < -FINE_MAX_RAD) fine_offset = -FINE_MAX_RAD;
+        cum_yaw_offset = frozen_yaw_offset + fine_offset;
+    }
+
+    // 输出限幅
+    if (cum_yaw_offset > (float)M_PI / 2.0f)  cum_yaw_offset = (float)M_PI / 2.0f;
     if (cum_yaw_offset < -(float)M_PI / 2.0f) cum_yaw_offset = -(float)M_PI / 2.0f;
 
-    // ---------- 俯仰方向：PI 控制 + 基准偏移 + 死区衰减 ----------
-    // P 项提供快速响应，I 项消除稳态误差，死区衰减防止卡死
-    static const float PITCH_BIAS_DEG = 11.5f;
-    float pitch_calib = pitch_rad - PITCH_BIAS_DEG * (float)M_PI / 180.0f;
+    // 累加本帧各分量
+    acc_big_integ  += big_integ;
+    acc_ff         += feedforward;
+    acc_boost      += boost;
+    acc_fine_integ += fine_integ;
 
-    static const float DEAD_ZONE_PITCH_RAD = 3.0f * (float)M_PI / 180.0f;
-    static const float KP_PITCH = 2.0f;      // 比例系数，越大响应越快
-    static const float KI_PITCH = 0.06f;     // 积分系数
-    static const float MAX_I_PITCH = (float)M_PI / 9.0f;  // 积分限幅 ±20°
+    // ---------- 俯仰方向：已禁用，固定高度 ----------
     static float cum_pitch_offset = 0.0f;
+    cum_pitch_offset = 0.0f;
+    float pitch_output = 0.0f;
 
-    float err = pitch_calib;
-    float p_term = 0.0f;
-
-    if (err > DEAD_ZONE_PITCH_RAD) {
-        float eff_err = err - DEAD_ZONE_PITCH_RAD;
-        p_term = KP_PITCH * eff_err;
-        cum_pitch_offset += KI_PITCH * eff_err;
-    } else if (err < -DEAD_ZONE_PITCH_RAD) {
-        float eff_err = err + DEAD_ZONE_PITCH_RAD;
-        p_term = KP_PITCH * eff_err;
-        cum_pitch_offset += KI_PITCH * eff_err;
-    } else {
-        // 死区内：积分衰减，P 项为 0
-        cum_pitch_offset *= 0.95f;
-    }
-    // 积分限幅
-    if (cum_pitch_offset > MAX_I_PITCH) cum_pitch_offset = MAX_I_PITCH;
-    if (cum_pitch_offset < -MAX_I_PITCH) cum_pitch_offset = -MAX_I_PITCH;
-
-    // P + I 输出
-    float pitch_output = p_term + cum_pitch_offset;
-    // 总输出限幅 ±60°
-    if (pitch_output > (float)M_PI / 3.0f) pitch_output = (float)M_PI / 3.0f;
-    if (pitch_output < -(float)M_PI / 3.0f) pitch_output = -(float)M_PI / 3.0f;
-
-    // 相机目标位置：水平面由偏航决定，高度由俯仰 PI 输出决定
     float target_x = FACE_X_CM + TRACK_DIST_CM * std::sin(cum_yaw_offset);
     float target_y = FACE_Y_CM + TRACK_DIST_CM * std::cos(cum_yaw_offset);
-    static const float NEUTRAL_Z_CM = FACE_Z_CM + CAM_HEIGHT_OFFSET_CM;  // 40 cm
+    static const float NEUTRAL_Z_CM = FACE_Z_CM + CAM_HEIGHT_OFFSET_CM;
     static const float PITCH_RANGE_CM = 15.0f;
     float target_z = NEUTRAL_Z_CM + PITCH_RANGE_CM * std::sin(pitch_output);
 
-    // 每 3 帧发送一次目标位姿（30fps 下约 10Hz）
-    static int uart_send_cnt = 0;
-    if (++uart_send_cnt % 3 == 0) {
-        uart_send_arm_target(target_x, target_y, target_z,
-                             SERVO1_DEG, SERVO2_DEG);
+    // 发送历史（用于 60cm 软限幅）
+    static float last_sent_x = 0.0f, last_sent_y = 0.0f;
+    static bool has_last_sent = false;
+    static int skip_streak = 0;          // 连续被SKIP的帧数
+    static bool was_clamped = false;     // 本帧是否被60cm软限幅
+
+    // 1. 60cm 软限幅（而非硬丢弃）：超限时发送边界点并同步控制器状态
+    bool should_send = true;
+    was_clamped = false;
+    if (has_last_sent) {
+        float dx = target_x - last_sent_x;
+        float dy = target_y - last_sent_y;
+        float dist_to_last = std::sqrt(dx*dx + dy*dy);
+        if (dist_to_last > 60.0f) {
+            float ratio = 60.0f / dist_to_last;
+            float clamped_x = last_sent_x + dx * ratio;
+            float clamped_y = last_sent_y + dy * ratio;
+            float clamped_yaw = std::atan2(clamped_x - FACE_X_CM, clamped_y - FACE_Y_CM);
+
+            target_x = clamped_x;
+            target_y = clamped_y;
+            // 关键：把积分器状态也拉回，防止持续漂移导致永远超限
+            cum_yaw_offset = clamped_yaw;
+            frozen_yaw_offset = clamped_yaw;
+            frozen = false;
+            stable_cnt = 0;
+            fine_offset = 0.0f;
+            was_clamped = true;
+
+            printf("[GUARD] Soft-clamp 60cm: orig_dist=%.1fcm, yaw clamped to %+.2f°\n",
+                   dist_to_last, clamped_yaw * 180.0f / (float)M_PI);
+        }
     }
 
-    // ---------- 验证打印 ----------
-    printf("\n========== [VERIFY] 人脸跟随验证 ==========\n");
-    printf("[VERIFY] 人脸位置: (%.1f, %.1f, %.1f) cm\n",
-           FACE_X_CM, FACE_Y_CM, FACE_Z_CM);
-    printf("[VERIFY] PnP  yaw=%.2f pitch_raw=%.2f pitch_calib=%.2f (deg)\n",
-           yaw_rad * 180.0f / (float)M_PI,
-           pitch_rad * 180.0f / (float)M_PI,
-           pitch_calib * 180.0f / (float)M_PI);
-    printf("[VERIFY] 偏航累积: yaw_off=%.2f deg | 俯仰 PI: P=%.2f I=%.2f out=%.2f (deg)\n",
-           cum_yaw_offset * 180.0f / (float)M_PI,
-           p_term * 180.0f / (float)M_PI,
-           cum_pitch_offset * 180.0f / (float)M_PI,
-           pitch_output * 180.0f / (float)M_PI);
-    printf("[VERIFY] 相机目标: (%.1f, %.1f, %.1f) cm | 舵机: %.1f, %.1f\n",
-           target_x, target_y, target_z, SERVO1_DEG, SERVO2_DEG);
-    printf("[VERIFY] PnP tvec=(%.1f, %.1f, %.1f) mm | pos_err(yaw=%.2f, pitch=%.2f deg)\n",
-           tx, ty, tz, pye_deg, ppe_deg);
-    printf("[VERIFY] => P 项快速响应，I 项消除稳态；若震荡改小 KP_PITCH\n");
-    printf("========== [VERIFY] END ==========\n\n");
+    // 2. 防死锁：连续 SKIP 超过 20 帧，强制发一次（安全网）
+    // （当前只有 60cm 限幅会导致 SKIP，若持续超限说明人脸在快速甩头）
+    if (!should_send) {
+        skip_streak++;
+        if (skip_streak >= 20) {
+            should_send = true;
+            printf("[GUARD] Force send after %d consecutive skips (anti-stall)\n", skip_streak);
+            skip_streak = 0;
+        }
+    } else {
+        skip_streak = 0;
+    }
+
+    if (should_send) {
+        uart_send_arm_target(target_x, target_y, target_z,
+                             SERVO1_DEG, SERVO2_DEG);
+
+        // 更新发送历史
+        last_sent_x = target_x;
+        last_sent_y = target_y;
+        has_last_sent = true;
+
+        float delta_yaw = cum_yaw_offset - last_sent_yaw;
+        float yaw_deg   = cum_yaw_offset * 180.0f / (float)M_PI;
+
+        printf("\n[SEND] yaw=%+.2f°  Δ=%+.3f°  (big=%+.3f°  ff=%+.3f°  boost=%+.3f°  fine=%+.3f°)\n",
+               yaw_deg,
+               delta_yaw * 180.0f / (float)M_PI,
+               acc_big_integ  * 180.0f / (float)M_PI,
+               acc_ff         * 180.0f / (float)M_PI,
+               acc_boost      * 180.0f / (float)M_PI,
+               acc_fine_integ * 180.0f / (float)M_PI);
+        printf("  CUR:  x=%6.1f y=%6.1f z=%5.1f | yaw=%+.2f°\n",
+               target_x, target_y, target_z, yaw_deg);
+        printf("  PREV: x=%6.1f y=%6.1f z=%5.1f | yaw=%+.2f°\n",
+               prev1_x, prev1_y, prev1_z,
+               prev1_yaw * 180.0f / (float)M_PI);
+        printf("  PRE2: x=%6.1f y=%6.1f z=%5.1f | yaw=%+.2f°\n",
+               prev2_x, prev2_y, prev2_z,
+               prev2_yaw * 180.0f / (float)M_PI);
+
+        // 移位历史记录（日志显示用）
+        prev2_x = prev1_x; prev2_y = prev1_y; prev2_z = prev1_z; prev2_yaw = prev1_yaw;
+        prev1_x = target_x; prev1_y = target_y; prev1_z = target_z; prev1_yaw = cum_yaw_offset;
+
+        // 重置周期累加器
+        acc_big_integ  = 0.0f;
+        acc_ff         = 0.0f;
+        acc_boost      = 0.0f;
+        acc_fine_integ = 0.0f;
+        last_sent_yaw  = cum_yaw_offset;
+    }
 }
 
 // ========== FP16/FP32转换 ==========
