@@ -8,6 +8,12 @@
 - **下位机**: STM32H723 (裸机 HAL)，负责机械臂电机驱动、S 曲线速度规划、MIT 力矩控制、重力补偿
 - **通信**: UART 串口（主控），蓝牙 BLE SPP（遥控器指令）
 
+## 当前状态
+
+- **下位机运动控制**：S 曲线自适应限速（`v_limit` / `a_limit`）已生效，大范围与小范围运动均平稳，正常情况下无明显抖动。
+- **打断切换**：运动过程中目标打断切换功能正常，速度连续性通过反向衰减策略保证，无显著冲击。
+- **测试模式**：支持定时打断测试（600ms 间隔），用于验证运动稳定性。
+
 ## 仓库导航
 
 | 文档 | 内容 |
@@ -16,6 +22,7 @@
 | [`docs/protocol.md`](docs/protocol.md) | 上下位机 UART 通信协议帧格式 |
 | [`docs/roadmap.md`](docs/roadmap.md) | 开发状态、待办事项、已知问题 |
 | [`docs/calibration.md`](docs/calibration.md) | 相机标定、PnP 问题分析、MJPG/YUYV 对比 |
+| [`docs/workspace-sync.md`](docs/workspace-sync.md) | **工作区与仓库同步规范、目录关系、提交注意事项** |
 | [`host-rk3588/README.md`](host-rk3588/README.md) | 上位机编译、文件说明、模型信息 |
 | [`mcu-stm32/README.md`](mcu-stm32/README.md) | 下位机工程结构、电机配置、导入说明 |
 
