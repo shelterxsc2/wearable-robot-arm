@@ -1,0 +1,1277 @@
+#include "Robotic_Arm_Control_API.h"
+#include "string.h"
+
+static uint8_t Gimbal_Start_Complete = 0;
+static uint8_t Joint_Upper_Start_Complete = 0;
+static uint8_t Joint_Fore_Start_Complete = 0;
+static uint8_t Gimbal_Flag = 0;
+
+#define TEST_MODE_ENABLE  0
+
+/* ========== 自动测试状态机 ========== */
+uint8_t Test_Mode_Active = TEST_MODE_ENABLE;
+
+/* 测试点：距离较远的四个角（单位：m，舵机固定90°） */
+static const float Test_Point[4][4] = {
+    { 0.25f,  0.70f, 0.55f, 1.5708f },   /* 右上  [0] */
+    { 0.25f,  0.70f, 0.25f, 1.5708f },   /* 右下  [1] */
+    {-0.25f,  0.70f, 0.25f, 1.5708f },   /* 左下  [2] */
+    {-0.25f,  0.70f, 0.55f, 1.5708f }    /* 左上  [3] */
+};
+
+#define TEST_POS_THR  0.05f
+#define TEST_CYCLES   10
+
+typedef enum {
+    TEST_IDLE,
+    TEST_MOVE,
+    TEST_WAIT,
+    TEST_DONE
+} Test_State_t;
+
+static Test_State_t Test_State = TEST_IDLE;
+static uint8_t      Test_Point_Idx   = 0;
+static uint8_t      Test_Cycle_Count = 0;
+static uint32_t     Test_Wait_Tick   = 0;
+
+static void Test_Set_Target(uint8_t idx)
+{
+    float gimbal, upper, fore;
+    Coordinate_Inverse_Settlement(Test_Point[idx][0], Test_Point[idx][1],
+                                  Test_Point[idx][2], Test_Point[idx][3],
+                                  &gimbal, &upper, &fore);
+
+    LK4005_Motor_Handle[0].Motor_Position_Target = gimbal;
+    DMJ4310_Motor_Handle[0].Motor_Position_Target = upper;
+    LK4005_Motor_Handle[1].Motor_Position_Target = fore;
+
+    DMJ4310_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+    LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+}
+
+static uint8_t Test_Is_All_Stopped(void)
+{
+    uint8_t upper_done =
+        (DMJ4310_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State == idle) &&
+        (fabsf(DMJ4310_Motor_Handle[0].Motor_MIT_Control_Handle.Motor_Position_Actual -
+               DMJ4310_Motor_Handle[0].Motor_Position_Target) <= TEST_POS_THR);
+
+    uint8_t fore_done =
+        (LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.Speed_Plan_State == idle) &&
+        (fabsf(LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].Motor_Position_Actual -
+               LK4005_Motor_Handle[1].Motor_Position_Target) <= TEST_POS_THR);
+
+    uint8_t gimbal_done =
+        (LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State == idle) &&
+        (fabsf(LK4005_Motor_Handle[0].Motor_Position_PID_Control_Handle.Motor_Position_Actual -
+               LK4005_Motor_Handle[0].Motor_Position_Target) <= TEST_POS_THR);
+
+    return upper_done && fore_done && gimbal_done;
+}
+
+static void Test_Sequence_Run(void)
+{
+    if (!Test_Mode_Active) return;
+    if (!Gimbal_Start_Complete) return;
+
+    switch (Test_State)
+    {
+    case TEST_IDLE:
+        Test_Point_Idx   = 0;
+        Test_Cycle_Count = 0;
+        Test_State = TEST_MOVE;
+        break;
+
+    case TEST_MOVE:
+        Test_Set_Target(Test_Point_Idx);
+        Test_Wait_Tick = HAL_GetTick();
+        Test_State = TEST_WAIT;
+        break;
+
+    case TEST_WAIT:
+        if (HAL_GetTick() - Test_Wait_Tick >= 600)
+        {
+            Test_Wait_Tick = 0;
+            Test_Point_Idx++;
+            if (Test_Point_Idx >= 4)
+            {
+                Test_Point_Idx = 0;
+                Test_Cycle_Count++;
+                if (Test_Cycle_Count >= TEST_CYCLES)
+                {
+                    Test_State = TEST_DONE;
+                    break;
+                }
+            }
+            Test_State = TEST_MOVE;
+        }
+        break;
+
+    case TEST_DONE:
+        Test_Mode_Active = 0;
+        Test_State = TEST_IDLE;
+        break;
+
+    default:
+        break;
+    }
+
+    /* ===== MG90S 360° 舵机0测试：已禁用，改为上位机实时控制 ===== */
+    /*
+    typedef enum {
+        SERVO0_TEST_MOVE_POS,
+        SERVO0_TEST_WAIT1,
+        SERVO0_TEST_MOVE_NEG,
+        SERVO0_TEST_WAIT2
+    } Servo0_Test_State_t;
+
+    static Servo0_Test_State_t servo0_test_state = SERVO0_TEST_MOVE_POS;
+    static uint32_t servo0_test_tick = 0;
+
+    switch (servo0_test_state)
+    {
+    case SERVO0_TEST_MOVE_POS:
+        Servo0_Speed = 100;
+        Servo0_Run_Duration = SERVO0_FIXED_RUN_DURATION_MS;
+        Servo0_Run_Tick = HAL_GetTick();
+        Servo0_Running = 1;
+        servo0_test_tick = HAL_GetTick();
+        servo0_test_state = SERVO0_TEST_WAIT1;
+        break;
+
+    case SERVO0_TEST_WAIT1:
+        if (HAL_GetTick() - servo0_test_tick >= 500)
+        {
+            servo0_test_state = SERVO0_TEST_MOVE_NEG;
+        }
+        break;
+
+    case SERVO0_TEST_MOVE_NEG:
+        Servo0_Speed = 0;
+        Servo0_Run_Duration = SERVO0_FIXED_RUN_DURATION_MS;
+        Servo0_Run_Tick = HAL_GetTick();
+        Servo0_Running = 1;
+        servo0_test_tick = HAL_GetTick();
+        servo0_test_state = SERVO0_TEST_WAIT2;
+        break;
+
+    case SERVO0_TEST_WAIT2:
+        if (HAL_GetTick() - servo0_test_tick >= 500)
+        {
+            servo0_test_state = SERVO0_TEST_MOVE_POS;
+        }
+        break;
+
+    default:
+        servo0_test_state = SERVO0_TEST_MOVE_POS;
+        break;
+    }
+    */
+    /* ======================================================================== */
+}
+/* =================================== */
+
+/* TIM3 中断中调用的舵机0超时检查（1ms 精度） */
+void Servo0_IRQHandlerUpdate(void)
+{
+    if (Servo0_Running && (HAL_GetTick() - Servo0_Run_Tick >= Servo0_Run_Duration))
+    {
+        __HAL_TIM_SET_COMPARE(LFD01M_Motor_Handle[0].Motor_PWM_Timer,
+                              LFD01M_Motor_Handle[0].Motor_PWM_Channel, 1500);
+        Servo0_Running = 0;
+    }
+}
+
+void LFD01M_Motor_Handle_Update(void)
+{
+    if (Gimbal_Start_Complete)
+    {
+        /* 舵机0：360° 连续旋转，0-100 调速，50=停止
+         * 超时停止由 TIM3 中断（1ms 精度）处理，这里只做正常更新
+         */
+        if (Servo0_Running)
+        {
+            LFD01M_Motor_Set_Speed(LFD01M_Motor_Handle[0], Servo0_Speed);
+        }
+        else
+        {
+            LFD01M_Motor_Set_Speed(LFD01M_Motor_Handle[0], 50);
+        }
+        HAL_Delay(LFD01M_Motor_Control_Cycle);
+
+        /* 舵机1：位置型180°舵机，保持原有角度控制 */
+        LFD01M_Motor_Set_Angle(LFD01M_Motor_Handle[1]);
+        HAL_Delay(LFD01M_Motor_Control_Cycle);
+    }
+}
+
+void DMJ4310_Motor_Handle_Update(void)
+{
+    uint8_t i = 0;
+    float Motor_Angle_Temp = 0;
+    for (i = 0; i < LK4005_Motor_Number; i++)
+    {
+        if (LK4005_Motor_Handle[i].Motor_Type == Joint_Fore)
+        {
+            Motor_Angle_Temp = LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0].Motor_Position_Actual;
+            break;
+        }
+    }
+    for (i = 0; i < DMJ4310_Motor_Number; i++)
+    {
+        if (DMJ4310_Motor_Handle[i].Wait_Count >= 20)
+        {
+            if (DMJ4310_Motor_Handle[i].Motor_Type == Joint_Upper)
+            {
+                Speed_Plan_Update(&DMJ4310_Motor_Handle[i].Motor_Speed_Plan_Handle, DMJ4310_Motor_Handle[i].Motor_MIT_Control_Handle.Motor_Position_Actual, DMJ4310_Motor_Handle[i].Motor_Position_Target);
+                if (DMJ4310_Motor_Handle[i].Motor_Speed_Plan_Handle.Speed_Plan_State != idle)
+                {
+                    DMJ4310_Motor_Handle[i].Motor_MIT_Control_Handle.Motor_Position_Target = DMJ4310_Motor_Handle[i].Motor_Speed_Plan_Handle.position_initial + DMJ4310_Motor_Handle[i].Motor_Speed_Plan_Handle.direction_flag * DMJ4310_Motor_Handle[i].Motor_Speed_Plan_Handle.s;
+
+                    DMJ4310_Motor_Handle[i].Motor_MIT_Control_Handle.Motor_Velocity_Target = DMJ4310_Motor_Handle[i].Motor_Speed_Plan_Handle.direction_flag * DMJ4310_Motor_Handle[i].Motor_Speed_Plan_Handle.v;
+                }
+                else
+                {
+                    DMJ4310_Motor_Handle[i].Motor_MIT_Control_Handle.Motor_Position_Target = DMJ4310_Motor_Handle[i].Motor_Position_Target;
+                    DMJ4310_Motor_Handle[i].Motor_MIT_Control_Handle.Motor_Velocity_Target = 0.0f;
+                }
+
+                DMJ4310_Motor_Handle[i].Motor_MIT_Control_Handle.Motor_Torque_Feedforward = -Upperarm_Gravity_Compensation(Normalize_Angle((3.0f * PI / 2.0f) - DMJ4310_Motor_Handle[i].Motor_MIT_Control_Handle.Motor_Position_Actual), Normalize_Angle((3.0f * PI / 2.0f) - Angle_Joint_Fore_Offset + Motor_Angle_Temp));
+
+                DMJ4310_Motor_MIT_Control(DMJ4310_Motor_Handle[i]);
+
+                if (fabsf(DMJ4310_Motor_Handle[i].Motor_MIT_Control_Handle.Motor_Position_Actual - DMJ4310_Motor_Handle[i].Motor_Position_Target) <= 0.1f && Joint_Upper_Start_Complete == 0)
+                {
+                    Joint_Upper_Start_Complete = 1;
+                }
+            }
+            HAL_Delay(DMJ4310_Motor_Control_Cycle);
+        }
+        else
+        {
+            uint8_t FDCAN_Send_Temp_[DMJ4310_Motor_FDCAN_Length] = {0};
+            FDCAN_Send_Temp_[0] = 0x7F;
+            FDCAN_Send_Temp_[1] = 0xFF;
+            FDCAN_Send_Temp_[2] = 0x7F;
+            FDCAN_Send_Temp_[3] = 0xF0;
+            FDCAN_Send_Temp_[4] = 0x00;
+            FDCAN_Send_Temp_[5] = 0x00;
+            FDCAN_Send_Temp_[6] = 0x07;
+            FDCAN_Send_Temp_[7] = 0xFF;
+
+            FDCAN_Send_Standard(DMJ4310_Motor_Handle[i].Motor_FDCAN_Handle, DMJ4310_Motor_Handle[i].Motor_ID, FDCAN_Send_Temp_, DMJ4310_Motor_FDCAN_Length);
+        }
+    }
+}
+
+void LK4005_Motor_Handle_Update(void)
+{
+    uint8_t i = 0;
+    float Motor_Angle_Temp = 0;
+    for (i = 0; i < DMJ4310_Motor_Number; i++)
+    {
+        if (DMJ4310_Motor_Handle[i].Motor_Type == Joint_Upper)
+        {
+            Motor_Angle_Temp = DMJ4310_Motor_Handle[i].Motor_MIT_Control_Handle.Motor_Position_Actual;
+            break;
+        }
+    }
+    for (i = 0; i < LK4005_Motor_Number; i++)
+    {
+        LK4005_Motor_Read_Position(LK4005_Motor_Handle[i]);
+        HAL_Delay(2); // 微小延迟完成FDCAN报文发送
+        LK4005_Motor_Read_Velocity(LK4005_Motor_Handle[i]);
+        HAL_Delay(2); // 微小延迟完成FDCAN报文发送
+        if (LK4005_Motor_Handle[i].Wait_Count >= 20)
+        {
+            if (LK4005_Motor_Handle[i].Motor_Type == Joint_Fore)
+            {
+                Speed_Plan_Update(&LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle, LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0].Motor_Position_Actual, LK4005_Motor_Handle[i].Motor_Position_Target);
+
+                if (LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle.Speed_Plan_State != idle)
+                {
+                    LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0].Motor_Position_Target = LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle.position_initial + LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle.direction_flag * LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle.s;
+                    LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0].Motor_Velocity_Target = LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle.direction_flag * LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle.v;
+                    LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0].Motor_Torque_Feedforward = Forearm_Gravity_Compensation(Normalize_Angle((3.0f * PI / 2.0f) - Motor_Angle_Temp), Normalize_Angle((3.0f * PI / 2.0f) - Angle_Joint_Fore_Offset + LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0].Motor_Position_Actual));
+                    Motor_MIT_Control(&LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0]);
+
+                    LK4005_Motor_Torque_Control(LK4005_Motor_Handle[i], LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0]);
+                }
+                else
+                {
+                    LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[1].Motor_Position_Target = LK4005_Motor_Handle[i].Motor_Position_Target;
+                    LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[1].Motor_Velocity_Target = 0.0f;
+                    LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[1].Motor_Torque_Feedforward = Forearm_Gravity_Compensation(Normalize_Angle((3.0f * PI / 2.0f) - Motor_Angle_Temp), Normalize_Angle((3.0f * PI / 2.0f) - Angle_Joint_Fore_Offset + LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[1].Motor_Position_Actual));
+                    Motor_MIT_Control(&LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[1]);
+
+                    LK4005_Motor_Torque_Control(LK4005_Motor_Handle[i], LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[1]);
+                }
+
+                if (fabsf(LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[1].Motor_Position_Actual - LK4005_Motor_Handle[i].Motor_Position_Target) <= 0.1f && Joint_Fore_Start_Complete == 0 && Joint_Upper_Start_Complete == 2)
+                {
+                    Joint_Fore_Start_Complete = 1;
+                }
+            }
+
+            if (LK4005_Motor_Handle[i].Motor_Type == Gimbal)
+            {
+
+                Speed_Plan_Update(&LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle, LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0].Motor_Position_Actual, LK4005_Motor_Handle[i].Motor_Position_Target);
+
+                if (LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle.Speed_Plan_State != idle)
+                {
+                    LK4005_Motor_Handle[i].Motor_Position_PID_Control_Handle.Motor_Position_Target = LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle.position_initial + LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle.direction_flag * LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle.s;
+
+                }
+                else
+                {
+                    LK4005_Motor_Handle[i].Motor_Position_PID_Control_Handle.Motor_Position_Target = LK4005_Motor_Handle[i].Motor_Position_Target;
+                }
+                LK4005_Motor_Position_Control(LK4005_Motor_Handle[i]);
+                if (fabsf(LK4005_Motor_Handle[i].Motor_Position_PID_Control_Handle.Motor_Position_Actual - LK4005_Motor_Handle[i].Motor_Position_Target) <= 0.1f && Gimbal_Start_Complete == 0 && Joint_Fore_Start_Complete == 2)
+                {
+                    Gimbal_Start_Complete = 1;
+                }
+            }
+
+            HAL_Delay(LK4005_Motor_Control_Cycle);
+        }
+    }
+}
+
+void Robotic_Arm_Control_Init(void)
+{
+    Motor_Control_Init();
+    HAL_Delay(1500);
+    uint8_t i = 0;
+    for (i = 0; i < DMJ4310_Motor_Number; i++)
+    {
+        DMJ4310_Motor_Enable(DMJ4310_Motor_Handle[i]);
+    }
+    Communication_Usart_Init();
+}
+
+void Robotic_Arm_Control(void)
+{
+    if (Joint_Upper_Start_Complete == 0)
+    {
+        if(LK4005_Motor_Handle[1].Wait_Count == 19)
+        {
+            LK4005_Motor_Handle[1].Motor_Position_Target = LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[1].Motor_Position_Actual;
+        }
+    }
+    else if (Joint_Upper_Start_Complete == 1)
+    {
+        LK4005_Motor_Handle[1].Motor_Position_Target = 1.67f;
+        LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+        Joint_Upper_Start_Complete = 2;
+    }
+    if(Joint_Fore_Start_Complete == 0)
+    {
+        if (LK4005_Motor_Handle[0].Wait_Count >= 15 && LK4005_Motor_Handle[0].Wait_Count <= 19 && Gimbal_Flag == 0)
+        {
+            LK4005_Motor_Handle[0].Motor_Position_Target = LK4005_Motor_Handle[0].Motor_Position_PID_Control_Handle.Motor_Position_Actual;
+            Gimbal_Flag = 1;
+        }
+    }
+    else if (Joint_Fore_Start_Complete == 1)
+    {
+        LK4005_Motor_Handle[0].Motor_Position_Target = 3.14f + floorf(LK4005_Motor_Handle[0].Motor_Position_PID_Control_Handle.Motor_Position_Actual / (2.0f * PI)) * 2.0f * PI;
+        LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+        Joint_Fore_Start_Complete = 2;
+    }
+
+    /* ========== 运动完成检测与上报 ========== */
+    if (Gimbal_Start_Complete)
+    {
+        static uint8_t prev_all_done = 0;
+
+        uint8_t gimbal_done =
+            (LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State == idle) &&
+            (fabsf(LK4005_Motor_Handle[0].Motor_Position_PID_Control_Handle.Motor_Position_Actual -
+                   LK4005_Motor_Handle[0].Motor_Position_Target) <= 0.05f);
+
+        uint8_t upper_done =
+            (DMJ4310_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State == idle) &&
+            (fabsf(DMJ4310_Motor_Handle[0].Motor_MIT_Control_Handle.Motor_Position_Actual -
+                   DMJ4310_Motor_Handle[0].Motor_Position_Target) <= 0.05f);
+
+        uint8_t fore_done =
+            (LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.Speed_Plan_State == idle) &&
+            (fabsf(LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[1].Motor_Position_Actual -
+                   LK4005_Motor_Handle[1].Motor_Position_Target) <= 0.05f);
+
+        uint8_t all_done = gimbal_done && upper_done && fore_done;
+
+        if (all_done && !prev_all_done)
+        {
+            const char* msg = "move complete\r\n";
+            HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 10);
+        }
+        prev_all_done = all_done;
+    }
+    /* ======================================= */
+
+    /* ========== 舵机0演示：已禁用，改为上位机实时控制 ========== */
+    /*
+    if (Gimbal_Start_Complete)
+    {
+        static uint8_t demo_state = 0;
+        static uint32_t demo_tick = 0;
+
+        switch (demo_state)
+        {
+        case 0:
+            Servo0_Speed = 100;
+            Servo0_Run_Duration = SERVO0_FIXED_RUN_DURATION_MS;
+            Servo0_Run_Tick = HAL_GetTick();
+            Servo0_Running = 1;
+            demo_state = 1;
+            break;
+
+        case 1:
+            if (!Servo0_Running)
+            {
+                demo_tick = HAL_GetTick();
+                demo_state = 2;
+            }
+            break;
+
+        case 2:
+            if (HAL_GetTick() - demo_tick >= 1000)
+            {
+                demo_state = 3;
+            }
+            break;
+
+        case 3:
+            Servo0_Speed = 0;
+            Servo0_Run_Duration = SERVO0_FIXED_RUN_DURATION_MS;
+            Servo0_Run_Tick = HAL_GetTick();
+            Servo0_Running = 1;
+            demo_state = 4;
+            break;
+
+        case 4:
+            if (!Servo0_Running)
+            {
+                demo_tick = HAL_GetTick();
+                demo_state = 5;
+            }
+            break;
+
+        case 5:
+            if (HAL_GetTick() - demo_tick >= 1000)
+            {
+                demo_state = 0;
+            }
+            break;
+        }
+    }
+    */
+    /* ============================================================== */
+
+    LFD01M_Motor_Handle_Update();
+    DMJ4310_Motor_Handle_Update();
+    LK4005_Motor_Handle_Update();
+
+    Test_Sequence_Run();
+}
+
+
+#include "Robotic_Arm_Motor_HAL_STM32_Port.h"
+#include "DMJ4310_Motor_Driver.h"
+#include "LFD01M_Motor_Driver.h"
+#include "LK4005_Motor_Driver.h"
+#include "Robotic_Arm_Control_API.h"
+
+void Motor_Control_Init(void)
+{
+    LFD01M_Motor_Control_Init();
+    DMJ4310_Motor_Control_Init();
+    LK4005_Motor_Control_Init();
+    HAL_FDCAN_Start(&hfdcan1);
+    HAL_FDCAN_Start(&hfdcan2);
+}
+
+void FDCAN_Send_Standard(FDCAN_HandleTypeDef *FDCAN_Handle, uint16_t std_id, uint8_t *data, uint8_t length)
+{
+    FDCAN_TxHeaderTypeDef TxHeader = {0};
+    TxHeader.Identifier = std_id;
+    TxHeader.IdType = FDCAN_STANDARD_ID;
+    TxHeader.TxFrameType = FDCAN_DATA_FRAME;
+    TxHeader.DataLength = (length == 8) ? FDCAN_DLC_BYTES_8 : (length == 7) ? FDCAN_DLC_BYTES_7
+                                                          : (length == 6)   ? FDCAN_DLC_BYTES_6
+                                                          : (length == 5)   ? FDCAN_DLC_BYTES_5
+                                                          : (length == 4)   ? FDCAN_DLC_BYTES_4
+                                                          : (length == 3)   ? FDCAN_DLC_BYTES_3
+                                                          : (length == 2)   ? FDCAN_DLC_BYTES_2
+                                                          : (length == 1)   ? FDCAN_DLC_BYTES_1
+                                                                            : FDCAN_DLC_BYTES_0;
+    TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+    TxHeader.BitRateSwitch = FDCAN_BRS_OFF;
+    TxHeader.FDFormat = FDCAN_CLASSIC_CAN;
+    TxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+    TxHeader.MessageMarker = 0;
+
+    HAL_FDCAN_AddMessageToTxFifoQ(FDCAN_Handle, &TxHeader, data);
+}
+
+uint16_t Float_To_Uint(float x, float x_min, float x_max, int bits)
+{
+    float span = x_max - x_min;
+    float offset = x_min;
+    if (x < x_min)
+        x = x_min;
+    else if (x > x_max)
+        x = x_max;
+    return (uint16_t)((x - offset) * ((float)((1 << bits) - 1)) / span);
+}
+
+float Uint_To_Float(int x_int, float x_min, float x_max, int bits)
+{
+    float span = x_max - x_min;
+    float offset = x_min;
+    return ((float)x_int) * span / ((float)((1 << bits) - 1)) + offset;
+}
+
+void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
+{
+    FDCAN_RxHeaderTypeDef FDCAN_Rx_Head_Temp;
+    uint8_t FDCAN_Rx_Data_Temp[DMJ4310_Motor_FDCAN_Length] = {0};
+    HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &FDCAN_Rx_Head_Temp, FDCAN_Rx_Data_Temp);
+    uint8_t i = 0;
+    for (i = 0; i < DMJ4310_Motor_Number; i++)
+    {
+        DMJ4310_Motor_Response_Data_Explain(hfdcan, FDCAN_Rx_Head_Temp, FDCAN_Rx_Data_Temp ,&DMJ4310_Motor_Handle[i]);
+    }
+}
+
+void HAL_FDCAN_RxFifo1Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo1ITs)
+{
+    FDCAN_RxHeaderTypeDef FDCAN_Rx_Head_Temp;
+    uint8_t FDCAN_Rx_Data_Temp[LK4005_Motor_FDCAN_Length] = {0};
+    HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO1, &FDCAN_Rx_Head_Temp, FDCAN_Rx_Data_Temp);
+    uint8_t i = 0;
+    for (i = 0; i < LK4005_Motor_Number; i++)
+    {
+        LK4005_Motor_Response_Data_Explain(hfdcan, FDCAN_Rx_Head_Temp, FDCAN_Rx_Data_Temp, &LK4005_Motor_Handle[i]);
+    }
+}
+#include "Robotic_Arm_Communication_HAL_STM32_Port.h"
+#include "string.h"
+#include "stdio.h"
+#include "LFD01M_Motor_Driver.h"
+#include "LK4005_Motor_Driver.h"
+#include "DMJ4310_Motor_Driver.h"
+#include "Control_Algorithm.h"
+#include "Robotic_Arm_Control_API.h"
+
+uint8_t Usart_Used0_Rx_Buff[Usart_Used0_Rx_Buff_Length] = {0};
+
+/* 舵机0（摄像头 360° 连续旋转）控制全局状态 */
+volatile uint8_t  Servo0_Speed = 50;                  /* 0-100, 50=停止 */
+volatile uint32_t Servo0_Run_Tick = 0;                /* 开始运行时刻 */
+volatile uint16_t Servo0_Run_Duration = SERVO0_FIXED_RUN_DURATION_MS;  /* 固定运行时间 */
+volatile uint8_t  Servo0_Running = 0;                 /* 是否正在运行 */
+
+void Communication_Usart_Init(void)
+{
+    HAL_UARTEx_ReceiveToIdle_DMA(Communication_Usart_Handle_Used0, Usart_Used0_Rx_Buff, Usart_Used0_Rx_Buff_Length);
+}
+
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
+{
+    if (huart->Instance == Communication_Usart_Instance_Used0)
+    {
+        /* 测试模式期间屏蔽上位机指令 */
+        if (Test_Mode_Active)
+        {
+            HAL_UARTEx_ReceiveToIdle_DMA(Communication_Usart_Handle_Used0,
+                                         Usart_Used0_Rx_Buff,
+                                         Usart_Used0_Rx_Buff_Length);
+            return;
+        }
+
+        /* ---------- 滤波与死区参数 ---------- */
+        #define POS_DEADZONE_M      0.015f   // 位置死区 1cm (单位: m)
+        #define SERVO0_DEADZONE     3        // 舵机0速度值死区 (0-100 范围内)
+        #define ALPHA               0.65f    // 一阶低通系数
+
+        static float filt_X = 0.0f, filt_Y = 0.0f, filt_Z = 0.0f;
+        static float filt_Servo0 = 50.0f, filt_Servo1 = 0.0f;
+        static float last_X = 0.0f, last_Y = 0.0f, last_Z = 0.0f;
+        static float last_Servo0 = 50.0f, last_Servo1 = 0.0f;
+        static uint8_t first_rx = 1;
+        /* ---------------------------------- */
+
+        float X_Temp = ((float)(int16_t)((Usart_Used0_Rx_Buff[1] << 8) | Usart_Used0_Rx_Buff[0])) / 100.0f;
+        float Y_Temp = ((float)(int16_t)((Usart_Used0_Rx_Buff[3] << 8) | Usart_Used0_Rx_Buff[2])) / 100.0f;
+        float Z_Temp = ((float)(int16_t)((Usart_Used0_Rx_Buff[5] << 8) | Usart_Used0_Rx_Buff[4])) / 100.0f;
+        /* Servo0: 舵机0（摄像头）连续旋转速度指令，范围 0-100，50=停止 */
+        int16_t servo0_raw = (int16_t)((Usart_Used0_Rx_Buff[7] << 8) | Usart_Used0_Rx_Buff[6]);
+        float Servo0_Temp = 50.0f;
+        if (servo0_raw < 0)       Servo0_Temp = 0.0f;
+        else if (servo0_raw > 100) Servo0_Temp = 100.0f;
+        else                       Servo0_Temp = (float)servo0_raw;
+
+        /* Servo2: 舵机1（小臂）位置指令，单位 °，0~180 */
+        float Servo2_Temp = (float)(int16_t)((Usart_Used0_Rx_Buff[9] << 8) | Usart_Used0_Rx_Buff[8]) / 180.0f * PI;
+
+        /* ---------- 一阶低通滤波 ---------- */
+        if (first_rx)
+        {
+            filt_X = X_Temp;
+            filt_Y = Y_Temp;
+            filt_Z = Z_Temp;
+            filt_Servo0 = Servo0_Temp;
+            filt_Servo1 = Servo2_Temp;
+        }
+        else
+        {
+            filt_X += ALPHA * (X_Temp - filt_X);
+            filt_Y += ALPHA * (Y_Temp - filt_Y);
+            filt_Z += ALPHA * (Z_Temp - filt_Z);
+            filt_Servo0 += ALPHA * (Servo0_Temp - filt_Servo0);
+            filt_Servo1 += ALPHA * (Servo2_Temp - filt_Servo1);
+        }
+        /* ---------------------------------- */
+
+        /* ---------- 死区判断 ---------- */
+        if (!first_rx)
+        {
+            if (fabsf(filt_X - last_X) < POS_DEADZONE_M &&
+                fabsf(filt_Y - last_Y) < POS_DEADZONE_M &&
+                fabsf(filt_Z - last_Z) < POS_DEADZONE_M &&
+                fabsf(filt_Servo0 - last_Servo0) < SERVO0_DEADZONE &&
+                fabsf(filt_Servo1 - last_Servo1) < (PI / 180.0f))   /* 舵机1约1°死区 */
+            {
+                HAL_UARTEx_ReceiveToIdle_DMA(Communication_Usart_Handle_Used0,
+                                             Usart_Used0_Rx_Buff,
+                                             Usart_Used0_Rx_Buff_Length);
+                return;
+            }
+        }
+        /* ------------------------------ */
+
+        /* 舵机1（下方连小臂）范围检查，保持原有逻辑 */
+        float servo1_pos = filt_Servo1 - (PI / 2.0f) + Angle_Servo_Offset;
+        if (servo1_pos >= 0.0f && servo1_pos <= PI)
+        {
+            Coordinate_Inverse_Settlement(filt_X, filt_Y, filt_Z, (3.0f * PI / 2.0f) - filt_Servo1, &LK4005_Motor_Handle[0].Motor_Position_Target, &DMJ4310_Motor_Handle[0].Motor_Position_Target, &LK4005_Motor_Handle[1].Motor_Position_Target);
+
+            DMJ4310_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+            LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+            LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+
+            /* 舵机0：360° 连续旋转，0-100 调速，每次收到指令运行固定时间 */
+            Servo0_Speed = (uint8_t)(filt_Servo0 + 0.5f);
+            Servo0_Run_Duration = SERVO0_FIXED_RUN_DURATION_MS;
+            Servo0_Run_Tick = HAL_GetTick();
+            Servo0_Running = 1;
+
+            /* 舵机1：位置型，保持原有逻辑 */
+            LFD01M_Motor_Handle[1].Motor_Position = servo1_pos;
+
+            last_X = filt_X;
+            last_Y = filt_Y;
+            last_Z = filt_Z;
+            last_Servo0 = filt_Servo0;
+            last_Servo1 = filt_Servo1;
+            first_rx = 0;
+        }
+
+        HAL_UARTEx_ReceiveToIdle_DMA(Communication_Usart_Handle_Used0, Usart_Used0_Rx_Buff, Usart_Used0_Rx_Buff_Length);
+    }
+}
+
+void Communication_Test(void)
+{
+    uint8_t package[16] = {0};
+
+    memcpy(&package[0], &LK4005_Motor_Handle[0].Motor_Position_Target, 4);
+    memcpy(&package[4], &LK4005_Motor_Handle[0].Motor_Position_PID_Control_Handle.Motor_Position_Actual, 4);
+    package[12] = 0x00;
+    package[13] = 0x00;
+    package[14] = 0x80;
+    package[15] = 0x7f;
+    HAL_UART_Transmit_DMA(&huart1, package, 16);
+    HAL_Delay(3);
+}
+#include "Control_Algorithm.h"
+#include "DMJ4310_Motor_Driver.h"
+#include "LK4005_Motor_Driver.h"
+
+// 弧度归一化到0~2pi
+float Normalize_Angle(float Angle)
+{
+    float Res = fmodf(Angle, 2.0f * PI);
+    if (Res < 0)
+    {
+        Res += 2.0f * PI;
+    }
+    return Res;
+}
+
+/*
+//达妙电机由于其特殊的CAN报文控制用不到这个函数
+*/
+void Motor_MIT_Control(Motor_MIT_Control_Handle_t *Motor_MIT_Control_Handle)
+{
+    Motor_MIT_Control_Handle->Output = Motor_MIT_Control_Handle->MIT_Kp * (Motor_MIT_Control_Handle->Motor_Position_Target - Motor_MIT_Control_Handle->Motor_Position_Actual) + Motor_MIT_Control_Handle->MIT_Kd * (Motor_MIT_Control_Handle->Motor_Velocity_Target - Motor_MIT_Control_Handle->Motor_Velocity_Actual) + Motor_MIT_Control_Handle->Motor_Torque_Feedforward;
+
+    if (fabsf(Motor_MIT_Control_Handle->Motor_Velocity_Actual) >= 0.001f)
+    {
+        Motor_MIT_Control_Handle->Output += (Motor_MIT_Control_Handle->Motor_Velocity_Actual) / fabsf(Motor_MIT_Control_Handle->Motor_Velocity_Actual) * Motor_MIT_Control_Handle->Motor_Torque_Friction;
+    }
+}
+
+static float Calc_V1(float a_max, float j)
+{
+    return (a_max * a_max) / (2.0f * j);
+}
+
+static float Calc_Decel_Dist(float v, float a_max, float j)
+{
+    return (v * v) / (2.0f * a_max) + (v * a_max) / (2.0f * j);
+}
+
+void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_actual, float position_target)
+{
+    uint32_t Current_Time = HAL_GetTick();
+    float dt = (Current_Time - Speed_Plan_Handle->Time_Stamp) * 0.001f;
+    float v1 = Calc_V1(Speed_Plan_Handle->a_limit, Speed_Plan_Handle->j_limit);
+
+    switch (Speed_Plan_Handle->Speed_Plan_State)
+    {
+    case idle:
+    {
+        Speed_Plan_Handle->a = 0;
+        Speed_Plan_Handle->v = 0;
+        Speed_Plan_Handle->s = 0;
+        break;
+    }
+    case init:
+    {
+        float old_direction = Speed_Plan_Handle->direction_flag;
+        Speed_Plan_Handle->error_s = position_target - position_actual;
+        Speed_Plan_Handle->position_initial = position_actual;
+
+        if (Speed_Plan_Handle->error_s >= 0)
+        {
+            Speed_Plan_Handle->direction_flag = 1.0f;
+        }
+        else
+        {
+            Speed_Plan_Handle->direction_flag = -1.0f;
+        }
+
+        /* Direction reversal: attenuate inherited velocity to reduce Kd shock */
+        if (old_direction * Speed_Plan_Handle->direction_flag < 0.0f)
+        {
+            Speed_Plan_Handle->v *= 0.3f;
+        }
+
+        /* Adaptive v_limit: pre-compute peak speed for this displacement */
+        {
+            float S = fabsf(Speed_Plan_Handle->error_s);
+            float v1 = Calc_V1(Speed_Plan_Handle->a_max, Speed_Plan_Handle->j);
+            float b = (Speed_Plan_Handle->a_max * Speed_Plan_Handle->a_max) / Speed_Plan_Handle->j;
+            float discriminant = b * b + 4.0f * S * Speed_Plan_Handle->a_max;
+            float v_peak = (-b + sqrtf(discriminant)) / 2.0f;
+
+            if (v_peak < 2.0f * v1)
+            {
+                /* Triangle S-curve: cannot even reach a_max */
+                v_peak = powf(0.5f * Speed_Plan_Handle->j * S * S, 1.0f / 3.0f);
+            }
+
+            /* Short-distance attenuation: further reduce v_limit for small moves */
+            float scale = 1.0f;
+            if (S < 0.03f)
+            {
+                scale = 0.15f;   /* tiny step: 30% */
+            }
+            else if (S < 0.06f)
+            {
+                scale = 0.2f;   /* small step: 40% */
+            }
+            else if (S < 0.15f)
+            {
+                scale = 0.3f;   /* medium step: 60% */
+            }
+            v_peak *= scale;
+
+            Speed_Plan_Handle->v_limit = fminf(v_peak, Speed_Plan_Handle->v_max);
+            if (Speed_Plan_Handle->v_limit < 0.0f)
+            {
+                Speed_Plan_Handle->v_limit = 0.0f;
+            }
+
+            /* Dynamic j_limit for smoother short-distance motion */
+            if (S < 0.03f)
+            {
+                Speed_Plan_Handle->j_limit = 6.0f;
+            }
+            else if (S < 0.06f)
+            {
+                Speed_Plan_Handle->j_limit = 8.0f;
+            }
+            else if (S < 0.15f)
+            {
+                Speed_Plan_Handle->j_limit = 10.0f;
+            }
+            else
+            {
+                Speed_Plan_Handle->j_limit = Speed_Plan_Handle->j;
+            }
+
+            /* Compute effective max accel: ensure v_limit >= 2*v1' */
+            float v1_limit = Calc_V1(Speed_Plan_Handle->a_max, Speed_Plan_Handle->j_limit);
+            if (Speed_Plan_Handle->v_limit < 2.0f * v1_limit)
+            {
+                Speed_Plan_Handle->a_limit = sqrtf(Speed_Plan_Handle->j_limit * Speed_Plan_Handle->v_limit);
+            }
+            else
+            {
+                Speed_Plan_Handle->a_limit = Speed_Plan_Handle->a_max;
+            }
+        }
+
+        Speed_Plan_Handle->a = 0;
+        Speed_Plan_Handle->s = 0;
+
+        Speed_Plan_Handle->Speed_Plan_State = phase1;
+        break;
+    }
+    case phase1:
+    {
+        Speed_Plan_Handle->a += Speed_Plan_Handle->j_limit * dt;
+        Speed_Plan_Handle->v += Speed_Plan_Handle->a * dt;
+        Speed_Plan_Handle->s += Speed_Plan_Handle->v * dt;
+
+        if (Speed_Plan_Handle->a >= Speed_Plan_Handle->a_limit)
+        {
+            Speed_Plan_Handle->a = Speed_Plan_Handle->a_limit;
+            Speed_Plan_Handle->Speed_Plan_State = phase2;
+        }
+        break;
+    }
+    case phase2:
+    {
+        Speed_Plan_Handle->v += Speed_Plan_Handle->a * dt;
+        Speed_Plan_Handle->s += Speed_Plan_Handle->v * dt;
+
+        if (Speed_Plan_Handle->v >= Speed_Plan_Handle->v_limit - v1)
+        {
+            Speed_Plan_Handle->Speed_Plan_State = phase3;
+        }
+        break;
+    }
+    case phase3:
+    {
+        Speed_Plan_Handle->a -= Speed_Plan_Handle->j_limit * dt;
+        Speed_Plan_Handle->v += Speed_Plan_Handle->a * dt;
+        Speed_Plan_Handle->s += Speed_Plan_Handle->v * dt;
+
+        if (Speed_Plan_Handle->a <= 0)
+        {
+            Speed_Plan_Handle->a = 0;
+            if (Speed_Plan_Handle->v > Speed_Plan_Handle->v_limit)
+                Speed_Plan_Handle->v = Speed_Plan_Handle->v_limit;
+            Speed_Plan_Handle->Speed_Plan_State = phase3_end;
+        }
+        break;
+    }
+    case phase3_end:
+    {
+        float decel_dist = Calc_Decel_Dist(Speed_Plan_Handle->v, Speed_Plan_Handle->a_limit, Speed_Plan_Handle->j_limit);
+
+        if (Speed_Plan_Handle->s >= fabsf(Speed_Plan_Handle->error_s) - decel_dist)
+        {
+            Speed_Plan_Handle->Speed_Plan_State = phase5;
+        }
+        else
+        {
+            Speed_Plan_Handle->Speed_Plan_State = phase4;
+        }
+        break;
+    }
+    case phase4:
+    {
+        Speed_Plan_Handle->s += Speed_Plan_Handle->v * dt;
+
+        float decel_dist = Calc_Decel_Dist(Speed_Plan_Handle->v, Speed_Plan_Handle->a_limit, Speed_Plan_Handle->j_limit);
+
+        if (Speed_Plan_Handle->s >= fabsf(Speed_Plan_Handle->error_s) - decel_dist)
+        {
+            Speed_Plan_Handle->Speed_Plan_State = phase5;
+        }
+        break;
+    }
+    case phase5:
+    {
+        Speed_Plan_Handle->a -= Speed_Plan_Handle->j * dt;
+        Speed_Plan_Handle->v += Speed_Plan_Handle->a * dt;
+        Speed_Plan_Handle->s += Speed_Plan_Handle->v * dt;
+
+        if (Speed_Plan_Handle->a <= -Speed_Plan_Handle->a_limit)
+        {
+            Speed_Plan_Handle->a = -Speed_Plan_Handle->a_limit;
+            Speed_Plan_Handle->Speed_Plan_State = phase6;
+        }
+        break;
+    }
+    case phase6:
+    {
+        Speed_Plan_Handle->v += Speed_Plan_Handle->a * dt;
+        Speed_Plan_Handle->s += Speed_Plan_Handle->v * dt;
+
+        if (Speed_Plan_Handle->v <= v1)
+        {
+            Speed_Plan_Handle->Speed_Plan_State = phase7;
+        }
+        break;
+    }
+    case phase7:
+    {
+        Speed_Plan_Handle->a += Speed_Plan_Handle->j_limit * dt;
+        Speed_Plan_Handle->v += Speed_Plan_Handle->a * dt;
+        Speed_Plan_Handle->s += Speed_Plan_Handle->v * dt;
+
+        if (Speed_Plan_Handle->a >= 0 || Speed_Plan_Handle->v <= 0)
+        {
+            Speed_Plan_Handle->a = 0;
+            Speed_Plan_Handle->v = 0;
+            Speed_Plan_Handle->Speed_Plan_State = idle;
+        }
+        break;
+    }
+    }
+    if (fabsf(Speed_Plan_Handle->s - fabsf(Speed_Plan_Handle->error_s)) <= 0.003f || Speed_Plan_Handle->v < 0 || Speed_Plan_Handle->s - fabsf(Speed_Plan_Handle->error_s) >= 0)
+    {
+        Speed_Plan_Handle->v = 0;
+        Speed_Plan_Handle->a = 0;
+        Speed_Plan_Handle->s = 0;
+        Speed_Plan_Handle->Speed_Plan_State = idle;
+    }
+    Speed_Plan_Handle->Time_Stamp = HAL_GetTick();
+}
+
+float Upperarm_Gravity_Compensation(float Upperarm_Motor_Angle, float Forearm_Motor_Angle)
+{
+    return ((Robotic_Arm_Mass_L1 * Robotic_Arm_Length_L1 * 0.5f + Robotic_Arm_Mass_Forearm_Motor * Robotic_Arm_Length_L1) * g * cosf(Robotic_Arm_Angle_Offset + Upperarm_Motor_Angle) + (Robotic_Arm_Mass_L2 * (Robotic_Arm_Length_L2 * 0.5f) + Robotic_Arm_Mass_End * Robotic_Arm_Length_L2) * g * cosf(Robotic_Arm_Angle_Offset + Upperarm_Motor_Angle + Forearm_Motor_Angle));
+}
+
+float Forearm_Gravity_Compensation(float Upperarm_Motor_Angle, float Forearm_Motor_Angle)
+{
+    return (Robotic_Arm_Mass_L2 * Robotic_Arm_Length_L2 * 0.5f + Robotic_Arm_Mass_End * Robotic_Arm_Length_L2) * g * cosf(Robotic_Arm_Angle_Offset + Upperarm_Motor_Angle + Forearm_Motor_Angle);
+}
+
+/*
+单位统一为国际单位制
+*/
+void Coordinate_Inverse_Settlement(float X, float Y, float Z, float Servo_Angle,float *Gimbal_Angle, float *Joint_Upper_Angle, float *Joint_Fore_Angle)
+{
+    if (fabsf((Robotic_Arm_Length_L1 * Robotic_Arm_Length_L1 + Robotic_Arm_Length_L2 * Robotic_Arm_Length_L2 - X * X - Y * Y - (Z - Robotic_Arm_Length_Connect) * (Z - Robotic_Arm_Length_Connect)) / (2.0f * Robotic_Arm_Length_L1 * Robotic_Arm_Length_L2)) < 1.0f && fabsf(Robotic_Arm_Length_L2 * sinf(acosf((Robotic_Arm_Length_L1 * Robotic_Arm_Length_L1 + Robotic_Arm_Length_L2 * Robotic_Arm_Length_L2 - X * X - Y * Y - (Z - Robotic_Arm_Length_Connect) * (Z - Robotic_Arm_Length_Connect)) / (2.0f * Robotic_Arm_Length_L1 * Robotic_Arm_Length_L2))) / sqrtf(X * X + Y * Y + (Z - Robotic_Arm_Length_Connect) * (Z - Robotic_Arm_Length_Connect))) < 1.0f)
+    {
+        *Gimbal_Angle = (PI / 2.0f) + atan2f(Y, X) + floorf(LK4005_Motor_Handle[0].Motor_Position_PID_Control_Handle.Motor_Position_Actual / (2.0f * PI)) * 2.0f * PI;
+        float L2_Length_Virtual = sqrtf(Robotic_Arm_Length_L2 * Robotic_Arm_Length_L2 + Robotic_Arm_Length_End * Robotic_Arm_Length_End - 2.0f * Robotic_Arm_Length_End * Robotic_Arm_Length_L2 * cosf(Servo_Angle));
+        float L2_Angle_Virtual = fabsf(asinf(Robotic_Arm_Length_End * sinf(Servo_Angle) / L2_Length_Virtual));
+
+        float temp = acosf((Robotic_Arm_Length_L1 * Robotic_Arm_Length_L1 + L2_Length_Virtual * L2_Length_Virtual - X * X - Y * Y - (Z - Robotic_Arm_Length_Connect) * (Z - Robotic_Arm_Length_Connect)) / (2.0f * Robotic_Arm_Length_L1 * L2_Length_Virtual));
+        *Joint_Upper_Angle = -Normalize_Angle(asinf(L2_Length_Virtual * sinf(temp) / sqrtf(X * X + Y * Y + (Z - Robotic_Arm_Length_Connect) * (Z - Robotic_Arm_Length_Connect))) + atan2f(Z - Robotic_Arm_Length_Connect, sqrtf(X * X + Y * Y + (Z - Robotic_Arm_Length_Connect) * (Z - Robotic_Arm_Length_Connect))) + Angle_Joint_Upper_Offset);
+        *Joint_Fore_Angle = Normalize_Angle(temp + Angle_Joint_Fore_Offset - L2_Angle_Virtual);
+    }
+}
+#include "LFD01M_Motor_Driver.h"
+
+LFD01M_Motor_Handle_t LFD01M_Motor_Handle[LFD01M_Motor_Number] = {0};
+
+void LFD01M_Motor_Control_Init(void)
+{
+    LFD01M_Motor_Handle[0].Motor_PWM_Timer = &htim1;
+    LFD01M_Motor_Handle[0].Motor_PWM_Channel = TIM_CHANNEL_3;
+    LFD01M_Motor_Handle[0].Motor_Type = Servo;//上方的舵机与摄像头直接相连
+    LFD01M_Motor_Handle[0].Motor_Position = 1.57f;
+    LFD01M_Motor_Handle[1].Motor_PWM_Timer = &htim2;
+    LFD01M_Motor_Handle[1].Motor_PWM_Channel = TIM_CHANNEL_3;
+    LFD01M_Motor_Handle[1].Motor_Type = Servo;//下方的舵机
+    LFD01M_Motor_Handle[1].Motor_Position = 1.37f;
+
+    HAL_TIM_PWM_Start(LFD01M_Motor_Handle[0].Motor_PWM_Timer, LFD01M_Motor_Handle[0].Motor_PWM_Channel);
+    HAL_TIM_PWM_Start(LFD01M_Motor_Handle[1].Motor_PWM_Timer, LFD01M_Motor_Handle[1].Motor_PWM_Channel);
+}
+
+void LFD01M_Motor_Set_Angle(LFD01M_Motor_Handle_t LFD01M_Motor_Handle)
+{
+    if (LFD01M_Motor_Handle.Motor_Position >= 0.0f && LFD01M_Motor_Handle.Motor_Position <= PI)
+    {
+        uint16_t Target_CCR_Temp = (uint16_t)(LFD01M_Motor_PWM_CCR_Min + (LFD01M_Motor_Handle.Motor_Position / PI) * (LFD01M_Motor_PWM_CCR_Max - LFD01M_Motor_PWM_CCR_Min));
+        __HAL_TIM_SET_COMPARE(LFD01M_Motor_Handle.Motor_PWM_Timer, LFD01M_Motor_Handle.Motor_PWM_Channel, Target_CCR_Temp);
+    }
+}
+
+/*
+ * @brief 360° 连续旋转舵机速度控制 (0-100 线性调速)
+ * @param speed_0to100: 0-100
+ *        0   = 左转最高速 (1100 μs)
+ *        50  = 停止       (1500 μs)
+ *        100 = 右转最高速 (1900 μs)
+ * @note 基于实测: 此舵机支持脉宽调速，偏离中位越多转速越快
+ */
+void LFD01M_Motor_Set_Speed(LFD01M_Motor_Handle_t LFD01M_Motor_Handle, uint8_t speed_0to100)
+{
+    if (speed_0to100 > 100) speed_0to100 = 100;
+
+    /* 线性映射: 0→1100, 50→1500, 100→1900 */
+    uint16_t pulse_us = (uint16_t)(1100 + ((uint32_t)speed_0to100 * 800U / 100U));
+    __HAL_TIM_SET_COMPARE(LFD01M_Motor_Handle.Motor_PWM_Timer,
+                          LFD01M_Motor_Handle.Motor_PWM_Channel,
+                          pulse_us);
+}
+#include "DMJ4310_Motor_Driver.h"
+#include "Control_Algorithm.h"
+
+DMJ4310_Motor_Handle_t DMJ4310_Motor_Handle[DMJ4310_Motor_Number] ={0};
+
+void DMJ4310_Motor_Control_Init(void)
+{
+    DMJ4310_Motor_Handle[0].Motor_FDCAN_Handle = &hfdcan2;
+    DMJ4310_Motor_Handle[0].Motor_ID = 1;
+    DMJ4310_Motor_Handle[0].Motor_Type = Joint_Upper;
+    DMJ4310_Motor_Handle[0].Motor_MIT_Control_Handle.MIT_Kp = 67.8f;
+    DMJ4310_Motor_Handle[0].Motor_MIT_Control_Handle.MIT_Kd = 1.73f;
+    DMJ4310_Motor_Handle[0].Motor_Position_Target = -0.605f;
+    DMJ4310_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+    DMJ4310_Motor_Handle[0].Motor_Speed_Plan_Handle.j = 15.5f;
+    DMJ4310_Motor_Handle[0].Motor_Speed_Plan_Handle.a_max = 1.5f;
+    DMJ4310_Motor_Handle[0].Motor_Speed_Plan_Handle.v_max = 0.45f;
+
+    FDCAN_FilterTypeDef sfilter = {0};
+    sfilter.IdType = FDCAN_STANDARD_ID;
+    sfilter.FilterIndex = 0;
+    sfilter.FilterType = FDCAN_FILTER_RANGE;
+    sfilter.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
+    sfilter.FilterID1 = 0x000;
+    sfilter.FilterID2 = 0x00F;
+    HAL_FDCAN_ConfigFilter(DMJ4310_Motor_Handle[0].Motor_FDCAN_Handle, &sfilter);
+
+    HAL_FDCAN_ActivateNotification(DMJ4310_Motor_Handle[0].Motor_FDCAN_Handle, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
+}
+
+/*
+MIT控制帧也被视为请求帧,引发DMJ4310发送反馈帧
+*/
+void DMJ4310_Motor_MIT_Control(DMJ4310_Motor_Handle_t DMJ4310_Motor_Handle)
+{
+    uint8_t FDCAN_Send_Temp[DMJ4310_Motor_FDCAN_Length] = {0};
+
+    uint16_t Position_Temp = Float_To_Uint(DMJ4310_Motor_Handle.Motor_MIT_Control_Handle.Motor_Position_Target, DMJ4310_Motor_Position_Min, DMJ4310_Motor_Position_Max, DMJ4310_Motor_Position_Length);
+    uint16_t Velocity_Temp = Float_To_Uint(DMJ4310_Motor_Handle.Motor_MIT_Control_Handle.Motor_Velocity_Target, DMJ4310_Motor_Velocity_Min, DMJ4310_Motor_Velocity_Max, DMJ4310_Motor_Velocity_Length);
+    uint16_t MIT_Kp_Temp = Float_To_Uint(DMJ4310_Motor_Handle.Motor_MIT_Control_Handle.MIT_Kp, DMJ4310_Motor_MIT_Kp_Min, DMJ4310_Motor_MIT_Kp_Max, DMJ4310_Motor_MIT_Kp_Length);
+    uint16_t MIT_Kd_Temp = Float_To_Uint(DMJ4310_Motor_Handle.Motor_MIT_Control_Handle.MIT_Kd, DMJ4310_Motor_MIT_Kd_Min, DMJ4310_Motor_MIT_Kd_Max, DMJ4310_Motor_MIT_Kd_Length);
+    uint16_t Torque_Temp = Float_To_Uint(DMJ4310_Motor_Handle.Motor_MIT_Control_Handle.Motor_Torque_Feedforward, DMJ4310_Motor_Torque_Min, DMJ4310_Motor_Torque_Max, DMJ4310_Motor_Torque_Length);
+
+    FDCAN_Send_Temp[0] = Position_Temp >> 8;
+    FDCAN_Send_Temp[1] = Position_Temp & 0xFF;
+    FDCAN_Send_Temp[2] = Velocity_Temp >> 4;
+    FDCAN_Send_Temp[3] = ((Velocity_Temp & 0xF) << 4) | (MIT_Kp_Temp >> 8);
+    FDCAN_Send_Temp[4] = MIT_Kp_Temp & 0xFF;
+    FDCAN_Send_Temp[5] = MIT_Kd_Temp >> 4;
+    FDCAN_Send_Temp[6] = ((MIT_Kd_Temp & 0xF) << 4) | (Torque_Temp >> 8);
+    FDCAN_Send_Temp[7] = Torque_Temp & 0xFF;
+
+    FDCAN_Send_Standard(DMJ4310_Motor_Handle.Motor_FDCAN_Handle, DMJ4310_Motor_Handle.Motor_ID, FDCAN_Send_Temp, DMJ4310_Motor_FDCAN_Length);
+}
+
+void DMJ4310_Motor_Enable(DMJ4310_Motor_Handle_t DMJ4310_Motor_Handle)
+{
+    uint8_t FDCAN_Send_Temp[DMJ4310_Motor_FDCAN_Length] = {0};
+    FDCAN_Send_Temp[0] = 0xFF;
+    FDCAN_Send_Temp[1] = 0xFF;
+    FDCAN_Send_Temp[2] = 0xFF;
+    FDCAN_Send_Temp[3] = 0xFF;
+    FDCAN_Send_Temp[4] = 0xFF;
+    FDCAN_Send_Temp[5] = 0xFF;
+    FDCAN_Send_Temp[6] = 0xFF;
+    FDCAN_Send_Temp[7] = 0xFC;
+    FDCAN_Send_Standard(DMJ4310_Motor_Handle.Motor_FDCAN_Handle, DMJ4310_Motor_Handle.Motor_ID, FDCAN_Send_Temp, DMJ4310_Motor_FDCAN_Length);
+}
+
+void DMJ4310_Motor_Response_Data_Explain(FDCAN_HandleTypeDef *hfdcan, FDCAN_RxHeaderTypeDef FDCAN_Rx_Head_Temp, uint8_t *FDCAN_Rx_Data_Temp, DMJ4310_Motor_Handle_t *DMJ4310_Motor_Handle)
+{
+    if (hfdcan == DMJ4310_Motor_Handle->Motor_FDCAN_Handle)
+    {
+        if (FDCAN_Rx_Head_Temp.Identifier == DMJ4310_Motor_FDCAN_Response_ID && FDCAN_Rx_Head_Temp.DataLength == DMJ4310_Motor_FDCAN_Length)
+        {
+            if ((DMJ4310_Motor_Handle->Motor_ID & 0xFF) == (FDCAN_Rx_Data_Temp[0] >> 4))
+            {
+                DMJ4310_Motor_Handle->Motor_Status = (FDCAN_Rx_Data_Temp[0] & 0x0F);
+                uint16_t Position_Temp = (FDCAN_Rx_Data_Temp[1] << 8) | FDCAN_Rx_Data_Temp[2];
+                uint16_t Velocity_Temp = (FDCAN_Rx_Data_Temp[3] << 4) | (FDCAN_Rx_Data_Temp[4] >> 4);
+                uint16_t Torque_Temp = ((FDCAN_Rx_Data_Temp[4] & 0x0F) << 8) | FDCAN_Rx_Data_Temp[5];
+
+                DMJ4310_Motor_Handle->Motor_MIT_Control_Handle.Motor_Position_Actual = Uint_To_Float((int)Position_Temp, DMJ4310_Motor_Position_Min, DMJ4310_Motor_Position_Max, DMJ4310_Motor_Position_Length);
+                DMJ4310_Motor_Handle->Motor_MIT_Control_Handle.Motor_Velocity_Actual = Uint_To_Float((int)Velocity_Temp, DMJ4310_Motor_Velocity_Min, DMJ4310_Motor_Velocity_Max, DMJ4310_Motor_Velocity_Length);
+                DMJ4310_Motor_Handle->Motor_Torque_Actual = Uint_To_Float((int)Torque_Temp, DMJ4310_Motor_Torque_Min, DMJ4310_Motor_Torque_Max, DMJ4310_Motor_Torque_Length);
+            }
+            DMJ4310_Motor_Handle->Wait_Count++;
+        }
+    }
+}
+#include "LK4005_Motor_Driver.h"
+#include "Control_Algorithm.h"
+
+LK4005_Motor_Handle_t LK4005_Motor_Handle[LK4005_Motor_Number] = {0};
+int32_t Position_Temp = 0;
+
+void LK4005_Motor_Control_Init(void)
+{
+    LK4005_Motor_Handle[0].Motor_FDCAN_Handle = &hfdcan1;
+    LK4005_Motor_Handle[0].Motor_ID = 0x14C;
+    LK4005_Motor_Handle[0].Motor_Type = Gimbal;
+    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.j = 15.5f;
+    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.a_max = 2.5f;
+    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.v_max = 0.75f;
+
+    LK4005_Motor_Handle[1].Motor_FDCAN_Handle = &hfdcan2;
+    LK4005_Motor_Handle[1].Motor_ID = 0x149;
+    LK4005_Motor_Handle[1].Motor_Type = Joint_Fore;
+    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].MIT_Kp = 100.5f;
+    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[1].MIT_Kp = 100.5f;
+    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].MIT_Kd = 2.05f;
+    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[1].MIT_Kd = 1.45f;
+    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].Motor_Torque_Friction = 0.02f;
+    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[1].Motor_Torque_Friction = 0.02f;
+    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].Output = 0.0f;
+    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[1].Output = 0.0f;
+    LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.j = 15.5f;
+    LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.a_max = 1.5f;
+    LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.v_max = 0.45f;
+
+    FDCAN_FilterTypeDef sfilter = {0};
+    sfilter.IdType = FDCAN_STANDARD_ID;
+    sfilter.FilterIndex = 1;
+    sfilter.FilterType = FDCAN_FILTER_RANGE;
+    sfilter.FilterConfig = FDCAN_FILTER_TO_RXFIFO1;
+    sfilter.FilterID1 = 0x140;
+    sfilter.FilterID2 = 0x14F;
+    HAL_FDCAN_ConfigFilter(LK4005_Motor_Handle[0].Motor_FDCAN_Handle, &sfilter);
+    HAL_FDCAN_ConfigFilter(LK4005_Motor_Handle[1].Motor_FDCAN_Handle, &sfilter);
+
+    HAL_FDCAN_ActivateNotification(LK4005_Motor_Handle[0].Motor_FDCAN_Handle, FDCAN_IT_RX_FIFO1_NEW_MESSAGE, 0);
+    HAL_FDCAN_ActivateNotification(LK4005_Motor_Handle[1].Motor_FDCAN_Handle, FDCAN_IT_RX_FIFO1_NEW_MESSAGE, 0);
+}
+
+void LK4005_Motor_Torque_Control(LK4005_Motor_Handle_t LK4005_Motor_Handle, Motor_MIT_Control_Handle_t Motor_MIT_Control_Handle)
+{
+    if (Motor_MIT_Control_Handle.Output <= -33.0f)
+    {
+        Motor_MIT_Control_Handle.Output = -33.0f;
+    }
+    else if (Motor_MIT_Control_Handle.Output >= 33.0f)
+    {
+        Motor_MIT_Control_Handle.Output = 33.0f;
+    }
+    uint8_t FDCAN_Send_Temp[LK4005_Motor_FDCAN_Length] = {0};
+    int16_t Torque_Temp = (int16_t)(Motor_MIT_Control_Handle.Output * Torque_Conversion_Ratio);
+    FDCAN_Send_Temp[0] = 0xA1;
+    FDCAN_Send_Temp[4] = (uint8_t)(Torque_Temp & 0xFF);
+    FDCAN_Send_Temp[5] = (uint8_t)((Torque_Temp >> 8) & 0xFF);
+    FDCAN_Send_Standard(LK4005_Motor_Handle.Motor_FDCAN_Handle, LK4005_Motor_Handle.Motor_ID, FDCAN_Send_Temp, LK4005_Motor_FDCAN_Length);
+}
+
+void LK4005_Motor_Position_Control(LK4005_Motor_Handle_t LK4005_Motor_Handle)
+{
+    uint8_t FDCAN_Send_Temp[LK4005_Motor_FDCAN_Length] = {0};
+    Position_Temp = (int32_t)((LK4005_Motor_Handle.Motor_Position_PID_Control_Handle.Motor_Position_Target + Angle_Gimbal_Offset) * 180.0f / PI * 100.0f *Reduction_Ratio);
+    FDCAN_Send_Temp[0] = 0xA3;
+    FDCAN_Send_Temp[4] = (uint8_t)(Position_Temp & 0xFF);
+    FDCAN_Send_Temp[5] = (uint8_t)((Position_Temp >> 8 * 1) & 0xFF);
+    FDCAN_Send_Temp[6] = (uint8_t)((Position_Temp >> 8 * 2) & 0xFF);
+    FDCAN_Send_Temp[7] = (uint8_t)((Position_Temp >> 8 * 3) & 0xFF);
+    FDCAN_Send_Standard(LK4005_Motor_Handle.Motor_FDCAN_Handle, LK4005_Motor_Handle.Motor_ID, FDCAN_Send_Temp, LK4005_Motor_FDCAN_Length);
+}
+
+void LK4005_Motor_Read_Position(LK4005_Motor_Handle_t LK4005_Motor_Handle)
+{
+    uint8_t FDCAN_Send_Temp[LK4005_Motor_FDCAN_Length] = {0};
+    FDCAN_Send_Temp[0] = 0x92;
+    FDCAN_Send_Standard(LK4005_Motor_Handle.Motor_FDCAN_Handle, LK4005_Motor_Handle.Motor_ID, FDCAN_Send_Temp, LK4005_Motor_FDCAN_Length);
+}
+
+void LK4005_Motor_Read_Velocity(LK4005_Motor_Handle_t LK4005_Motor_Handle)
+{
+    uint8_t FDCAN_Send_Temp[LK4005_Motor_FDCAN_Length] = {0};
+    FDCAN_Send_Temp[0] = 0x9C;
+    FDCAN_Send_Standard(LK4005_Motor_Handle.Motor_FDCAN_Handle, LK4005_Motor_Handle.Motor_ID, FDCAN_Send_Temp, LK4005_Motor_FDCAN_Length);
+}
+
+void LK4005_Motor_Response_Data_Explain(FDCAN_HandleTypeDef *hfdcan, FDCAN_RxHeaderTypeDef FDCAN_Rx_Head_Temp, uint8_t *FDCAN_Rx_Data_Temp, LK4005_Motor_Handle_t *LK4005_Motor_Handle)
+{
+    if (hfdcan == LK4005_Motor_Handle->Motor_FDCAN_Handle)
+    {
+        if (FDCAN_Rx_Head_Temp.Identifier == LK4005_Motor_Handle->Motor_ID && FDCAN_Rx_Head_Temp.DataLength == LK4005_Motor_FDCAN_Length)
+        {
+            if (FDCAN_Rx_Data_Temp[0] == 0x92)
+            {
+                /* 0x92 读取多圈角度：DATA[1]~DATA[7] 为 motorAngle(int64_t) 的 7 个字节，单位 0.01°/LSB */
+                int64_t motorAngle_raw =
+                    ((int64_t)(int8_t)FDCAN_Rx_Data_Temp[7] << 48) |
+                    ((int64_t)FDCAN_Rx_Data_Temp[6] << 40) |
+                    ((int64_t)FDCAN_Rx_Data_Temp[5] << 32) |
+                    ((int64_t)FDCAN_Rx_Data_Temp[4] << 24) |
+                    ((int64_t)FDCAN_Rx_Data_Temp[3] << 16) |
+                    ((int64_t)FDCAN_Rx_Data_Temp[2] << 8)  |
+                    ((int64_t)FDCAN_Rx_Data_Temp[1]);
+
+                /* 0.01°/LSB -> 度 -> 弧度 -> 除以减速比得到输出轴角度 */
+                float motor_angle_rad = (float)motorAngle_raw * 0.01f * PI / 180.0f;
+                LK4005_Motor_Handle->Motor_MIT_Control_Handle[0].Motor_Position_Actual = motor_angle_rad / Reduction_Ratio;
+
+                if (LK4005_Motor_Handle->Motor_Type == Gimbal)
+                {
+                    LK4005_Motor_Handle->Motor_MIT_Control_Handle[0].Motor_Position_Actual = LK4005_Motor_Handle->Motor_MIT_Control_Handle[0].Motor_Position_Actual - Angle_Gimbal_Offset;
+                }
+                else if (LK4005_Motor_Handle->Motor_Type == Joint_Fore)
+                {
+                    LK4005_Motor_Handle->Motor_MIT_Control_Handle[0].Motor_Position_Actual = Normalize_Angle(LK4005_Motor_Handle->Motor_MIT_Control_Handle[0].Motor_Position_Actual);
+                }
+                LK4005_Motor_Handle->Motor_Position_PID_Control_Handle.Motor_Position_Actual = LK4005_Motor_Handle->Motor_MIT_Control_Handle[0].Motor_Position_Actual;
+
+                LK4005_Motor_Handle->Motor_MIT_Control_Handle[1].Motor_Position_Actual = LK4005_Motor_Handle->Motor_MIT_Control_Handle[0].Motor_Position_Actual;
+            }
+
+            else if (FDCAN_Rx_Data_Temp[0] == 0x9C)
+            {
+                LK4005_Motor_Handle->Motor_MIT_Control_Handle[0].Motor_Velocity_Actual = (float)((int16_t)(FDCAN_Rx_Data_Temp[5] << 8 | FDCAN_Rx_Data_Temp[4])) * PI / (180.0f * Reduction_Ratio);
+
+                LK4005_Motor_Handle->Motor_MIT_Control_Handle[1].Motor_Velocity_Actual = LK4005_Motor_Handle->Motor_MIT_Control_Handle[0].Motor_Velocity_Actual;
+            }
+            LK4005_Motor_Handle->Wait_Count++;
+        }
+    }
+}
+#include "BMI088_IMU_Driver.h"
+
+void Accel_CS_Low(void)
+{
+    HAL_GPIO_WritePin(SPI2_CS0_GPIO_Port, SPI2_CS0_Pin, GPIO_PIN_RESET);
+}
+
+void Accel_CS_High(void)
+{
+    HAL_GPIO_WritePin(SPI2_CS0_GPIO_Port, SPI2_CS0_Pin, GPIO_PIN_SET);
+}
+
+void Gyro_CS_Low(void)
+{
+    HAL_GPIO_WritePin(SPI2_CS1_GPIO_Port, SPI2_CS1_Pin, GPIO_PIN_RESET);
+}
+
+void Gyro_CS_High(void)
+{
+    HAL_GPIO_WritePin(SPI2_CS1_GPIO_Port, SPI2_CS1_Pin, GPIO_PIN_SET);
+}

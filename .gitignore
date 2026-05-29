@@ -1,0 +1,24 @@
+# Build outputs
+build/
+*.o
+*.out
+
+# Large models
+models/*.rknn
+
+# Backup dirs
+backup/
+*.bak/
+
+# Calibration images
+calib/images/
+calib_result.png
+
+# Temp files
+/tmp/
+sudo
+*.log
+
+# IDE
+.vscode/
+.idea/
