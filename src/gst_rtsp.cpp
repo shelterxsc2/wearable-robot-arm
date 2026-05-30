@@ -363,10 +363,11 @@ int start_rtsp_server(const char *device, GMainLoop **loop_ptr) {
     g_print("[RTSP] Features: YOLOv8-Pose20 FP + RGA hardware draw\n");
     g_print("[RTSP] ==============================================\n\n");
 
-    *loop_ptr = g_main_loop_new(NULL, FALSE);
-    g_main_loop_run(*loop_ptr);
+    GMainLoop *loop = g_main_loop_new(NULL, FALSE);
+    *loop_ptr = loop;
+    g_main_loop_run(loop);
 
-    g_main_loop_unref(*loop_ptr);
+    g_main_loop_unref(loop);
     g_object_unref(server);
     return 0;
 }

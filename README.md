@@ -1,8 +1,10 @@
-# 可穿戴机械臂 — NRF24 IMU 控制 + RTSP 推流
+# 可穿戴机械臂 — RTMP 云端推流 + 端侧控制 + NRF24 IMU 控制
 
-> **分支**: `imu-rtsp-main`  
+> **分支**: `imu-rtm/sp-main`  
 > **核心路径**: NRF24 无线 IMU → 8 状态运动状态机 → UART → STM32  
-> **视觉链路**: 仅用于 RTSP 推流与画面显示，不参与控制
+> **视觉链路**: MJPG → mppjpegdec → identity handoff → AI 绘制 → H264 → FLV → RTMP  
+> **云端交互**: WebSocket 注册 + 心跳 (device-003)  
+> **端侧控制**: HTTP API @ 8080 (模式/标定/舵机/命令)
 
 ---
 
@@ -10,7 +12,7 @@
 
 | 组件 | 型号/职责 |
 |------|----------|
-| 上位机 | RK3588 (ELF2) — IMU 接收、运动预测、RTSP 推流 |
+| 上位机 | RK3588 (ELF2) — IMU 接收、运动预测、RTMP 推流、端侧控制 |
 | 下位机 | STM32H723 — 逆运动学、S-curve、电机/舵机驱动 |
 | 摄像头 | Realtek USB Camera (0bda:5858) — 1920×1080@30fps MJPG |
 | 无线 IMU | NRF24 + 陀螺仪 — 头戴/颈挂，发送 roll/yaw/pitch + wx/wy/wz |
@@ -20,6 +22,7 @@
 
 ## 数据流
 
+### 控制链路
 ```
 IMU (头部) → NRF24 无线 → RK3588 SPI
                               ↓
@@ -28,54 +31,33 @@ IMU (头部) → NRF24 无线 → RK3588 SPI
                     目标位姿 (tx,ty,tz) + 舵机 (k1,k2)
                               ↓
                     UART 115200 @ 5~7Hz → STM32 → 电机
-
-USB Camera → GStreamer → RGA → NPU (face_best.rknn)
-                              ↓
-                         PnP + 3D 绘制（仅显示）
-                              ↓
-                         RTSP 推流 (rtsp://<IP>:8554/stream)
 ```
 
----
-
-## 当前控制逻辑
-
-### 输入
-- `gy_roll` / `gy_yaw`：IMU 欧拉角
-- `gy_wx` / `gy_wz`：角速度
-
-### Roll → Z 轴（机械臂升降）
+### 视觉/推流链路
 ```
-tz = 40 + 15 × sin(Δroll)    // 限幅 ±45°
-ty = 67  (固定)
-tx = 0   (固定)
+USB Camera (MJPG 1920×1080@30fps)
+    → v4l2src → mppjpegdec → identity handoff
+        → process_frame (YOLOv8-Pose / Face 3D PnP + RGA 绘制)
+        → appsrc → mpph264enc → h264parse → flvmux → rtmpsink
 ```
 
-### Yaw → XY 平面（机械臂水平移动）
+### 云端/端侧交互
 ```
-tx = 57 × sin(Δyaw)
-ty = 10 + 57 × cos(Δyaw)     // 限幅 ±90°
+RTMP: rtmp://47.93.162.124:1935/live/device-003
+WS  : ws://47.93.162.124/ws?deviceId=device-003
+HTTP: http://<ELF2_IP>:8080/{status,mode,calib,servo,cmd}
 ```
-
-### 8 状态运动状态机 + 终点预测器
-- `dt` 自适应：250~500ms（速度越大越短）
-- `k` 状态调制：0.00 ~ 0.70（加速→匀速窗口最大）
-- 发令频率：主窗口 150ms，常规/停止 200ms
-- 阈值：5°
-
-### 当前舵机配置
-- `k1 = 50` (J5 水平舵机)
-- `k2 = 145` (J4 俯仰舵机)
 
 ---
 
 ## 编译
 
 ```bash
-cd /home/elf/work/twice  # 或你的项目路径
+cd /home/elf/work/twice
 
 g++ -std=c++17 -O2 -Isrc \
   src/main.cpp src/rga_npu.cpp src/gst_rtsp.cpp src/gst_rtmp.cpp \
+  src/stream_manager.cpp src/ctrl_server.cpp src/ws_client.cpp \
   src/uart_comm.cpp src/wifi.cpp \
   src/nrf24_linux.c /tmp/bt_stub.c \
   -o build/cc \
@@ -92,17 +74,25 @@ g++ -std=c++17 -O2 -Isrc \
 sudo ./build/cc
 ```
 
-启动后等待：
-```
-[RTSP] Server running on port 8554
-[RTSP] Stream URL: rtsp://<IP>:8554/stream
-```
+启动后自动行为：
+1. 连接 WiFi (iQOO 12)
+2. 探测 RTMP 服务器 (`47.93.162.124:1935`)
+3. 若 RTMP 可达 → 推 RTMP + 启动 WebSocket
+4. 若 RTMP 不可达 → 降级为本地 RTSP (`rtsp://<IP>:8554/stream`)
+5. 启动端侧 HTTP 控制服务器 (端口 8080)
+6. 启动 NRF24 控制定时器 (50ms)
 
-然后用 VLC / ffplay 拉流：
-```bash
-# 强制 TCP（推荐）
-ffplay -rtsp_transport tcp rtsp://10.104.247.114:8554/stream
-```
+---
+
+## 端侧控制 API
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/status` | GET | 返回当前模式、帧计数、运行时间 |
+| `/mode` | POST `mode=face/body` | 切换 AI 模式 |
+| `/calib` | POST `action=start/stop/save` | 标定模式控制 |
+| `/servo` | POST `k1=50&k2=145` | 实时调整舵机角度 |
+| `/cmd` | POST `action=rebaseline` | 重新标定 baseline |
 
 ---
 
@@ -110,16 +100,40 @@ ffplay -rtsp_transport tcp rtsp://10.104.247.114:8554/stream
 
 ```
 src/
-  main.cpp          # 初始化 WiFi/NPU/RGA/UART/NRF24/RTSP，主循环
-  rga_npu.cpp       # 视觉链路(deprecated) + NRF24 控制核心
-  nrf24_linux.c/h   # NRF24 SPI 驱动 + IMU 帧解析 + 历史缓冲
-  uart_comm.cpp/h   # UART 通信（10 字节 raw int16）
-  gst_rtsp.cpp/h    # GStreamer RTSP 推流
-  wifi.cpp/h        # WiFi 连接
-docs/               # 项目文档（控制设计、标定指南、调试日志）
+  main.cpp            # 主入口：WiFi探测、WS/RTMP/RTSP初始化、控制服务器
+  rga_npu.cpp         # 视觉链路 + NRF24 控制核心（8状态机+终点预测）
+  nrf24_linux.c/h     # NRF24 SPI 驱动 + IMU 帧解析 + 历史缓冲
+  uart_comm.cpp/h     # UART 通信（10 字节 raw int16）
+  gst_rtmp.cpp/h      # GStreamer RTMP 推流（identity handoff → appsrc）
+  gst_rtsp.cpp/h      # GStreamer RTSP 推流（appsink 桥接）
+  stream_manager.cpp/h# 推流管理器：RTMP探测 + 自动选择 RTMP/RTSP
+  ctrl_server.cpp/h   # 端侧 HTTP 控制服务器（零依赖 socket 实现）
+  ws_client.cpp/h     # WebSocket 客户端（注册帧 + 100ms心跳）
+  wifi.cpp/h          # WiFi 连接（wpa_supplicant）
+docs/               # 项目文档（控制设计、标定指南、调试日志、审计提示）
 scripts/            # 标定脚本
 calib/              # 相机标定参数
+models/             # RKNN 模型（best.rknn / face_best.rknn）
 ```
+
+---
+
+## 关键设计决策
+
+### 1. identity handoff 替代 appsink
+- `appsink` 的 `new-sample` signal 在 `gst_parse_launch` + `GstPipeline` 中存在不触发的兼容性问题（卡 PAUSED）
+- 改用 `identity` 的 `handoff` signal（同步 callback），pipeline 稳定进入 PLAYING
+- `mppjpegdec` 输出 NV12 高度对齐到 16 的倍数（1080→1088），handoff 中做 stride padding 校正
+
+### 2. 初始化时探测 RTMP，条件启动 WebSocket
+- `probe_rtmp_server()` 做 TCP 非阻塞 connect，3 秒超时
+- RTMP 可达 → 推 RTMP + 启动 `ws_worker_thread`
+- RTMP 不可达 → 降级 RTSP + 不启动 WS（避免 connect 阻塞 75s）
+
+### 3. 安全的 Ctrl+C 退出
+- 信号处理函数只设原子标志，不直接调用 `g_main_loop_quit`
+- GLib 100ms 定时器 `check_quit_timer` 在同线程安全 quit
+- `gst_rtmp.cpp` 中 `rtmpsink` 关闭放到后台线程，避免网络超时阻塞主线程退出
 
 ---
 
@@ -129,7 +143,7 @@ calib/              # 相机标定参数
 2. **5° 阈值延迟**：小角度头部动作不触发发令
 3. **STM32 短距减速**：小位移响应极慢
 4. **纯开环**：上位机不知道机械臂实际位置
-5. **视觉算力浪费**：每帧仍跑完整 PnP + 3D 绘制，仅用于显示
+5. **identity handoff 同步阻塞**：`process_frame` 耗时若 >33ms 会降低有效帧率
 
 ---
 

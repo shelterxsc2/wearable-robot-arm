@@ -90,6 +90,7 @@ twice/
 cd /home/elf/work/twice
 g++ -std=c++17 -O2 -Isrc \
   src/main.cpp src/rga_npu.cpp src/gst_rtsp.cpp src/gst_rtmp.cpp \
+  src/stream_manager.cpp src/ctrl_server.cpp src/ws_client.cpp \
   src/uart_comm.cpp src/wifi.cpp src/nrf24_linux.c /tmp/bt_stub.c \
   -o build/cc \
   $(pkg-config --cflags --libs opencv4 gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtsp-server-1.0) \

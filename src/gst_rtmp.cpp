@@ -1,11 +1,7 @@
 /**
  * gst_rtmp.cpp - RTMP 云端推流 (ELF2 RK3588)
- * 基于 real 工程的 identity handoff 低延迟 pipeline
- * 适配 twice 工程的 USB 摄像头 YUY2 输入 + RGA 硬件转 NV12
- * 
- * 【备份版本】1920x1080 YUY2 采集，1080p30 RTMP 推流
- * 备份时间：2026-05-15
- * 用途：当摄像头支持 YUYV 1080p30（USB3.0 模式）时可恢复此版本
+ * 基于 identity handoff 架构（和备份版本一致）
+ * Pipeline: v4l2src(MJPG) → mppjpegdec → identity → process_frame → appsrc → mpph264enc → flvmux → rtmpsink
  */
 #include "gst_rtmp.h"
 #include "rga_npu.h"
@@ -16,13 +12,10 @@
 #include <time.h>
 #include <gst/app/gstappsrc.h>
 
-#define ALSA_AUDIO_DEVICE   "hw:3,0"
-
 static GMainLoop *g_loop = NULL;
 static volatile guint64 g_frame_count = 0;
-static time_t g_last_print_time = 0;
 
-guint64 get_frame_count(void) {
+guint64 get_rtmp_frame_count(void) {
     return g_frame_count;
 }
 
@@ -32,17 +25,11 @@ static gboolean bus_message_cb(GstBus *bus, GstMessage *message, gpointer user_d
         case GST_MESSAGE_ERROR: {
             GError *err = NULL;
             gchar *dbg = NULL;
-            GstObject *src = GST_MESSAGE_SRC(message);
-            const gchar *name = src ? GST_OBJECT_NAME(src) : "unknown";
             gst_message_parse_error(message, &err, &dbg);
-            g_printerr("[GStreamer] ERROR from %s: %s | %s\n", name, err->message, dbg ? dbg : "");
+            g_printerr("[GStreamer] ERROR: %s\n", err->message);
             g_error_free(err);
             g_free(dbg);
-            if (name && (strstr(name, "rtmp") || strstr(name, "flv") || strstr(name, "queue"))) {
-                g_printerr("[GStreamer] Network/sink error ignored, camera keeps running\n");
-            } else {
-                if (g_loop) g_main_loop_quit(g_loop);
-            }
+            if (g_loop) g_main_loop_quit(g_loop);
             break;
         }
         case GST_MESSAGE_WARNING: {
@@ -55,7 +42,7 @@ static gboolean bus_message_cb(GstBus *bus, GstMessage *message, gpointer user_d
             break;
         }
         case GST_MESSAGE_EOS:
-            g_print("[GStreamer] End of stream (sink disconnected?)\n");
+            g_print("[GStreamer] End of stream\n");
             break;
         default:
             break;
@@ -63,28 +50,23 @@ static gboolean bus_message_cb(GstBus *bus, GstMessage *message, gpointer user_d
     return TRUE;
 }
 
-/* ---------- identity handoff: 抓帧 → YUY2→NV12 → AI 绘制 → 打时间戳 → 推给 appsrc ---------- */
+/* ---------- identity handoff: 抓帧 → 处理 NV12 stride padding → AI 绘制 → 打时间戳 → 推给 appsrc ---------- */
 static void identity_handoff(GstElement *identity, GstBuffer *buffer, gpointer user_data) {
     (void)identity;
     GstElement *appsrc = (GstElement *)user_data;
 
     g_frame_count++;
-    time_t now_wall = time(NULL);
-    if (now_wall - g_last_print_time >= 5) {
-        g_print("[RTMP] Processed %llu frames, current FPS ~%.1f\n",
-                (unsigned long long)g_frame_count, g_frame_count / 5.0);
-        g_frame_count = 0;
-        g_last_print_time = now_wall;
-    }
 
-    /* 记录帧接收时间，用于延迟测量 */
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t start_us = ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
     set_frame_start_time_us(start_us);
 
-    /* 分配 NV12 buffer（USB 摄像头输入为 YUY2，需 RGA 硬件转换） */
-    gsize nv12_size = 1920 * 1080 * 3 / 2;
+    /* 固定 1920x1080 */
+    const int width = 1920;
+    const int height = 1080;
+    gsize nv12_size = (gsize)width * height * 3 / 2;  /* 3110400 */
+
     GstBuffer *out_buffer = gst_buffer_new_allocate(NULL, nv12_size, NULL);
     if (!out_buffer) {
         fprintf(stderr, "[GStreamer] Failed to allocate NV12 output buffer\n");
@@ -95,26 +77,31 @@ static void identity_handoff(GstElement *identity, GstBuffer *buffer, gpointer u
     if (gst_buffer_map(buffer, &in_map, GST_MAP_READ) &&
         gst_buffer_map(out_buffer, &out_map, GST_MAP_WRITE)) {
 
-        if (convert_yuyv_to_nv12((uint8_t*)in_map.data, (uint8_t*)out_map.data, 1920, 1080) != 0) {
-            fprintf(stderr, "[GStreamer] RGA YUYV->NV12 failed, fallback to zero\n");
-            memset(out_map.data, 0, nv12_size);
+        if (in_map.size > nv12_size) {
+            /* MPP 解码器输出高度对齐到 16 的倍数：1080 -> 1088 */
+            int align_h = (int)(in_map.size / (width * 3 / 2));
+            memcpy(out_map.data, in_map.data, width * height);
+            memcpy(out_map.data + width * height,
+                   in_map.data + width * align_h,
+                   width * height / 2);
+        } else {
+            memcpy(out_map.data, in_map.data, nv12_size);
         }
-        process_frame((uint8_t*)out_map.data, 1920, 1080);
+        process_frame((uint8_t*)out_map.data, width, height);
 
         gst_buffer_unmap(buffer, &in_map);
         gst_buffer_unmap(out_buffer, &out_map);
     }
 
-    /* 用系统时钟 running time 打时间戳，比固定 33ms 更精确 */
+    /* 用系统时钟 running time 打时间戳 */
     static GstClockTime base_time = GST_CLOCK_TIME_NONE;
     GstClock *clock = gst_system_clock_obtain();
     GstClockTime now = gst_clock_get_time(clock);
     if (base_time == GST_CLOCK_TIME_NONE) base_time = now;
     GST_BUFFER_PTS(out_buffer) = now - base_time;
-    GST_BUFFER_DURATION(out_buffer) = GST_SECOND / 5;
+    GST_BUFFER_DURATION(out_buffer) = GST_SECOND / 30;
     gst_object_unref(clock);
 
-    /* 推送到 appsrc */
     GstFlowReturn push_ret = gst_app_src_push_buffer(GST_APP_SRC(appsrc), out_buffer);
     if (push_ret != GST_FLOW_OK) {
         gst_buffer_unref(out_buffer);
@@ -125,37 +112,23 @@ int start_rtmp_stream(const char *device, const char *rtmp_url, GMainLoop **loop
     gst_init(NULL, NULL);
 
     gchar *pipeline_str = g_strdup_printf(
-        "v4l2src device=%s io-mode=mmap "
-        "! video/x-raw,format=YUY2,width=1920,height=1080,framerate=5/1 "
-        "! tee name=t "
-        /* fakesink 分支：最小缓冲，只用来防止 v4l2src 阻塞 */
-        "t. ! queue max-size-buffers=1 leaky=downstream ! fakesink "
-        /* identity 抓帧分支：同样最小缓冲 */
-        "t. ! queue max-size-buffers=1 leaky=downstream ! identity name=myid ! fakesink "
+        "v4l2src device=%s io-mode=auto "
+        "! image/jpeg,width=1920,height=1080,framerate=30/1 "
+        "! mppjpegdec "
+        "! video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 "
+        "! identity name=myid ! fakesink sync=false "
         /* 视频编码 + 推流分支 */
-        "appsrc name=mysrc caps=video/x-raw,format=NV12,width=1920,height=1080,framerate=5/1 "
+        "appsrc name=mysrc caps=video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 "
         "! queue max-size-buffers=1 leaky=downstream "
-        /* GOP=15：0.5s 一个关键帧，首屏延迟更低；profile=high */
         "! mpph264enc bps=4000000 bps-max=8000000 rc-mode=vbr gop=15 profile=high "
-        /* config-interval=1：每秒插入一次 SPS/PPS，防止中途花屏 */
         "! h264parse config-interval=1 "
-        "! flvmux name=mux streamable=true "
-        /* 音频分支：USB 无线麦克风 → AAC */
-        "alsasrc device=" ALSA_AUDIO_DEVICE " "
-        "! audioconvert ! audioresample ! audio/x-raw,rate=44100,channels=1 "
-        "! queue max-size-buffers=10 leaky=downstream "
-        "! voaacenc "
-        "! aacparse "
-        "! queue max-size-buffers=10 leaky=downstream "
-        "! mux. "
-        /* 网络缓冲也减到最小 */
-        "mux. ! queue leaky=downstream max-size-buffers=5 max-size-time=0 "
-        /* sync=false：rtmpsink 不等待 PTS，收到就发，降低延迟 */
+        "! flvmux streamable=true "
+        "! queue leaky=downstream max-size-buffers=5 max-size-time=0 "
         "! rtmpsink sync=false location=%s",
         device, rtmp_url);
 
     g_print("[RTMP] Starting stream to: %s\n", rtmp_url);
-    g_print("[RTMP] Pipeline: 1080p30 YUY2->NV12(RGA) + AI overlay + H264 + AAC(audio) -> FLV -> RTMP (low-latency)\n");
+    g_print("[RTMP] Pipeline: MJPG → NV12 → AI → H264 → FLV → RTMP\n");
 
     GError *error = NULL;
     GstElement *pipeline = gst_parse_launch(pipeline_str, &error);
@@ -188,10 +161,9 @@ int start_rtmp_stream(const char *device, const char *rtmp_url, GMainLoop **loop
 
     g_object_set(appsrc,
                  "is-live", TRUE,
+                 "do-timestamp", TRUE,
+                 "stream-type", 0,
                  "format", GST_FORMAT_TIME,
-                 "block", FALSE,
-                 "max-buffers", 1,
-                 "leaky-type", GST_APP_LEAKY_TYPE_DOWNSTREAM,
                  NULL);
     g_object_unref(appsrc);
 
@@ -210,19 +182,27 @@ int start_rtmp_stream(const char *device, const char *rtmp_url, GMainLoop **loop
 
     g_print("\n[RTMP] ==============================================\n");
     g_print("[RTMP] Stream pushing to: %s\n", rtmp_url);
-    g_print("[RTMP] Features: YOLOv8-Pose20 + RGA hardware draw + USB mic audio (low-latency)\n");
+    g_print("[RTMP] Features: YOLOv8-Pose20 FP + RGA hardware draw\n");
     g_print("[RTMP] Press Ctrl+C to stop\n");
     g_print("[RTMP] ==============================================\n\n");
 
-    *loop_ptr = g_main_loop_new(NULL, FALSE);
-    g_loop = *loop_ptr;
-    g_main_loop_run(*loop_ptr);
+    GMainLoop *loop = g_main_loop_new(NULL, FALSE);
+    *loop_ptr = loop;
+    g_loop = loop;
+    g_main_loop_run(loop);
 
     g_print("[RTMP] Stopping...\n");
-    gst_element_set_state(pipeline, GST_STATE_NULL);
-    gst_object_unref(pipeline);
-    g_loop = NULL;
+    gst_element_send_event(pipeline, gst_event_new_flush_start());
+    gst_element_send_event(pipeline, gst_event_new_flush_stop(TRUE));
 
-    g_main_loop_unref(*loop_ptr);
+    g_thread_new("rtmp-stop", [](gpointer data) -> gpointer {
+        GstElement *p = GST_ELEMENT(data);
+        gst_element_set_state(p, GST_STATE_NULL);
+        gst_object_unref(p);
+        return NULL;
+    }, pipeline);
+
+    g_loop = NULL;
+    g_main_loop_unref(loop);
     return 0;
 }
