@@ -2,7 +2,7 @@
 你是 RK3588 可穿戴机械臂项目的代码维护助手。
 
 # 任务
-读取以下文件，理解当前 `imu-rtmp-main` 分支的实现状态，并给出一份简明扼要的项目状态汇报。
+读取以下文件，理解当前 `imu-2model_main` 分支的实现状态，并给出一份简明扼要的项目状态汇报。
 
 # 需要读取的文件
 
@@ -59,6 +59,7 @@ NRF24 SPI 驱动和 IMU 数据解析。重点看：
 - `nrf24_rx_thread_func()` 线程逻辑
 - 共享状态 `g_nrf24_state` 的字段（gy_roll/yaw/pitch, gy_wx/wy/wz, 历史缓冲）
 - 历史缓冲大小和更新逻辑
+- 调试打印（`[NRF24-DIAG]`、`[NRF24] Rate`）是否已注释
 
 ## 9. src/uart_comm.cpp
 UART 通信驱动。重点看：
@@ -76,14 +77,26 @@ RTSP 推流核心（降级模式）。重点看：
 
 ## 11. src/rga_npu.cpp（分段读取）
 
-### 第 470~675 行：8 状态运动状态机 + 终点预测器
+### 第 30~60 行：全局变量与 12 点 PnP 模型定义
+重点看：
+- `FACE_LM_12_IDS[12]`：选取的 12 个 MediaPipe 关键点索引
+- `FACE_LM_12_3D`：对应的 3D 面部坐标（原始 6 点坐标系是否保留）
+- `CAMERA_MATRIX` / `DIST_COEFFS`：相机内参和畸变系数来源
+
+### 第 130~200 行：7 模块时序统计
+重点看：
+- `STAT_WINDOW = 30` 的滚动窗口实现
+- 7 个模块分别统计什么：`get_frame`、`rga_preprocess`、`npu_body`、`roi_crop`、`npu_face_lm`、`draw`、`encode_push`
+- `print_pipeline_stats()` 的输出格式和触发时机
+
+### 第 440~720 行：8 状态运动状态机 + 终点预测器
 重点看：
 - `MotionContext`：如何从 `wx`/`wz` 历史数组更新运动上下文
 - `next_motion_state()`：8 状态转移逻辑
 - `EndpointPredictor`：预测时间窗口 `dt`、状态调制系数 `k`
 - 当前 k 值配置
 
-### 第 676~1011 行：`nrf24_control_update()` 完整函数
+### 第 720~1070 行：`nrf24_control_update()` 完整函数
 重点看：
 - Roll 轴控制：读取 `gy_roll`/`gy_wx`、状态机、预测器、发令判断
 - Yaw 轴控制：读取 `gy_yaw`/`gy_wz`、状态机、预测器、发令判断
@@ -96,13 +109,34 @@ RTSP 推流核心（降级模式）。重点看：
 - 当前舵机配置：`k1=50`、`k2=145`
 - 所有 `[CALIB]`、`[IMU]`、`[CMD]`、`[NRF-STATE]` 调试打印是否已注释
 
-### 第 1013~1336 行：`estimate_and_draw_pose()`
+### 第 1070~1410 行：`estimate_and_draw_pose()`
 重点看：
-- PnP 解算流程（6 点人脸模型 → solvePnP）
+- PnP 解算流程（12 点人脸模型 → `solvePnP`）
+- 12 点选取逻辑（从 468 个 landmark 中映射）
 - 质量过滤（重投影误差、镜像解、旋转跳变）
 - OneEuroFilter 是否启用
 - 视觉控制逻辑是否已完全注释废弃
 - 3D 绘制（坐标轴、立方体框、关键点、左上角文字叠加）
+- `[PnP-Debug]` 打印是否已注释
+
+### 第 1410~1850 行：`init_npu()` 与模型加载
+重点看：
+- `best.rknn`（Body）和 `face_landmark_468_fp16.rknn`（Face）的加载顺序
+- RKNN 输入/输出内存分配方式（`attr->size` vs `n_elems * es`）
+- RGA 缓冲区分配（`rga_input_buf`、`rga_output_buf`）
+- `convert_yuyv_to_nv12()` 是否仍在使用
+
+### 第 1850~2220 行：两阶段 `process_frame_face()` / `process_frame_body()`
+重点看：
+- `process_frame_face()`：
+  - Body NPU 推理流程（640×640，YOLO-Pose，17 keypoints）
+  - 面部 ROI 估计：从 nose/shoulder 几何推导
+  - RGA `imcrop` / `imresize` / `imcvtcolor` 的调用顺序和参数
+  - ROI 宽度的 16 字节对齐处理
+  - Face NPU 推理流程（192×192，468 landmarks）
+  - `draw_detections()` 绘制 body keypoints
+- `process_frame_body()`：单阶段 body 检测 + tracking
+- `process_frame()` 的分发逻辑（`MODE_FACE` / `MODE_BODY`）
 
 # 输出要求
 
@@ -110,18 +144,23 @@ RTSP 推流核心（降级模式）。重点看：
 
 1. **一句话概括**：当前项目在做什么？
 2. **硬件拓扑**：简述各组件职责和数据流向
-3. **NRF24 控制链路现状**：
+3. **两阶段视觉链路现状**：
+   - Stage 1：Body 检测（模型、分辨率、耗时、输出）
+   - Stage 2：Face 468 landmarks（RGA 预处理、模型、分辨率、耗时、输出）
+   - PnP：12 点选取、坐标系、姿态解算
+   - 整体性能（7 模块统计）
+4. **NRF24 控制链路现状**：
    - 传感器数据流（IMU → NRF24 → SPI → 上位机）
    - 控制策略（8 状态机 + 终点预测）
    - 双轴控制架构（Roll → tz，Yaw → tx/ty）
    - 发令频率、阈值、关键参数
    - 标定模式基础设施状态
-4. **视觉/推流链路现状**：RTMP vs RTSP 自动选择机制、identity handoff 设计、AI 处理参与情况
-5. **云端交互现状**：WebSocket 注册时序、心跳机制、帧计数上报
-6. **端侧控制现状**：HTTP API 端点、标定/舵机/命令控制
-7. **通信链路现状**：UART 协议格式、波特率、是否双向、打印状态
-8. **已知问题**：当前有哪些明显缺陷或陷阱？
-9. **最新进度**：相比之前版本，最近改动了什么关键逻辑？
-10. **下一步**：J4 舵机标定的准备状态
+5. **视觉/推流链路现状**：RTMP vs RTSP 自动选择机制、identity handoff 设计、AI 处理参与情况
+6. **云端交互现状**：WebSocket 注册时序、心跳机制、帧计数上报
+7. **端侧控制现状**：HTTP API 端点、标定/舵机/命令控制
+8. **通信链路现状**：UART 协议格式、波特率、是否双向、打印状态
+9. **已知问题**：当前有哪些明显缺陷或陷阱？
+10. **最新进度**：相比之前版本，最近改动了什么关键逻辑？
+11. **下一步**：J4 舵机标定准备状态 + Body 模型优化方向
 
 要求：简明扼要，不要大段粘贴代码，用工程师能理解的语言总结。

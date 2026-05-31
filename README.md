@@ -1,8 +1,8 @@
-# 可穿戴机械臂 — RTMP 云端推流 + 端侧控制 + NRF24 IMU 控制
+# 可穿戴机械臂 — 两阶段视觉管道 + NRF24 IMU 控制
 
-> **分支**: `imu-rtm/sp-main`  
+> **分支**: `imu-2model_main`  
 > **核心路径**: NRF24 无线 IMU → 8 状态运动状态机 → UART → STM32  
-> **视觉链路**: MJPG → mppjpegdec → identity handoff → AI 绘制 → H264 → FLV → RTMP  
+> **视觉链路**: 两阶段 NPU 推理（Body → ROI → Face 468 landmarks → 12-point PnP）+ RGA 硬件预处理  
 > **云端交互**: WebSocket 注册 + 心跳 (device-003)  
 > **端侧控制**: HTTP API @ 8080 (模式/标定/舵机/命令)
 
@@ -12,7 +12,7 @@
 
 | 组件 | 型号/职责 |
 |------|----------|
-| 上位机 | RK3588 (ELF2) — IMU 接收、运动预测、RTMP 推流、端侧控制 |
+| 上位机 | RK3588 (ELF2) — IMU 接收、运动预测、RTMP 推流、端侧控制、双模型 NPU 推理 |
 | 下位机 | STM32H723 — 逆运动学、S-curve、电机/舵机驱动 |
 | 摄像头 | Realtek USB Camera (0bda:5858) — 1920×1080@30fps MJPG |
 | 无线 IMU | NRF24 + 陀螺仪 — 头戴/颈挂，发送 roll/yaw/pitch + wx/wy/wz |
@@ -33,11 +33,16 @@ IMU (头部) → NRF24 无线 → RK3588 SPI
                     UART 115200 @ 5~7Hz → STM32 → 电机
 ```
 
-### 视觉/推流链路
+### 视觉/推流链路（两阶段）
 ```
 USB Camera (MJPG 1920×1080@30fps)
-    → v4l2src → mppjpegdec → identity handoff
-        → process_frame (YOLOv8-Pose / Face 3D PnP + RGA 绘制)
+    → v4l2src → mppjpegdec → identity handoff (NV12)
+        → process_frame
+            ├─ Stage 1: best.rknn (YOLO-Pose, 640×640) → 17 COCO keypoints
+            │              └─ 估计面部 ROI（鼻肩几何）
+            ├─ Stage 2: RGA imcrop/imresize/imcvtcolor (192×192 NV12)
+            │              └─ face_landmark_468_fp16.rknn → 468 3D landmarks
+            └─ 12-point PnP → solvePnP → 3D 立方体 / 坐标轴 overlay
         → appsrc → mpph264enc → h264parse → flvmux → rtmpsink
 ```
 
@@ -101,7 +106,8 @@ sudo ./build/cc
 ```
 src/
   main.cpp            # 主入口：WiFi探测、WS/RTMP/RTSP初始化、控制服务器
-  rga_npu.cpp         # 视觉链路 + NRF24 控制核心（8状态机+终点预测）
+  rga_npu.cpp         # 视觉链路 + NRF24 控制核心（两阶段推理、RGA、PnP、8状态机+终点预测）
+  rga_npu.h           # 视觉/控制对外接口声明
   nrf24_linux.c/h     # NRF24 SPI 驱动 + IMU 帧解析 + 历史缓冲
   uart_comm.cpp/h     # UART 通信（10 字节 raw int16）
   gst_rtmp.cpp/h      # GStreamer RTMP 推流（identity handoff → appsrc）
@@ -113,42 +119,54 @@ src/
 docs/               # 项目文档（控制设计、标定指南、调试日志、审计提示）
 scripts/            # 标定脚本
 calib/              # 相机标定参数
-models/             # RKNN 模型（best.rknn / face_best.rknn）
+models/             # RKNN 模型（best.rknn / face_landmark_468_fp16.rknn）
 ```
 
 ---
 
 ## 关键设计决策
 
-### 1. identity handoff 替代 appsink
-- `appsink` 的 `new-sample` signal 在 `gst_parse_launch` + `GstPipeline` 中存在不触发的兼容性问题（卡 PAUSED）
-- 改用 `identity` 的 `handoff` signal（同步 callback），pipeline 稳定进入 PLAYING
-- `mppjpegdec` 输出 NV12 高度对齐到 16 的倍数（1080→1088），handoff 中做 stride padding 校正
+### 1. 两阶段 NPU 推理（Body → Face）
+- **Stage 1**：`best.rknn` 在 640×640 上检测 17 COCO 关键点，提取鼻/肩几何估算面部 ROI。
+- **Stage 2**：RGA 硬件 `imcrop` + `imresize` + `imcvtcolor` 将 ROI 转为 192×192 NV12，送入 `face_landmark_468_fp16.rknn` 提取 468 个面部 3D 关键点。
+- **PnP**：从 468 点中选取 12 个 MediaPipe 稳定点（眼、鼻、嘴、眉），通过 `solvePnP` 解算头部姿态，叠加 3D 立方体和坐标轴。
+- **性能**：Body NPU ~46ms，Face NPU ~3ms，RGA 预处理 <1ms，总 AI 耗时 ~54ms（≈18.4 fps）。
 
-### 2. 初始化时探测 RTMP，条件启动 WebSocket
-- `probe_rtmp_server()` 做 TCP 非阻塞 connect，3 秒超时
-- RTMP 可达 → 推 RTMP + 启动 `ws_worker_thread`
-- RTMP 不可达 → 降级 RTSP + 不启动 WS（避免 connect 阻塞 75s）
+### 2. RGA NV12 stride 对齐约束
+- `wrapbuffer_virtualaddr` 的 `wstride` 在 NV12 模式下必须 **16 字节对齐**。
+- 面部 ROI 宽度在 `imcrop` 前需对齐：`roi_w = (roi_w / 16) * 16`。
+- ROI 高度设为与宽度相等（正方形），且 `roi_x`/`roi_y` 需为偶数（NV12 色度子采样）。
+- 未对齐会导致 `imcrop` 返回 `-1`，后续 resize 产生绿屏/花屏。
 
-### 3. 安全的 Ctrl+C 退出
-- 信号处理函数只设原子标志，不直接调用 `g_main_loop_quit`
-- GLib 100ms 定时器 `check_quit_timer` 在同线程安全 quit
-- `gst_rtmp.cpp` 中 `rtmpsink` 关闭放到后台线程，避免网络超时阻塞主线程退出
+### 3. RKNN 输出内存分配
+- `rknn_create_mem` 必须使用 `rknn_query` 返回的 `attr->size`，而非 `n_elems * sizeof(element)`。
+- 对于 FP16 模型，`attr->size` 可能包含 padding 或 stride 开销，手动计算会导致堆损坏（`malloc(): unsorted double linked list corrupted`）。
+
+### 4. identity handoff 替代 appsink
+- `appsink` 的 `new-sample` signal 在 `gst_parse_launch` + `GstPipeline` 中存在不触发的兼容性问题（卡 PAUSED）。
+- 改用 `identity` 的 `handoff` signal（同步 callback），pipeline 稳定进入 PLAYING。
+- `mppjpegdec` 输出 NV12 高度对齐到 16 的倍数（1080→1088），handoff 中做 stride padding 校正。
+
+### 5. 7 模块滚动时序统计
+- 30 帧滑动窗口统计 7 个模块耗时：`get_frame`、`rga_preprocess`、`npu_body`、`roi_crop`、`npu_face_lm`、`draw`、`encode_push`。
+- 每 30 帧在终端打印一次平均值，用于定位瓶颈。
 
 ---
 
 ## 已知问题
 
-1. **wx 噪声**：静止时 wx 仍有尖峰，可能误判运动状态
-2. **5° 阈值延迟**：小角度头部动作不触发发令
-3. **STM32 短距减速**：小位移响应极慢
-4. **纯开环**：上位机不知道机械臂实际位置
-5. **identity handoff 同步阻塞**：`process_frame` 耗时若 >33ms 会降低有效帧率
+1. **Body 模型瓶颈**：`best.rknn` 占 AI 总耗时 85%（~46ms），是整体帧率的主要瓶颈。后续可考虑轻量化 body 检测模型或降分辨率。
+2. **wx 噪声**：静止时 wx 仍有尖峰，可能误判运动状态。
+3. **5° 阈值延迟**：小角度头部动作不触发发令。
+4. **STM32 短距减速**：小位移响应极慢。
+5. **纯开环**：上位机不知道机械臂实际位置。
+6. **identity handoff 同步阻塞**：`process_frame` 耗时若 >33ms 会降低有效帧率。
 
 ---
 
 ## 下一步
 
+- 探索 Body 模型优化（更轻量架构或 320×320 输入）以突破 18 fps 瓶颈
 - J4 舵机标定（方案 A：简单映射）
 - 下位机回传关节角 / 末端位姿
 - 通信协议升级（帧头 + CRC + 双向）
