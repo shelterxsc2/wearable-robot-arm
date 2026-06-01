@@ -14,6 +14,9 @@
 #include <vector>
 #include <algorithm>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <errno.h>
 #include <opencv2/opencv.hpp>
 #include <atomic>
 
@@ -27,6 +30,8 @@
 #define OBJ_THRESHOLD       0.25f
 #define NMS_THRESHOLD       0.45f
 #define MAX_DETECTIONS      10
+#define KPT_CONF_THRESHOLD  0.30f
+#define RULE_MODEL_PATH     "./models/mode_rule_engine_fp16.rknn"
 
 // ========== 全局变量 ==========
 static std::atomic<PoseMode> g_mode{MODE_FACE};
@@ -49,6 +54,19 @@ static uint8_t *rga_input_buf = NULL;
 static uint8_t *rga_output_buf = NULL;
 static float *npu_input_fp32 = NULL;
 static uint16_t *npu_input_fp16 = NULL;
+
+// Rule engine socket client
+static int g_rule_sock = -1;
+#define RULE_SOCK_PATH "/tmp/rule_engine.sock"
+
+// Rule engine state registers (cross-frame) — 对应 handcraft 模型的 7 个 INT64 输出
+static int64_t g_rule_state = 0;       // output[0]
+static int64_t g_rule_r_hold = 0;      // output[1] right_hold
+static int64_t g_rule_l_hold = 0;      // output[2] left_hold
+static int64_t g_rule_c_hold = 0;      // output[3] center_hold
+static int64_t g_rule_n_hold = 0;      // output[4] neutral_hold
+static int64_t g_rule_r_miss = 0;      // output[5] right_keep_miss
+static int64_t g_rule_l_miss = 0;      // output[6] left_keep_miss
 
 static int g_frame_count = 0;
 static int npu_initialized = 0;
@@ -83,13 +101,13 @@ static const std::vector<cv::Point3f> FACE_3D_POINTS = {
 
 // face_landmark_468 -> 12 点 PnP（前 6 点为原始 FACE_3D_POINTS，后 6 点新增）
 static const int FACE_LM_12_IDS[12] = {
-    33,   // 0: right eye outer (原始 ID1)
+    133,  // 0: right eye outer (原始 ID1)
     263,  // 1: left eye outer  (原始 ID2)
     1,    // 2: nose tip        (原始 ID0)
     61,   // 3: right mouth     (原始 ID17)
     291,  // 4: left mouth      (原始 ID18)
     152,  // 5: chin            (原始 ID19)
-    133,  // 6: right eye inner (新增)
+    33,   // 6: right eye inner (新增)
     362,  // 7: left eye inner  (新增)
     48,   // 8: right nose      (新增)
     278,  // 9: left nose       (新增)
@@ -97,13 +115,13 @@ static const int FACE_LM_12_IDS[12] = {
     334   // 11: left brow      (新增)
 };
 static const std::vector<cv::Point3f> FACE_LM_12_3D = {
-    {-30.0f, -25.0f, -60.0f},   // 33: right eye outer (原始坐标，不变)
+    {-30.0f, -25.0f, -60.0f},   // 133: right eye outer (原始坐标，不变)
     {30.0f,  -25.0f, -60.0f},   // 263: left eye outer (原始坐标，不变)
     {0.0f,   -5.0f,  -90.0f},   // 1: nose tip (原始坐标，不变)
     {-25.0f, 20.0f,  -65.0f},   // 61: right mouth (原始坐标，不变)
     {25.0f,  20.0f,  -65.0f},   // 291: left mouth (原始坐标，不变)
     {0.0f,   50.0f,  -40.0f},   // 152: chin (原始坐标，不变)
-    {-15.0f, -25.0f, -70.0f},   // 133: right eye inner (新增)
+    {-15.0f, -25.0f, -70.0f},   // 33: right eye inner (新增)
     {15.0f,  -25.0f, -70.0f},   // 362: left eye inner (新增)
     {-10.0f, -5.0f,  -85.0f},   // 48: right nose (新增)
     {10.0f,  -5.0f,  -85.0f},   // 278: left nose (新增)
@@ -245,6 +263,12 @@ struct FaceTracker {
     float last_cx = 0, last_cy = 0;
     bool tracked = false;
 
+    // 人脸尺寸跟踪（用于动态 ROI）
+    float last_face_w = 0, last_face_h = 0;
+    int face_size_life = 0;
+    static constexpr int FACE_SIZE_MAX_LIFE = 5;
+    float prev_roi_size = 0;
+
     int num_kps;
     PoseMode mode;
 
@@ -300,6 +324,8 @@ struct FaceTracker {
             strong_init[k] = false;
             prev_raw_valid[k] = false;
         }
+        last_face_w = 0; last_face_h = 0;
+        face_size_life = 0; prev_roi_size = 0;
     }
 
     int update(const std::vector<PoseDetection>& dets, int img_w, int img_h) {
@@ -417,6 +443,29 @@ struct FaceTracker {
             det.kps[k].x = (float)fx;
             det.kps[k].y = (float)fy;
         }
+    }
+
+    void update_face_size(float w, float h) {
+        const float ALPHA = 0.5f;
+        if (last_face_w > 0 && last_face_h > 0) {
+            last_face_w = ALPHA * w + (1.0f - ALPHA) * last_face_w;
+            last_face_h = ALPHA * h + (1.0f - ALPHA) * last_face_h;
+        } else {
+            last_face_w = w;
+            last_face_h = h;
+        }
+        face_size_life = FACE_SIZE_MAX_LIFE;
+    }
+
+    bool has_face_size() const {
+        return face_size_life > 0 && last_face_w > 32.0f && last_face_h > 32.0f;
+    }
+
+    float get_roi_size() const {
+        if (!has_face_size()) return 0;
+        // 468 点 bbox 不含头发顶部，padding 放大确保覆盖全头
+        // 比例 + 固定余量：远距离不暴涨，近距离有保底
+        return std::max(last_face_w, last_face_h) * 1.3f + 50.0f;
     }
 
     void print_telemetry() {
@@ -1565,7 +1614,11 @@ static uint16_t fp32_to_fp16(float f) {
     uint32_t exp = (x >> 23) & 0xFF;
     uint32_t mant = x & 0x7FFFFF;
     if (exp == 0) return sign << 15;
-    if (exp == 255) return (sign << 15) | 0x7C00;
+    if (exp == 255) {
+        // NaN vs Inf: mant!=0 -> NaN, mant==0 -> Inf
+        if (mant != 0) return (sign << 15) | 0x7E00;
+        return (sign << 15) | 0x7C00;
+    }
     int new_exp = (int)exp - 127 + 15;
     if (new_exp >= 31) return (sign << 15) | 0x7C00;
     if (new_exp <= 0) return sign << 15;
@@ -1639,7 +1692,7 @@ static void post_process_face(uint16_t* fp16_data, int img_w, int img_h,
 
             det.kps[k].x = std::max(0.0f, std::min(kx, (float)MODEL_INPUT_SIZE)) * scale_x;
             det.kps[k].y = std::max(0.0f, std::min(ky, (float)MODEL_INPUT_SIZE)) * scale_y;
-            det.kps[k].visibility = kv;
+            det.kps[k].visibility = (kv > KPT_CONF_THRESHOLD) ? kv : 0.0f;
         }
 
         // 屏蔽噪声点：只保留6个有效点
@@ -1784,7 +1837,7 @@ static void draw_detections(uint8_t* nv12, int img_w, int img_h,
 
         // 画关键点（白色小点）和编号
         for (int k = 0; k < num_kps; k++) {
-            if (det.kps[k].visibility > 0.5f) {
+            if (det.kps[k].visibility > KPT_CONF_THRESHOLD) {
                 int kx = (int)det.kps[k].x;
                 int ky = (int)det.kps[k].y;
                 if (kx >= 2 && ky >= 2 && kx < img_w-2 && ky < img_h-2) {
@@ -1852,6 +1905,27 @@ static int init_single_model(const char* path, rknn_context* ctx,
     return 0;
 }
 
+static int init_rule_engine(void) {
+    printf("[NPU] Connecting to RuleEngine service: %s\n", RULE_SOCK_PATH);
+    g_rule_sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (g_rule_sock < 0) {
+        printf("[WARN] RuleEngine socket create failed: %s\n", strerror(errno));
+        return -1;
+    }
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, RULE_SOCK_PATH, sizeof(addr.sun_path)-1);
+    if (connect(g_rule_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        printf("[WARN] RuleEngine connect to %s failed: %s\n", RULE_SOCK_PATH, strerror(errno));
+        close(g_rule_sock);
+        g_rule_sock = -1;
+        return -1;
+    }
+    printf("[NPU] RuleEngine connected to %s\n", RULE_SOCK_PATH);
+    return 0;
+}
+
 int init_npu() {
     printf("\n========== NPU Init ==========\n");
 
@@ -1872,6 +1946,9 @@ int init_npu() {
     }
     if (init_single_model(BODY_MODEL_PATH, &body_ctx, &body_output_attr, &body_output_mem, "Body") != 0)
         return -1;
+
+    // 加载 RuleEngine（可选，失败不阻塞）
+    init_rule_engine();
 
     // 分配公共缓冲区
     if (posix_memalign((void**)&rga_input_buf, 64, MODEL_INPUT_SIZE*MODEL_INPUT_SIZE*3/2) != 0 ||
@@ -1926,11 +2003,27 @@ static void process_frame_face(uint8_t *nv12, int width, int height) {
     }
     uint64_t t4 = get_us();
 
-    // 先把 body 关键点画出来（让用户确认 best.rknn 工作正常）
-    draw_detections(nv12, width, height, body_dets, 17);
+    // ========== Intended Person Tracker (from backup) ==========
+    // 多人场景下锁定目标人物，只给 intended person 的 ROI 跑 Face LM
+    static FaceTracker tracker(MODE_FACE, 17);
+    if (tracker.mode != MODE_FACE) tracker.reset_mode(MODE_FACE, 17);
+    tracker.tele_frames++;
 
-    if (body_dets.empty()) {
-        // 无人则返回，但仍记录统计
+    int matched_idx = tracker.update(body_dets, width, height);
+    std::vector<PoseDetection> display_dets;
+
+    if (matched_idx >= 0) {
+        tracker.tele_tracked++;
+        tracker.apply_filter(body_dets[matched_idx]);
+        display_dets.push_back(body_dets[matched_idx]);
+    }
+
+    if (!display_dets.empty()) {
+        draw_detections(nv12, width, height, display_dets, 17);
+    }
+
+    if (display_dets.empty()) {
+        // 无人/丢失则返回，但仍记录统计
         int idx = g_stat_idx;
         g_stat[idx].get_frame_us      = g_next_get_frame_us;  g_next_get_frame_us = 0;
         g_stat[idx].rga_preprocess_us = t1 - t0;
@@ -1945,192 +2038,367 @@ static void process_frame_face(uint8_t *nv12, int width, int height) {
         return;
     }
 
-    // 取最佳人体检测
-    const PoseDetection* best_det = &body_dets[0];
-    for (size_t i = 1; i < body_dets.size(); i++) {
-        if (body_dets[i].score > best_det->score) best_det = &body_dets[i];
-    }
+    // 取跟踪到的目标人物（intended person）
+    const PoseDetection* best_det = &display_dets[0];
 
-    // ===== 第二步：估算 face ROI =====
-    float roi_cx, roi_cy, roi_size_f;
+    // 面部点坐标（Face LM 映射回原始图像），未做 Face LM 时默认 0
+    int img_rm_x = 0, img_rm_y = 0, img_lm_x = 0, img_lm_y = 0, img_chin_x = 0, img_chin_y = 0;
+
+    // ===== 第二步：估算 face ROI + 关键点质量检查 =====
+    float roi_cx = 0, roi_cy = 0, roi_size_f = 0;
+    int roi_x = 0, roi_y = 0, roi_w = 0, roi_h = 0;
     float v_nose = best_det->kps[0].visibility;
+    float v_l_eye  = best_det->kps[1].visibility;
+    float v_r_eye  = best_det->kps[2].visibility;
+    float v_l_shoulder = best_det->kps[5].visibility;
+    float v_r_shoulder = best_det->kps[6].visibility;
 
-    if (v_nose > 0.5f) {
-        roi_cx = best_det->kps[0].x;
-        // 中心点略偏下，让框覆盖下巴
-        roi_cy = best_det->kps[0].y + 30.0f;
-        float shoulder_w = fabs(best_det->kps[5].x - best_det->kps[6].x);
-        // 系数放大，确保整张脸+头发都能包进去
-        roi_size_f = shoulder_w * 1.6f;
-        if (roi_size_f < 150.0f) roi_size_f = 150.0f;
-        if (roi_size_f > 450.0f) roi_size_f = 450.0f;
+    // 严格的人脸完整性检查
+    bool face_valid = true;
+    const char* skip_reason = nullptr;
+    if (v_nose <= KPT_CONF_THRESHOLD) {
+        face_valid = false; skip_reason = "nose low conf";
+    } else if (v_l_eye <= KPT_CONF_THRESHOLD && v_r_eye <= KPT_CONF_THRESHOLD) {
+        face_valid = false; skip_reason = "both eyes low conf";
+    } else if (best_det->kps[0].y > height * 0.55f) {
+        face_valid = false; skip_reason = "nose too low";
     } else {
-        roi_cx = (best_det->x1 + best_det->x2) * 0.5f;
-        roi_cy = best_det->y1 + (best_det->y2 - best_det->y1) * 0.35f;
-        roi_size_f = (best_det->y2 - best_det->y1) * 0.55f;
-        if (roi_size_f < 150.0f) roi_size_f = 150.0f;
-        if (roi_size_f > 450.0f) roi_size_f = 450.0f;
-    }
-
-    int roi_x = (int)(roi_cx - roi_size_f * 0.5f);
-    int roi_y = (int)(roi_cy - roi_size_f * 0.5f);
-    int roi_w = (int)roi_size_f;
-    int roi_h = (int)roi_size_f;
-
-    if (roi_x < 0) roi_x = 0;
-    if (roi_y < 0) roi_y = 0;
-    // 越界时同步缩小宽高，保持正方形（避免人脸拉伸）
-    if (roi_x + roi_w > width) {
-        roi_w = width - roi_x;
-        roi_h = roi_w;
-    }
-    if (roi_y + roi_h > height) {
-        roi_h = height - roi_y;
-        roi_w = roi_h;
-    }
-    // RGA 要求 wstride 是 16 的倍数，NV12 要求偶数偏移
-    roi_w = (roi_w / 16) * 16;
-    roi_h = roi_w;
-    if (roi_x % 2 != 0) roi_x++;
-    if (roi_y % 2 != 0) roi_y++;
-    if (roi_w < 32 || roi_h < 32) {
-        int idx = g_stat_idx;
-        g_stat[idx].get_frame_us      = g_next_get_frame_us;  g_next_get_frame_us = 0;
-        g_stat[idx].rga_preprocess_us = t1 - t0;
-        g_stat[idx].npu_body_us       = t4 - t1;
-        g_stat[idx].roi_crop_us       = 0;
-        g_stat[idx].npu_face_us       = 0;
-        g_stat[idx].draw_us           = 0;
-        g_stat[idx].encode_push_us    = g_next_encode_push_us; g_next_encode_push_us = 0;
-        g_stat[idx].total_us          = t4 - t0;
-        g_stat_idx = (g_stat_idx + 1) % STAT_WINDOW;
-        if (++g_stat_count % STAT_WINDOW == 0) print_pipeline_stats();
-        return;
-    }
-
-    // ===== 先画 ROI 框（即使后面 RGA/NPU 失败也能看到框）=====
-    uint8_t* y_plane = nv12;
-    auto draw_roi_rect = [&](int rx, int ry, int rw, int rh) {
-        int x1 = rx, y1 = ry, x2 = rx + rw - 1, y2 = ry + rh - 1;
-        if (x1 < 0) x1 = 0; if (y1 < 0) y1 = 0;
-        if (x2 >= width) x2 = width - 1;
-        if (y2 >= height) y2 = height - 1;
-        for (int t = 0; t < 3; t++) {
-            if (y1 + t < height) for (int x = x1; x <= x2; x++) y_plane[(y1 + t) * width + x] = 180;
-            if (y2 - t >= 0)     for (int x = x1; x <= x2; x++) y_plane[(y2 - t) * width + x] = 180;
-            if (x1 + t < width)  for (int y = y1; y <= y2; y++) y_plane[y * width + (x1 + t)] = 180;
-            if (x2 - t >= 0)     for (int y = y1; y <= y2; y++) y_plane[y * width + (x2 - t)] = 180;
+        float shoulder_y = (best_det->kps[5].y + best_det->kps[6].y) * 0.5f;
+        if (shoulder_y - best_det->kps[0].y < height * 0.06f) {
+            face_valid = false; skip_reason = "face too short";
         }
-    };
-    draw_roi_rect(roi_x, roi_y, roi_w, roi_h);
-
-    // ===== RGA 裁剪 ROI -> 192x192 RGB =====
-    rga_buffer_t src_full = wrapbuffer_virtualaddr(nv12, width, height, RK_FORMAT_YCbCr_420_SP);
-    rga_buffer_t crop_buf = wrapbuffer_virtualaddr(face_lm_crop_buf, roi_w, roi_h, RK_FORMAT_YCbCr_420_SP);
-    im_rect crop_rect = {roi_x, roi_y, roi_w, roi_h};
-    if (imcrop(src_full, crop_buf, crop_rect) != IM_STATUS_SUCCESS) return;
-
-    rga_buffer_t tmp_lm = wrapbuffer_virtualaddr(face_lm_tmp_nv12, 192, 192, RK_FORMAT_YCbCr_420_SP);
-    if (imresize(crop_buf, tmp_lm, 0, 0, INTER_LINEAR) != IM_STATUS_SUCCESS) return;
-
-    rga_buffer_t dst_lm = wrapbuffer_virtualaddr(face_lm_input_buf, 192, 192, RK_FORMAT_RGB_888);
-    if (imcvtcolor(tmp_lm, dst_lm, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888, IM_YUV_TO_RGB_BT601_LIMIT) != IM_STATUS_SUCCESS) return;
-    uint64_t t5 = get_us();
-
-    // ===== 第四步：RGA 输出直接给 NPU（禁止 CPU 图像处理）=====
-    // face_lm_input_buf 已经是 uint8 RGB888 NHWC，由 RGA imcvtcolor 生成
-    // RKNN 会根据模型量化参数(mean=[0,0,0], std=[255,255,255])
-    // 自动做 uint8->float32 和 NHWC->NCHW 转换
-
-    // ===== 第五步：跑 face_landmark_468_fp16.rknn =====
-    rknn_input in_lm;
-    memset(&in_lm, 0, sizeof(in_lm));
-    in_lm.index = 0;
-    in_lm.type = RKNN_TENSOR_UINT8;
-    in_lm.fmt = RKNN_TENSOR_NHWC;
-    in_lm.buf = face_lm_input_buf;
-    in_lm.size = 192 * 192 * 3;
-    rknn_inputs_set(face_lm_ctx, 1, &in_lm);
-    rknn_set_io_mem(face_lm_ctx, face_lm_output_mem[0], &face_lm_output_attr[0]);
-    rknn_set_io_mem(face_lm_ctx, face_lm_output_mem[1], &face_lm_output_attr[1]);
-
-    if (rknn_run(face_lm_ctx, NULL) < 0) {
-        printf("[NPU] face_lm rknn_run failed\n");
-        return;
     }
-    uint64_t t6 = get_us();
+    bool skip_face_lm = !face_valid;
 
-    // ===== 第六步：后处理 468 点 =====
-    float lm_out[1404];
-    if (face_lm_output_attr[0].type == RKNN_TENSOR_FLOAT16) {
-        uint16_t* fp16_ptr = (uint16_t*)face_lm_output_mem[0]->virt_addr;
-        for (int i = 0; i < 1404; i++) lm_out[i] = fp16_to_fp32(fp16_ptr[i]);
+    if (skip_face_lm) {
+        printf("[Face] Skip Face LM: %s (nose=%.2f eye_l=%.2f eye_r=%.2f sh_l=%.2f sh_r=%.2f)\n",
+               skip_reason, v_nose, v_l_eye, v_r_eye, v_l_shoulder, v_r_shoulder);
+        if (tracker.face_size_life > 0) tracker.face_size_life--;
     } else {
-        memcpy(lm_out, face_lm_output_mem[0]->virt_addr, sizeof(lm_out));
-    }
+        if (v_nose > 0.5f) {
+            roi_cx = best_det->kps[0].x;
+            // 上一版 shoulder-based 作为最大范围
+            float shoulder_w = fabs(best_det->kps[5].x - best_det->kps[6].x);
+            float shoulder_roi = shoulder_w * 1.6f;
+            // 这一版 face-based 作为最小范围（远距离精准）
+            float face_roi = tracker.get_roi_size();
 
-    // 调试：打印前几个 landmark 坐标和 ROI 信息
-    printf("[FaceLM] ROI=%dx%d@%d,%d  lm[0]=(%.1f,%.1f) lm[61]=(%.1f,%.1f) lm[152]=(%.1f,%.1f) lm[291]=(%.1f,%.1f)\n",
-           roi_w, roi_h, roi_x, roi_y,
-           lm_out[0*3+0], lm_out[0*3+1],
-           lm_out[61*3+0], lm_out[61*3+1],
-           lm_out[152*3+0], lm_out[152*3+1],
-           lm_out[291*3+0], lm_out[291*3+1]);
-
-    // MediaPipe Face Mesh 468 关键索引
-    const int LM_RIGHT_MOUTH = 61;
-    const int LM_LEFT_MOUTH  = 291;
-    const int LM_CHIN        = 152;
-
-    float rm_x   = lm_out[LM_RIGHT_MOUTH * 3 + 0];
-    float rm_y   = lm_out[LM_RIGHT_MOUTH * 3 + 1];
-    float lm_x   = lm_out[LM_LEFT_MOUTH  * 3 + 0];
-    float lm_y   = lm_out[LM_LEFT_MOUTH  * 3 + 1];
-    float chin_x = lm_out[LM_CHIN * 3 + 0];
-    float chin_y = lm_out[LM_CHIN * 3 + 1];
-
-    // 映射回原始图像坐标（模型输出是 [0,192] 归一化坐标）
-    float scale_x = (float)roi_w / 192.0f;
-    float scale_y = (float)roi_h / 192.0f;
-
-    int img_rm_x   = (int)(rm_x   * scale_x + roi_x);
-    int img_rm_y   = (int)(rm_y   * scale_y + roi_y);
-    int img_lm_x   = (int)(lm_x   * scale_x + roi_x);
-    int img_lm_y   = (int)(lm_y   * scale_y + roi_y);
-    int img_chin_x = (int)(chin_x * scale_x + roi_x);
-    int img_chin_y = (int)(chin_y * scale_y + roi_y);
-
-    // ===== 第七步：画点 =====
-    auto draw_white_dot = [&](int x, int y, int label) {
-        if (x >= 3 && y >= 3 && x < width - 3 && y < height - 3) {
-            for (int dy = -2; dy <= 2; dy++) {
-                for (int dx = -2; dx <= 2; dx++) {
-                    y_plane[(y + dy) * width + (x + dx)] = 255;
+            float target_roi;
+            if (face_roi > 0) {
+                // face-based 已做指数平滑，直接生效
+                target_roi = face_roi;
+                if (target_roi > shoulder_roi) target_roi = shoulder_roi;
+                roi_cy = best_det->kps[0].y + tracker.last_face_h * 0.05f;
+                roi_size_f = target_roi;
+            } else {
+                // fallback: shoulder-based，每帧最多增长 16px（防止突变）
+                target_roi = shoulder_roi;
+                roi_cy = best_det->kps[0].y + 30.0f;
+                if (tracker.prev_roi_size > 0) {
+                    float diff = target_roi - tracker.prev_roi_size;
+                    if (diff > 16.0f) diff = 16.0f;
+                    roi_size_f = tracker.prev_roi_size + diff;
+                } else {
+                    roi_size_f = target_roi;
                 }
             }
-            draw_number(y_plane, width, height, x + 4, y + 4, label);
-        }
-    };
+            tracker.prev_roi_size = roi_size_f;
 
-    draw_white_dot(img_rm_x, img_rm_y, LM_RIGHT_MOUTH);
-    draw_white_dot(img_lm_x, img_lm_y, LM_LEFT_MOUTH);
-    draw_white_dot(img_chin_x, img_chin_y, LM_CHIN);
-
-    // face_landmark_468 -> 12 点 PnP（前 6 点为原始坐标，后 6 点新增）
-    {
-        float scale_x = (float)roi_w / 192.0f;
-        float scale_y = (float)roi_h / 192.0f;
-        std::vector<cv::Point2f> face_lm_2d;
-        for (int i = 0; i < 12; i++) {
-            int idx = FACE_LM_12_IDS[i];
-            float x = lm_out[idx * 3 + 0] * scale_x + roi_x;
-            float y = lm_out[idx * 3 + 1] * scale_y + roi_y;
-            face_lm_2d.emplace_back(x, y);
+            // printf("[FaceROI] used=%.1f target=%.1f (face=%.1f shoulder=%.1f)\n",
+            //        roi_size_f, target_roi, face_roi, shoulder_roi);
+            if (roi_size_f < 150.0f) roi_size_f = 150.0f;
+            if (roi_size_f > 640.0f) roi_size_f = 640.0f;
+        } else {
+            roi_cx = (best_det->x1 + best_det->x2) * 0.5f;
+            roi_cy = best_det->y1 + (best_det->y2 - best_det->y1) * 0.35f;
+            roi_size_f = (best_det->y2 - best_det->y1) * 0.55f;
+            tracker.prev_roi_size = roi_size_f;
+            if (roi_size_f < 150.0f) roi_size_f = 150.0f;
+            if (roi_size_f > 640.0f) roi_size_f = 640.0f;
         }
-        estimate_and_draw_pose(nv12, width, height, face_lm_2d, FACE_LM_12_3D);
+
+        roi_x = (int)(roi_cx - roi_size_f * 0.5f);
+        roi_y = (int)(roi_cy - roi_size_f * 0.5f);
+        roi_w = (int)roi_size_f;
+        roi_h = (int)roi_size_f;
+
+        if (roi_x < 0) roi_x = 0;
+        if (roi_y < 0) roi_y = 0;
+        // 越界时同步缩小宽高，保持正方形（避免人脸拉伸）
+        if (roi_x + roi_w > width) {
+            roi_w = width - roi_x;
+            roi_h = roi_w;
+        }
+        if (roi_y + roi_h > height) {
+            roi_h = height - roi_y;
+            roi_w = roi_h;
+        }
+        // RGA 要求 wstride 是 16 的倍数，NV12 要求偶数偏移
+        roi_w = (roi_w / 16) * 16;
+        roi_h = roi_w;
+        if (roi_x % 2 != 0) roi_x++;
+        if (roi_y % 2 != 0) roi_y++;
+        if (roi_w < 32 || roi_h < 32) {
+            skip_face_lm = true;
+        }
     }
 
-    uint64_t t7 = get_us();
+    uint8_t* y_plane = nv12;
+    if (!skip_face_lm) {
+        // 画 ROI 框
+        auto draw_roi_rect = [&](int rx, int ry, int rw, int rh) {
+            int x1 = rx, y1 = ry, x2 = rx + rw - 1, y2 = ry + rh - 1;
+            if (x1 < 0) x1 = 0; if (y1 < 0) y1 = 0;
+            if (x2 >= width) x2 = width - 1;
+            if (y2 >= height) y2 = height - 1;
+            for (int t = 0; t < 3; t++) {
+                if (y1 + t < height) for (int x = x1; x <= x2; x++) y_plane[(y1 + t) * width + x] = 180;
+                if (y2 - t >= 0)     for (int x = x1; x <= x2; x++) y_plane[(y2 - t) * width + x] = 180;
+                if (x1 + t < width)  for (int y = y1; y <= y2; y++) y_plane[y * width + (x1 + t)] = 180;
+                if (x2 - t >= 0)     for (int y = y1; y <= y2; y++) y_plane[y * width + (x2 - t)] = 180;
+            }
+        };
+        draw_roi_rect(roi_x, roi_y, roi_w, roi_h);
+    }
+
+    uint64_t t5 = t4, t6 = t4, t7 = t4;
+    if (!skip_face_lm) {
+        // ===== RGA 裁剪 ROI -> 192x192 RGB =====
+        rga_buffer_t src_full = wrapbuffer_virtualaddr(nv12, width, height, RK_FORMAT_YCbCr_420_SP);
+        rga_buffer_t crop_buf = wrapbuffer_virtualaddr(face_lm_crop_buf, roi_w, roi_h, RK_FORMAT_YCbCr_420_SP);
+        im_rect crop_rect = {roi_x, roi_y, roi_w, roi_h};
+        if (imcrop(src_full, crop_buf, crop_rect) != IM_STATUS_SUCCESS) {
+            skip_face_lm = true;
+            goto rule_engine_phase;
+        }
+
+        rga_buffer_t tmp_lm = wrapbuffer_virtualaddr(face_lm_tmp_nv12, 192, 192, RK_FORMAT_YCbCr_420_SP);
+        if (imresize(crop_buf, tmp_lm, 0, 0, INTER_LINEAR) != IM_STATUS_SUCCESS) {
+            skip_face_lm = true;
+            goto rule_engine_phase;
+        }
+
+        rga_buffer_t dst_lm = wrapbuffer_virtualaddr(face_lm_input_buf, 192, 192, RK_FORMAT_RGB_888);
+        if (imcvtcolor(tmp_lm, dst_lm, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888, IM_YUV_TO_RGB_BT601_LIMIT) != IM_STATUS_SUCCESS) {
+            skip_face_lm = true;
+            goto rule_engine_phase;
+        }
+        t5 = get_us();
+
+        // ===== 第四步：RGA 输出直接给 NPU =====
+        // ===== 第五步：跑 face_landmark_468_fp16.rknn =====
+        rknn_input in_lm;
+        memset(&in_lm, 0, sizeof(in_lm));
+        in_lm.index = 0;
+        in_lm.type = RKNN_TENSOR_UINT8;
+        in_lm.fmt = RKNN_TENSOR_NHWC;
+        in_lm.buf = face_lm_input_buf;
+        in_lm.size = 192 * 192 * 3;
+        rknn_inputs_set(face_lm_ctx, 1, &in_lm);
+        rknn_set_io_mem(face_lm_ctx, face_lm_output_mem[0], &face_lm_output_attr[0]);
+        rknn_set_io_mem(face_lm_ctx, face_lm_output_mem[1], &face_lm_output_attr[1]);
+
+        if (rknn_run(face_lm_ctx, NULL) < 0) {
+            printf("[NPU] face_lm rknn_run failed\n");
+            skip_face_lm = true;
+            goto rule_engine_phase;
+        }
+        t6 = get_us();
+
+        // ===== 第六步：后处理 468 点 =====
+        float lm_out[1404];
+        if (face_lm_output_attr[0].type == RKNN_TENSOR_FLOAT16) {
+            uint16_t* fp16_ptr = (uint16_t*)face_lm_output_mem[0]->virt_addr;
+            for (int i = 0; i < 1404; i++) lm_out[i] = fp16_to_fp32(fp16_ptr[i]);
+        } else {
+            memcpy(lm_out, face_lm_output_mem[0]->virt_addr, sizeof(lm_out));
+        }
+
+        // 计算 468 点在 ROI 内的 bbox，映射回原始图像尺寸
+        float lm_min_x = 192, lm_min_y = 192, lm_max_x = 0, lm_max_y = 0;
+        for (int i = 0; i < 468; i++) {
+            float x = lm_out[i * 3 + 0];
+            float y = lm_out[i * 3 + 1];
+            if (x < lm_min_x) lm_min_x = x;
+            if (y < lm_min_y) lm_min_y = y;
+            if (x > lm_max_x) lm_max_x = x;
+            if (y > lm_max_y) lm_max_y = y;
+        }
+        // Sanity check: 468 点分布是否合理
+        float face_w_ratio = (lm_max_x - lm_min_x) / 192.0f;
+        float face_h_ratio = (lm_max_y - lm_min_y) / 192.0f;
+        if (face_w_ratio < 0.22f || face_h_ratio < 0.22f ||
+            face_w_ratio > 0.92f || face_h_ratio > 0.92f) {
+            // printf("[FaceLM] Reject: bad bbox ratio (w=%.2f h=%.2f)\n", face_w_ratio, face_h_ratio);
+            skip_face_lm = true;
+            if (tracker.face_size_life > 0) tracker.face_size_life--;
+            goto rule_engine_phase;
+        }
+
+        float lm_scale_x = (float)roi_w / 192.0f;
+        float lm_scale_y = (float)roi_h / 192.0f;
+        float face_w_img = (lm_max_x - lm_min_x) * lm_scale_x;
+        float face_h_img = (lm_max_y - lm_min_y) * lm_scale_y;
+        tracker.update_face_size(face_w_img, face_h_img);
+
+        // 调试：打印前几个 landmark 坐标和 ROI 信息
+        // printf("[FaceLM] ROI=%dx%d@%d,%d  lm[0]=(%.1f,%.1f) lm[61]=(%.1f,%.1f) lm[152]=(%.1f,%.1f) lm[291]=(%.1f,%.1f)  face_bbox=%.1fx%.1f\n",
+        //        roi_w, roi_h, roi_x, roi_y,
+        //        lm_out[0*3+0], lm_out[0*3+1],
+        //        lm_out[61*3+0], lm_out[61*3+1],
+        //        lm_out[152*3+0], lm_out[152*3+1],
+        //        lm_out[291*3+0], lm_out[291*3+1],
+        //        face_w_img, face_h_img);
+
+        // MediaPipe Face Mesh 468 关键索引
+        const int LM_RIGHT_MOUTH = 61;
+        const int LM_LEFT_MOUTH  = 291;
+        const int LM_CHIN        = 152;
+
+        float rm_x   = lm_out[LM_RIGHT_MOUTH * 3 + 0];
+        float rm_y   = lm_out[LM_RIGHT_MOUTH * 3 + 1];
+        float lm_x   = lm_out[LM_LEFT_MOUTH  * 3 + 0];
+        float lm_y   = lm_out[LM_LEFT_MOUTH  * 3 + 1];
+        float chin_x = lm_out[LM_CHIN * 3 + 0];
+        float chin_y = lm_out[LM_CHIN * 3 + 1];
+
+        // 映射回原始图像坐标（模型输出是 [0,192] 归一化坐标）
+        img_rm_x   = (int)(rm_x   * lm_scale_x + roi_x);
+        img_rm_y   = (int)(rm_y   * lm_scale_y + roi_y);
+        img_lm_x   = (int)(lm_x   * lm_scale_x + roi_x);
+        img_lm_y   = (int)(lm_y   * lm_scale_y + roi_y);
+        img_chin_x = (int)(chin_x * lm_scale_x + roi_x);
+        img_chin_y = (int)(chin_y * lm_scale_y + roi_y);
+
+        // ===== 第七步：画点 =====
+        auto draw_white_dot = [&](int x, int y, int label) {
+            if (x >= 3 && y >= 3 && x < width - 3 && y < height - 3) {
+                for (int dy = -2; dy <= 2; dy++) {
+                    for (int dx = -2; dx <= 2; dx++) {
+                        y_plane[(y + dy) * width + (x + dx)] = 255;
+                    }
+                }
+                draw_number(y_plane, width, height, x + 4, y + 4, label);
+            }
+        };
+
+        draw_white_dot(img_rm_x, img_rm_y, LM_RIGHT_MOUTH);
+        draw_white_dot(img_lm_x, img_lm_y, LM_LEFT_MOUTH);
+        draw_white_dot(img_chin_x, img_chin_y, LM_CHIN);
+
+        // face_landmark_468 -> 12 点 PnP
+        {
+            std::vector<cv::Point2f> face_lm_2d;
+            for (int i = 0; i < 12; i++) {
+                int idx = FACE_LM_12_IDS[i];
+                float x = lm_out[idx * 3 + 0] * lm_scale_x + roi_x;
+                float y = lm_out[idx * 3 + 1] * lm_scale_y + roi_y;
+                face_lm_2d.emplace_back(x, y);
+            }
+            estimate_and_draw_pose(nv12, width, height, face_lm_2d, FACE_LM_12_3D);
+        }
+        t7 = get_us();
+    }
+
+rule_engine_phase:
+
+    // ===== RuleEngine: 20 关键点手势状态推理 (Python Socket 服务) =====
+    if (g_rule_sock >= 0) {
+        float kpts_20[20][2];
+        float valid_mask[20];
+        // COCO → Observer 视角：交换 left/right 成对点
+        static const int LR_PAIRS[8][2] = {
+            {1,2}, {3,4}, {5,6}, {7,8}, {9,10}, {11,12}, {13,14}, {15,16}
+        };
+        for (int i = 0; i < 17; i++) {
+            int coco_idx = i;
+            for (int p = 0; p < 8; p++) {
+                if (LR_PAIRS[p][0] == i) { coco_idx = LR_PAIRS[p][1]; break; }
+                if (LR_PAIRS[p][1] == i) { coco_idx = LR_PAIRS[p][0]; break; }
+            }
+            if (display_dets[0].kps[coco_idx].visibility > KPT_CONF_THRESHOLD) {
+                kpts_20[i][0] = display_dets[0].kps[coco_idx].x;
+                kpts_20[i][1] = display_dets[0].kps[coco_idx].y;
+                valid_mask[i] = 1.0f;
+            } else {
+                kpts_20[i][0] = 0.0f;
+                kpts_20[i][1] = 0.0f;
+                valid_mask[i] = 0.0f;
+            }
+        }
+        if (!skip_face_lm) {
+            kpts_20[17][0] = (float)img_lm_x; kpts_20[17][1] = (float)img_lm_y;
+            kpts_20[18][0] = (float)img_rm_x; kpts_20[18][1] = (float)img_rm_y;
+            kpts_20[19][0] = (float)img_chin_x; kpts_20[19][1] = (float)img_chin_y;
+            valid_mask[17] = valid_mask[18] = valid_mask[19] = 1.0f;
+        } else {
+            kpts_20[17][0] = kpts_20[17][1] = 0.0f;
+            kpts_20[18][0] = kpts_20[18][1] = 0.0f;
+            kpts_20[19][0] = kpts_20[19][1] = 0.0f;
+            valid_mask[17] = valid_mask[18] = valid_mask[19] = 0.0f;
+        }
+
+        // flatten kpts: interleaved [x0,y0, x1,y1, ..., x19,y19] for reshape(1,20,2)
+        float kpts_flat[40];
+        for (int i = 0; i < 20; i++) {
+            kpts_flat[i * 2]     = kpts_20[i][0];
+            kpts_flat[i * 2 + 1] = kpts_20[i][1];
+        }
+
+        int64_t state_fb[7] = {
+            g_rule_state, g_rule_r_hold, g_rule_l_hold,
+            g_rule_c_hold, g_rule_n_hold, g_rule_r_miss, g_rule_l_miss
+        };
+
+        // send all data (MSG_NOSIGNAL to avoid SIGPIPE on dead server)
+        for (int retry = 0; retry < 2; retry++) {
+            if (g_rule_sock < 0 && init_rule_engine() != 0) break;
+
+            bool send_ok = true;
+            ssize_t n = send(g_rule_sock, kpts_flat, sizeof(kpts_flat), MSG_MORE | MSG_NOSIGNAL);
+            if (n != sizeof(kpts_flat)) send_ok = false;
+            n = send(g_rule_sock, valid_mask, sizeof(valid_mask), MSG_MORE | MSG_NOSIGNAL);
+            if (n != sizeof(valid_mask)) send_ok = false;
+            n = send(g_rule_sock, state_fb, sizeof(state_fb), MSG_NOSIGNAL);
+            if (n != sizeof(state_fb)) send_ok = false;
+
+            if (send_ok) {
+                int64_t result[7];
+                ssize_t total = 0;
+                while (total < (ssize_t)sizeof(result)) {
+                    n = recv(g_rule_sock, ((char*)result) + total, sizeof(result) - total, 0);
+                    if (n <= 0) break;
+                    total += n;
+                }
+                if (total == sizeof(result)) {
+                    g_rule_state  = result[0];
+                    g_rule_r_hold = result[1];
+                    g_rule_l_hold = result[2];
+                    g_rule_c_hold = result[3];
+                    g_rule_n_hold = result[4];
+                    g_rule_r_miss = result[5];
+                    g_rule_l_miss = result[6];
+
+                    // 画面左下角打印 state
+                    const char* state_names[] = {"Idle", "Mode1", "Mode2"};
+                    int s = (int)g_rule_state;
+                    if (s < 0 || s > 2) s = 0;
+                    cv::Mat y_mat(height, width, CV_8UC1, nv12);
+                    cv::putText(y_mat, cv::format("State: %s", state_names[s]),
+                                cv::Point(10, height - 20),
+                                cv::FONT_HERSHEY_SIMPLEX, 1.2, cv::Scalar(255), 2);
+                    break;  // success
+                } else {
+                    printf("[RuleEngine] recv failed (%zd/%zu), reconnecting...\n", total, sizeof(result));
+                }
+            } else {
+                printf("[RuleEngine] send failed, reconnecting...\n");
+            }
+
+            // close and retry
+            close(g_rule_sock); g_rule_sock = -1;
+        }
+    }
 
     // 记录统计
     int idx = g_stat_idx;
@@ -2236,6 +2504,12 @@ void cleanup_npu() {
     if (body_output_mem) rknn_destroy_mem(body_ctx, body_output_mem);
     if (face_lm_ctx) rknn_destroy(face_lm_ctx);
     if (body_ctx) rknn_destroy(body_ctx);
+
+    // RuleEngine cleanup
+    if (g_rule_sock >= 0) {
+        close(g_rule_sock);
+        g_rule_sock = -1;
+    }
 
     pose_filter_init = false;
     have_prev_pose = false;

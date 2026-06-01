@@ -25,6 +25,16 @@
 #include "uart_comm.h"
 #include "nrf24_linux.h"
 #include "gst_rtmp.h"
+#include <sys/wait.h>
+
+static pid_t g_rule_engine_pid = -1;
+static void stop_rule_engine(void) {
+    if (g_rule_engine_pid > 0) {
+        kill(g_rule_engine_pid, SIGTERM);
+        waitpid(g_rule_engine_pid, NULL, 0);
+        g_rule_engine_pid = -1;
+    }
+}
 
 /* ========== 云服务器配置（来自历史备份） ========== */
 #define DEVICE_ID           "device-003"
@@ -257,7 +267,23 @@ int main(int argc, char *argv[]) {
         wifi_print_ip(WIFI_IFNAME, ip_str, sizeof(ip_str));
     }
 
-    // 3. 初始化NPU
+    // 3. 启动 RuleEngine Python 服务
+    printf("\n[Main] Starting RuleEngine Python service...\n");
+    pid_t pid = fork();
+    if (pid == 0) {
+        execlp("python3", "python3",
+               "/home/elf/work/twice/scripts/rule_engine_server.py",
+               (char*)NULL);
+        _exit(1);
+    } else if (pid > 0) {
+        g_rule_engine_pid = pid;
+        sleep(2);
+        printf("[Main] RuleEngine service PID=%d\n", pid);
+    } else {
+        fprintf(stderr, "[Main] Failed to fork RuleEngine service\n");
+    }
+
+    // 4. 初始化NPU
     printf("\n[Main] Initializing NPU...\n");
     if (init_npu() != 0) {
         fprintf(stderr, "[Main] NPU initialization failed\n");
@@ -371,6 +397,7 @@ int main(int argc, char *argv[]) {
         cleanup_npu();
         cleanup_rga();
         ctrl_server_stop();
+        stop_rule_engine();
         return 1;
     }
 
@@ -389,6 +416,7 @@ int main(int argc, char *argv[]) {
     ctrl_server_stop();
     cleanup_npu();
     cleanup_rga();
+    stop_rule_engine();
     printf("[Main] Shutdown complete\n");
     return 0;
 }
