@@ -87,15 +87,15 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
 
             /* Short-distance attenuation: further reduce v_limit for small moves */
             float scale = 1.0f;
-            if (S < 0.03f)
+            if (S < 0.08f)
             {
                 scale = 0.15f;   /* tiny step: 30% */
             }
-            else if (S < 0.06f)
+            else if (S < 0.12f)
             {
                 scale = 0.2f;   /* small step: 40% */
             }
-            else if (S < 0.15f)
+            else if (S < 0.30f)
             {
                 scale = 0.3f;   /* medium step: 60% */
             }
@@ -108,15 +108,15 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
             }
 
             /* Dynamic j_limit for smoother short-distance motion */
-            if (S < 0.03f)
+            if (S < 0.08f)
             {
                 Speed_Plan_Handle->j_limit = 12.0f;
             }
-            else if (S < 0.06f)
+            else if (S < 0.12f)
             {
                 Speed_Plan_Handle->j_limit = 16.0f;
             }
-            else if (S < 0.15f)
+            else if (S < 0.30f)
             {
                 Speed_Plan_Handle->j_limit = 20.0f;
             }
@@ -391,10 +391,10 @@ void Coordinate_Inverse_Settlement(float X, float Y, float Z, float phi_servo,
     float base_turns = floorf(current_gimbal / (2.0f * PI)) * 2.0f * PI;
     float gimbal_raw = atan2f(X, Y) + base_turns;
     /* 约束到实际位置 ±π 范围内，避免 floorf 在 0/2π 边界导致跨圈跳变 */
-    float delta = gimbal_raw - current_gimbal;
-    if (delta > PI)
+    float gimbal_delta = gimbal_raw - current_gimbal;
+    if (gimbal_delta > PI)
         gimbal_raw -= 2.0f * PI;
-    else if (delta < -PI)
+    else if (gimbal_delta < -PI)
         gimbal_raw += 2.0f * PI;
     *Gimbal_Angle = gimbal_raw;
 
