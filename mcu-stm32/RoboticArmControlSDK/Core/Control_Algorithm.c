@@ -386,10 +386,17 @@ static void Standard_TwoLink_IK(float R, float Z, float L1, float L_eq, float de
 void Coordinate_Inverse_Settlement(float X, float Y, float Z, float phi_servo,
                                    float *Gimbal_Angle, float *Joint_Upper_Angle, float *Joint_Fore_Angle)
 {
-    /* ---------- 1. 云台水平角（保持与当前同圈） ---------- */
+    /* ---------- 1. 云台水平角（保持与当前同圈，并取最近方向） ---------- */
     float current_gimbal = LK4005_Motor_Handle[0].Motor_Position_PID_Control_Handle.Motor_Position_Actual;
     float base_turns = floorf(current_gimbal / (2.0f * PI)) * 2.0f * PI;
-    *Gimbal_Angle = atan2f(X, Y) + base_turns;
+    float gimbal_raw = atan2f(X, Y) + base_turns;
+    /* 约束到实际位置 ±π 范围内，避免 floorf 在 0/2π 边界导致跨圈跳变 */
+    float delta = gimbal_raw - current_gimbal;
+    if (delta > PI)
+        gimbal_raw -= 2.0f * PI;
+    else if (delta < -PI)
+        gimbal_raw += 2.0f * PI;
+    *Gimbal_Angle = gimbal_raw;
 
     /* ---------- 2. 常数参数 ---------- */
     float R  = sqrtf(X * X + Y * Y);                  /* 水平径向距离 */
