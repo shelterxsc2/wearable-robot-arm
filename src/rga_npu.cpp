@@ -2448,18 +2448,28 @@ rule_engine_phase:
             kpts_flat[i * 2 + 1] = kpts_20[i][1];
         }
 
+        // bbox [x1, y1, x2, y2] for rule_engine_v2.rknn
+        float bbox[4] = {
+            display_dets[0].x1,
+            display_dets[0].y1,
+            display_dets[0].x2,
+            display_dets[0].y2
+        };
+
         int64_t state_fb[7] = {
             g_rule_state, g_rule_r_hold, g_rule_l_hold,
             g_rule_c_hold, g_rule_n_hold, g_rule_r_miss, g_rule_l_miss
         };
 
-        // send all data (MSG_NOSIGNAL to avoid SIGPIPE on dead server)
+        // v2 protocol: 44f(kpts+bbox) + 20f(valid_mask) + 7q(state_fb) = 312 bytes
         for (int retry = 0; retry < 2; retry++) {
             if (g_rule_sock < 0 && init_rule_engine() != 0) break;
 
             bool send_ok = true;
             ssize_t n = send(g_rule_sock, kpts_flat, sizeof(kpts_flat), MSG_MORE | MSG_NOSIGNAL);
             if (n != sizeof(kpts_flat)) send_ok = false;
+            n = send(g_rule_sock, bbox, sizeof(bbox), MSG_MORE | MSG_NOSIGNAL);
+            if (n != sizeof(bbox)) send_ok = false;
             n = send(g_rule_sock, valid_mask, sizeof(valid_mask), MSG_MORE | MSG_NOSIGNAL);
             if (n != sizeof(valid_mask)) send_ok = false;
             n = send(g_rule_sock, state_fb, sizeof(state_fb), MSG_NOSIGNAL);
