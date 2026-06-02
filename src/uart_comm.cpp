@@ -31,7 +31,7 @@ static std::atomic<int> g_recv_running{0};
 static uart_pose_callback_t g_pose_cb = NULL;
 
 /* 运动完成状态: 1=完成/空闲, 0=运动中 */
-volatile int g_uart_move_complete = 1;
+volatile int g_uart_move_complete = 0;
 
 /* 头部静止状态: 1=头部当前静止(wx/wz<3), 0=头部在动 */
 volatile int g_head_stationary = 0;

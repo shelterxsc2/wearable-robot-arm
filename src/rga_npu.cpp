@@ -772,6 +772,44 @@ struct EndpointPredictor {
     }
 };
 
+/* ========== A-inverse 姿态解耦：消除 IMU 初始安装角 ==========
+ * 初始姿态 R_init 在上电时记录，之后每帧做 R_rel = R_current * R_init^T
+ * 得到头部相对于上电姿态的真实旋转。
+ * 欧拉角顺序：ZYX (Yaw-Pitch-Roll)
+ */
+static inline cv::Mat eulerZYXToMat(float roll_deg, float pitch_deg, float yaw_deg)
+{
+    float r = roll_deg * (float)M_PI / 180.0f;
+    float p = pitch_deg * (float)M_PI / 180.0f;
+    float y = yaw_deg * (float)M_PI / 180.0f;
+    float cr = cosf(r), sr = sinf(r);
+    float cp = cosf(p), sp = sinf(p);
+    float cy = cosf(y), sy = sinf(y);
+    return (cv::Mat_<float>(3,3) <<
+        cy*cp,  cy*sp*sr - sy*cr,  cy*sp*cr + sy*sr,
+        sy*cp,  sy*sp*sr + cy*cr,  sy*sp*cr - cy*sr,
+        -sp,    cp*sr,             cp*cr);
+}
+
+static inline void matToEulerZYX(const cv::Mat& R, float& roll_deg, float& pitch_deg, float& yaw_deg)
+{
+    float sy = sqrtf(R.at<float>(0,0)*R.at<float>(0,0) + R.at<float>(1,0)*R.at<float>(1,0));
+    bool singular = sy < 1e-6f;
+    float rr, pp, yy;
+    if (!singular) {
+        yy = atan2f(R.at<float>(1,0), R.at<float>(0,0));
+        pp = atan2f(-R.at<float>(2,0), sy);
+        rr = atan2f(R.at<float>(2,1), R.at<float>(2,2));
+    } else {
+        yy = atan2f(-R.at<float>(1,2), R.at<float>(1,1));
+        pp = atan2f(-R.at<float>(2,0), sy);
+        rr = 0.0f;
+    }
+    roll_deg  = rr * 180.0f / (float)M_PI;
+    pitch_deg = pp * 180.0f / (float)M_PI;
+    yaw_deg   = yy * 180.0f / (float)M_PI;
+}
+
 /* 独立的 NRF24 IMU 控制链路：俯仰控制（仿照偏航控制架构） */
 void nrf24_control_update(void)
 {
@@ -802,10 +840,22 @@ void nrf24_control_update(void)
     static MotionContext ctx;
     static EndpointPredictor predictor;
 
+    /* A-inverse 初始姿态矩阵 */
+    static bool r_init_set = false;
+    static cv::Mat R_init;
+    static float rel_roll = 0.0f, rel_pitch = 0.0f, rel_yaw = 0.0f;
+
+    /* 等待下位机第一次 move complete 后再确定 A */
+    static bool first_complete_received = false;
+    if (!first_complete_received && g_uart_move_complete) {
+        first_complete_received = true;
+        printf("[A-INIT] First move complete received. Will capture R_init on next valid IMU.\n");
+    }
+
     /* 发令控制状态 */
     static uint64_t last_cmd_us = 0;
-    static float last_cmd_target_roll = 0.0f;
-    static const float CMD_ROLL_THRESHOLD_DEG = 5.0f;
+    static float last_cmd_target_pitch = 0.0f;
+    static const float CMD_PITCH_THRESHOLD_DEG = 5.0f;
 
     uint64_t now_us = get_us();
     if (now_us - last_update_us < 50000)   /* 50ms 采样周期 */
@@ -814,28 +864,35 @@ void nrf24_control_update(void)
 
     float current_roll_deg = 0.0f;
     float current_yaw_deg = 0.0f;
+    float current_pitch_deg = 0.0f;
     float wx = 0.0f;
+    float wy = 0.0f;
     float wz = 0.0f;
     bool imu_valid = false;
-    float wx_hist[NRF24_WX_HIST_SIZE];
+    float wy_hist[NRF24_WY_HIST_SIZE];
     float wz_hist[NRF24_WZ_HIST_SIZE];
-    int wx_count = 0;
+    int wy_count = 0;
     int wz_count = 0;
+    uint32_t nrf_rx_count = 0;
+    uint32_t nrf_err_count = 0;
 
     pthread_mutex_lock(&g_nrf24_state.mutex);
     current_roll_deg = g_nrf24_state.gy_roll;
     current_yaw_deg = g_nrf24_state.gy_yaw;
-    float current_pitch_deg = g_nrf24_state.gy_pitch;
+    current_pitch_deg = g_nrf24_state.gy_pitch;
     wx = g_nrf24_state.gy_wx;
+    wy = g_nrf24_state.gy_wy;
     wz = g_nrf24_state.gy_wz;
     imu_valid = g_nrf24_state.imu_valid;
-    wx_count = g_nrf24_state.gy_wx_count;
+    wy_count = g_nrf24_state.gy_wy_count;
     wz_count = g_nrf24_state.gy_wz_count;
-    if (wx_count > 0) {
-        for (int i = 0; i < wx_count; i++) {
-            int pos = (g_nrf24_state.gy_wx_idx - wx_count + i + NRF24_WX_HIST_SIZE)
-                      % NRF24_WX_HIST_SIZE;
-            wx_hist[i] = g_nrf24_state.gy_wx_hist[pos];
+    nrf_rx_count = g_nrf24_state.rx_count;
+    nrf_err_count = g_nrf24_state.error_count;
+    if (wy_count > 0) {
+        for (int i = 0; i < wy_count; i++) {
+            int pos = (g_nrf24_state.gy_wy_idx - wy_count + i + NRF24_WY_HIST_SIZE)
+                      % NRF24_WY_HIST_SIZE;
+            wy_hist[i] = g_nrf24_state.gy_wy_hist[pos];
         }
     }
     if (wz_count > 0) {
@@ -846,6 +903,19 @@ void nrf24_control_update(void)
         }
     }
     pthread_mutex_unlock(&g_nrf24_state.mutex);
+
+    /* ========== A-inverse：消除 IMU 初始安装角 ========== */
+    if (imu_valid && first_complete_received) {
+        cv::Mat R_current = eulerZYXToMat(current_roll_deg, current_pitch_deg, current_yaw_deg);
+        if (!r_init_set) {
+            R_init = R_current.clone();
+            r_init_set = true;
+            printf("[A-INIT] R_init captured: roll=%.2f pitch=%.2f yaw=%.2f\n",
+                   current_roll_deg, current_pitch_deg, current_yaw_deg);
+        }
+        cv::Mat R_rel_mat = R_current * R_init.t();
+        matToEulerZYX(R_rel_mat, rel_roll, rel_pitch, rel_yaw);
+    }
 
     /* printf("[IMU] roll=%+.2f pitch=%+.2f yaw=%+.2f | wx=%+.2f wz=%+.2f valid=%d\n",
            current_roll_deg, current_pitch_deg, current_yaw_deg, wx, wz, imu_valid); */
@@ -935,26 +1005,60 @@ void nrf24_control_update(void)
         /* printf("[CALIB] 标定模式退出，恢复正常控制\n"); */
     }
 
+    /* 计算 50ms 内角度历史的 A-inverse 平均值 */
+    float avg_rel_roll = 0.0f, avg_rel_pitch = 0.0f, avg_rel_yaw = 0.0f;
+    int avg_n = 0;
+    if (r_init_set) {
+        pthread_mutex_lock(&g_nrf24_state.mutex);
+        int angle_count = g_nrf24_state.gy_angle_count;
+        for (int i = 0; i < angle_count; i++) {
+            int pos = (g_nrf24_state.gy_angle_idx - angle_count + i + NRF24_ANGLE_HIST_SIZE)
+                      % NRF24_ANGLE_HIST_SIZE;
+            float h_r = g_nrf24_state.gy_roll_hist[pos];
+            float h_p = g_nrf24_state.gy_pitch_hist[pos];
+            float h_y = g_nrf24_state.gy_yaw_hist[pos];
+            cv::Mat R_h = eulerZYXToMat(h_r, h_p, h_y);
+            cv::Mat R_h_rel = R_h * R_init.t();
+            float hr, hp, hy;
+            matToEulerZYX(R_h_rel, hr, hp, hy);
+            avg_rel_roll += hr; avg_rel_pitch += hp; avg_rel_yaw += hy;
+            avg_n++;
+        }
+        pthread_mutex_unlock(&g_nrf24_state.mutex);
+        if (avg_n > 0) {
+            avg_rel_roll  /= avg_n;
+            avg_rel_pitch /= avg_n;
+            avg_rel_yaw   /= avg_n;
+        }
+    }
+    /* printf("[IMU-AVG] rel_roll=%+.2f rel_pitch=%+.2f rel_yaw=%+.2f (n=%d) valid=%d init=%d | nrf_rx=%u err=%u\n",
+           avg_rel_roll, avg_rel_pitch, avg_rel_yaw, avg_n, (int)imu_valid, (int)r_init_set,
+           nrf_rx_count, nrf_err_count); */
+
     if (!imu_valid) {
         /* printf("[NRF-STATE] 无效数据\n"); */
         return;
     }
 
-    /* 基准标定 */
+    /* A-init 完成前不发令，防止 predictor 初始噪声误触发 */
+    if (!r_init_set) {
+        return;
+    }
+
+    /* 基准标定（A-inverse 后初始姿态已归零，标量 baseline 不再需要） */
     if (!pitch_baseline_set) {
-        nrf_baseline_roll_deg = current_roll_deg;
         pitch_baseline_set = true;
-        last_cmd_target_roll = current_roll_deg;
+        last_cmd_target_pitch = 0.0f;
         predictor.reset();
     }
 
-    /* 用 wx 历史（10ms 分辨率）更新运动上下文并运行状态机 */
-    ctx.update_from_hist(wx_hist, wx_count, 5);   /* 取最近 5 个 ≈ 50ms */
+    /* 用 wy 历史（10ms 分辨率）更新运动上下文并运行状态机 */
+    ctx.update_from_hist(wy_hist, wy_count, 5);   /* 取最近 5 个 ≈ 50ms */
     MotionState curr_state = next_motion_state(prev_state, ctx);
     prev_state = curr_state;
 
     /* 更新终点预测 */
-    predictor.update(wx, curr_state);
+    predictor.update(wy, curr_state);
 
     /* 只在状态变化时打印 */
     if (curr_state != prev_print_state) {
@@ -963,34 +1067,33 @@ void nrf24_control_update(void)
         prev_print_state = curr_state;
     }
 
-    /* ========== Roll: 预测终点驱动的发令策略 ========== */
+    /* ========== Pitch: 预测终点驱动的发令策略 ========== */
     bool is_stop = ctx.is_stop();
-    float target_roll_deg = is_stop ? current_roll_deg
-                                    : predictor.get_target_yaw(current_roll_deg);
-    float delta_roll_deg = normalize_angle_deg(target_roll_deg - last_cmd_target_roll);
-    bool roll_moved_enough = std::fabs(delta_roll_deg) > CMD_ROLL_THRESHOLD_DEG;
+    float target_pitch_deg = is_stop ? rel_pitch
+                                     : predictor.get_target_yaw(rel_pitch);
+    float delta_pitch_deg = normalize_angle_deg(target_pitch_deg - last_cmd_target_pitch);
+    bool pitch_moved_enough = std::fabs(delta_pitch_deg) > CMD_PITCH_THRESHOLD_DEG;
 
-    uint64_t roll_interval = 200000;
-    bool roll_first_window  = (curr_state == STATE_ACCEL_TO_CONST);
-    bool roll_second_window = (curr_state == STATE_CONST_TO_DECEL);
-    if (roll_first_window || roll_second_window) roll_interval = 150000;
-    bool roll_interval_ok = (now_us - last_cmd_us) >= roll_interval;
+    uint64_t pitch_interval = 200000;
+    bool pitch_first_window  = (curr_state == STATE_ACCEL_TO_CONST);
+    bool pitch_second_window = (curr_state == STATE_CONST_TO_DECEL);
+    if (pitch_first_window || pitch_second_window) pitch_interval = 150000;
+    bool pitch_interval_ok = (now_us - last_cmd_us) >= pitch_interval;
 
-    bool roll_should_cmd = false;
-    if (roll_interval_ok && roll_moved_enough) {
-        if (roll_first_window || roll_second_window || is_stop) {
-            roll_should_cmd = true;
+    bool pitch_should_cmd = false;
+    if (pitch_interval_ok && pitch_moved_enough) {
+        if (pitch_first_window || pitch_second_window || is_stop) {
+            pitch_should_cmd = true;
             if (is_stop) predictor.reset();
         } else {
-            roll_should_cmd = true;
+            pitch_should_cmd = true;
         }
     }
 
     /* ========== Yaw: 从 imu-main-test 恢复的完整状态机 ========== */
     if (!yaw_baseline_set) {
-        nrf_baseline_yaw_deg = current_yaw_deg;
         yaw_baseline_set = true;
-        last_cmd_target_yaw = current_yaw_deg;
+        last_cmd_target_yaw = 0.0f;
         predictor_yaw.reset();
     }
 
@@ -1006,8 +1109,8 @@ void nrf24_control_update(void)
     }
 
     bool is_stop_yaw = ctx_yaw.is_stop();
-    float target_yaw_deg = is_stop_yaw ? current_yaw_deg
-                                       : predictor_yaw.get_target_yaw(current_yaw_deg);
+    float target_yaw_deg = is_stop_yaw ? rel_yaw
+                                       : predictor_yaw.get_target_yaw(rel_yaw);
     float delta_yaw_deg = normalize_angle_deg(target_yaw_deg - last_cmd_target_yaw);
     bool yaw_moved_enough = std::fabs(delta_yaw_deg) > CMD_YAW_THRESHOLD_DEG;
 
@@ -1035,15 +1138,15 @@ void nrf24_control_update(void)
     static float last_ty = NRF_FACE_Y_CM;
     static float last_tz = NRF_FACE_Z_CM;
 
-    bool should_cmd = roll_should_cmd || yaw_should_cmd;
-    /* printf("[CMD] roll=%+.2f->%+.2f(d=%+.2f%s) yaw=%+.2f->%+.2f(d=%+.2f%s) | r_cmd=%d y_cmd=%d | tx=%.1f ty=%.1f tz=%.1f\n",
-           current_roll_deg, target_roll_deg, delta_roll_deg, roll_moved_enough ? "" : "_thr",
-           current_yaw_deg, target_yaw_deg, delta_yaw_deg, yaw_moved_enough ? "" : "_thr",
-           roll_should_cmd, yaw_should_cmd, last_tx, last_ty, last_tz); */
+    bool should_cmd = pitch_should_cmd || yaw_should_cmd;
+    /* printf("[CMD] pitch=%+.2f->%+.2f(d=%+.2f%s) yaw=%+.2f->%+.2f(d=%+.2f%s) | p_cmd=%d y_cmd=%d | tx=%.1f ty=%.1f tz=%.1f\n",
+           rel_pitch, target_pitch_deg, delta_pitch_deg, pitch_moved_enough ? "" : "_thr",
+           rel_yaw, target_yaw_deg, delta_yaw_deg, yaw_moved_enough ? "" : "_thr",
+           pitch_should_cmd, yaw_should_cmd, last_tx, last_ty, last_tz); */
     if (should_cmd) {
-        /* Roll → tz */
-        float delta_roll_deg = normalize_angle_deg(target_roll_deg - nrf_baseline_roll_deg);
-        float cum_pitch_offset = delta_roll_deg * (float)M_PI / 180.0f;
+        /* Pitch → tz (pitch 增大 = 低头 = tz 增大) */
+        float delta_pitch_deg = normalize_angle_deg(target_pitch_deg - nrf_baseline_roll_deg);
+        float cum_pitch_offset = delta_pitch_deg * (float)M_PI / 180.0f;
         if (cum_pitch_offset > (float)M_PI / 4.0f)
             cum_pitch_offset = (float)M_PI / 4.0f;
         if (cum_pitch_offset < -(float)M_PI / 4.0f)
@@ -1064,8 +1167,8 @@ void nrf24_control_update(void)
         uart_send_arm_target(last_tx, last_ty, last_tz,
                              NRF_SERVO1_DEG, NRF_SERVO2_DEG);
 
-        if (roll_should_cmd) {
-            last_cmd_target_roll = target_roll_deg;
+        if (pitch_should_cmd) {
+            last_cmd_target_pitch = target_pitch_deg;
             last_cmd_us = now_us;
         }
         if (yaw_should_cmd) {
@@ -1112,8 +1215,8 @@ void nrf24_control_update(void)
     /* 只在 stable 状态变化时打印，减少刷屏 */
     static int prev_arm_stable = -1;
     if (g_arm_stable != prev_arm_stable) {
-        printf("[NRF-STATE] stable=%d (complete=%d) tx=%.1f ty=%.1f tz=%.1f | roll=%+.2f yaw=%+.2f | wx=%+.2f wz=%+.2f\n",
-               g_arm_stable, g_uart_move_complete, last_tx, last_ty, last_tz, current_roll_deg, current_yaw_deg, wx, wz);
+        /* printf("[NRF-STATE] stable=%d (complete=%d) tx=%.1f ty=%.1f tz=%.1f | roll=%+.2f yaw=%+.2f | wx=%+.2f wz=%+.2f\n",
+               g_arm_stable, g_uart_move_complete, last_tx, last_ty, last_tz, rel_roll, rel_yaw, wx, wz); */
         prev_arm_stable = g_arm_stable;
     }
 }

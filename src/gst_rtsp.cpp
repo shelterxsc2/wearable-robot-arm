@@ -112,17 +112,15 @@ static GstFlowReturn new_sample_cb(GstElement *sink, gpointer data) {
     }
     
     format = gst_structure_get_string(structure, "format");
-    if (!format) {
-        fprintf(stderr, "[GStreamer] No format in caps\n");
+    if (!format || strcmp(format, "YUY2") != 0) {
+        fprintf(stderr, "[GStreamer] Expected YUY2, got %s\n", format ? format : "null");
         gst_sample_unref(sample);
         return GST_FLOW_OK;
-    }
-    if (strcmp(format, "NV12") != 0) {
-        fprintf(stderr, "[GStreamer] Warning: Expected NV12, got %s, attempting anyway\n", format);
     }
 
     g_frames_in++;
 
+    gsize yuyv_size = (gsize)width * height * 2;
     gsize nv12_size = (gsize)width * height * 3 / 2;
 
     // mppjpegdec 输出可能是只读 dmabuf，分配可写 buffer 做绘制
@@ -152,20 +150,15 @@ static GstFlowReturn new_sample_cb(GstElement *sink, gpointer data) {
 
     uint64_t t2 = get_us();
 
-    // MPP 解码器输出高度对齐到 16 的倍数（如 1080 -> 1088）
-    // 实际布局: Y(1920 x align_h) + UV(1920 x align_h/2)
-    // 需要紧凑布局: Y(1920 x height) + UV(1920 x height/2)
-    if (in_info.size > nv12_size) {
-        int align_h = (int)(in_info.size / (width * 3 / 2));
-        // Y 平面：前 height 行直接复制（连续）
-        memcpy(out_info.data, in_info.data, width * height);
-        // UV 平面：从 Y padding 之后复制（连续）
-        memcpy(out_info.data + width * height,
-               in_info.data + width * align_h,
-               width * height / 2);
+    // RGA 硬件转换: YUYV -> NV12
+    if (in_info.size < yuyv_size) {
+        fprintf(stderr, "[GStreamer] YUY2 buffer too small: %zu < %zu\n", in_info.size, yuyv_size);
+        memset(out_info.data, 0, nv12_size);
     } else {
-        // 无 padding，整块复制
-        memcpy(out_info.data, in_info.data, nv12_size);
+        if (convert_yuyv_to_nv12((uint8_t*)in_info.data, (uint8_t*)out_info.data, width, height) != 0) {
+            fprintf(stderr, "[GStreamer] RGA YUYV->NV12 failed, fallback to zero\n");
+            memset(out_info.data, 0, nv12_size);
+        }
     }
 
     uint64_t t3 = get_us();
@@ -248,9 +241,7 @@ int start_rtsp_server(const char *device, GMainLoop **loop_ptr) {
     gchar *media_launch = g_strdup_printf(
         "( "
         "v4l2src device=%s min-buffers=2 io-mode=auto "
-        "! image/jpeg,width=1920,height=1080,framerate=30/1 "
-        "! mppjpegdec "
-        "! video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 "
+        "! video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1 "
         "! tee name=t "
         "t. ! queue max-size-buffers=1 leaky=downstream ! fakesink "
         "t. ! queue max-size-buffers=1 leaky=downstream "

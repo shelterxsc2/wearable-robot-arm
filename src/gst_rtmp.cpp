@@ -1,7 +1,7 @@
 /**
  * gst_rtmp.cpp - RTMP 云端推流 (ELF2 RK3588)
  * 基于 identity handoff 架构（和备份版本一致）
- * Pipeline: v4l2src(MJPG) → mppjpegdec → identity → process_frame → appsrc → mpph264enc → flvmux → rtmpsink
+ * Pipeline: v4l2src(YUY2) → identity → RGA(YUYV→NV12) → process_frame → appsrc → mpph264enc → flvmux → rtmpsink
  */
 #include "gst_rtmp.h"
 #include "rga_npu.h"
@@ -50,7 +50,7 @@ static gboolean bus_message_cb(GstBus *bus, GstMessage *message, gpointer user_d
     return TRUE;
 }
 
-/* ---------- identity handoff: 抓帧 → 处理 NV12 stride padding → AI 绘制 → 打时间戳 → 推给 appsrc ---------- */
+/* ---------- identity handoff: 抓帧 → RGA YUYV→NV12 → AI 绘制 → 打时间戳 → 推给 appsrc ---------- */
 static inline uint64_t get_us() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -70,10 +70,11 @@ static void identity_handoff(GstElement *identity, GstBuffer *buffer, gpointer u
 
     uint64_t t0 = get_us();
 
-    /* 固定 1920x1080 */
+    /* 固定 1920x1080，输入为 YUY2，需 RGA 硬件转 NV12 */
     const int width = 1920;
     const int height = 1080;
-    gsize nv12_size = (gsize)width * height * 3 / 2;  /* 3110400 */
+    gsize yuyv_size = (gsize)width * height * 2;
+    gsize nv12_size = (gsize)width * height * 3 / 2;
 
     GstBuffer *out_buffer = gst_buffer_new_allocate(NULL, nv12_size, NULL);
     if (!out_buffer) {
@@ -85,15 +86,14 @@ static void identity_handoff(GstElement *identity, GstBuffer *buffer, gpointer u
     if (gst_buffer_map(buffer, &in_map, GST_MAP_READ) &&
         gst_buffer_map(out_buffer, &out_map, GST_MAP_WRITE)) {
 
-        if (in_map.size > nv12_size) {
-            /* MPP 解码器输出高度对齐到 16 的倍数：1080 -> 1088 */
-            int align_h = (int)(in_map.size / (width * 3 / 2));
-            memcpy(out_map.data, in_map.data, width * height);
-            memcpy(out_map.data + width * height,
-                   in_map.data + width * align_h,
-                   width * height / 2);
+        if (in_map.size < yuyv_size) {
+            fprintf(stderr, "[GStreamer] YUY2 buffer too small: %zu < %zu\n", in_map.size, yuyv_size);
+            memset(out_map.data, 0, nv12_size);
         } else {
-            memcpy(out_map.data, in_map.data, nv12_size);
+            if (convert_yuyv_to_nv12((uint8_t*)in_map.data, (uint8_t*)out_map.data, width, height) != 0) {
+                fprintf(stderr, "[GStreamer] RGA YUYV->NV12 failed, fallback to zero\n");
+                memset(out_map.data, 0, nv12_size);
+            }
         }
         uint64_t t1 = get_us();
         report_gst_getframe_us(t1 - t0);
@@ -127,9 +127,7 @@ int start_rtmp_stream(const char *device, const char *rtmp_url, GMainLoop **loop
 
     gchar *pipeline_str = g_strdup_printf(
         "v4l2src device=%s io-mode=auto "
-        "! image/jpeg,width=1920,height=1080,framerate=30/1 "
-        "! mppjpegdec "
-        "! video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 "
+        "! video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1 "
         "! identity name=myid ! fakesink sync=false "
         /* 视频编码 + 推流分支 */
         "appsrc name=mysrc caps=video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 "
@@ -142,7 +140,7 @@ int start_rtmp_stream(const char *device, const char *rtmp_url, GMainLoop **loop
         device, rtmp_url);
 
     g_print("[RTMP] Starting stream to: %s\n", rtmp_url);
-    g_print("[RTMP] Pipeline: MJPG → NV12 → AI → H264 → FLV → RTMP\n");
+    g_print("[RTMP] Pipeline: YUY2 → RGA → NV12 → AI → H264 → FLV → RTMP\n");
 
     GError *error = NULL;
     GstElement *pipeline = gst_parse_launch(pipeline_str, &error);

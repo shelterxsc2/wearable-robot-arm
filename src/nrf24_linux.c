@@ -531,6 +531,18 @@ static void* nrf24_rx_thread_func(void* arg)
                     g_nrf24_state.gy_wy    = wy;
                     g_nrf24_state.gy_wz    = wz;
                     g_nrf24_state.imu_valid = true;
+                    /* 记录角度历史 */
+                    g_nrf24_state.gy_roll_hist[g_nrf24_state.gy_angle_idx] = roll;
+                    g_nrf24_state.gy_pitch_hist[g_nrf24_state.gy_angle_idx] = pitch;
+                    g_nrf24_state.gy_yaw_hist[g_nrf24_state.gy_angle_idx] = yaw;
+                    g_nrf24_state.gy_angle_idx = (g_nrf24_state.gy_angle_idx + 1) % NRF24_ANGLE_HIST_SIZE;
+                    if (g_nrf24_state.gy_angle_count < NRF24_ANGLE_HIST_SIZE)
+                        g_nrf24_state.gy_angle_count++;
+                    /* 记录 wy 历史 */
+                    g_nrf24_state.gy_wy_hist[g_nrf24_state.gy_wy_idx] = wy;
+                    g_nrf24_state.gy_wy_idx = (g_nrf24_state.gy_wy_idx + 1) % NRF24_WY_HIST_SIZE;
+                    if (g_nrf24_state.gy_wy_count < NRF24_WY_HIST_SIZE)
+                        g_nrf24_state.gy_wy_count++;
                     /* 记录 wz 历史 */
                     g_nrf24_state.gy_wz_hist[g_nrf24_state.gy_wz_idx] = wz;
                     g_nrf24_state.gy_wz_idx = (g_nrf24_state.gy_wz_idx + 1) % NRF24_WZ_HIST_SIZE;

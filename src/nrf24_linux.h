@@ -81,6 +81,9 @@ extern "C" {
 #define NRF24_AST_BUF_SIZE      10
 #define NRF24_WZ_HIST_SIZE      10
 #define NRF24_WX_HIST_SIZE      10
+#define NRF24_WY_HIST_SIZE      10
+/* roll/pitch/yaw 历史循环缓冲区 (degrees) — 供 A-inverse 平均 */
+#define NRF24_ANGLE_HIST_SIZE   16
 
 /* ======================================================================== */
 /*  Shared state (thread-safe)                                              */
@@ -109,10 +112,20 @@ typedef struct {
     float gy_wz_hist[NRF24_WZ_HIST_SIZE];
     int   gy_wz_idx;
     int   gy_wz_count;
-    /* wx 历史循环缓冲区 (deg/s) — 供俯仰控制链路使用 */
+    /* wx 历史循环缓冲区 (deg/s) */
     float gy_wx_hist[NRF24_WX_HIST_SIZE];
     int   gy_wx_idx;
     int   gy_wx_count;
+    /* wy 历史循环缓冲区 (deg/s) — 供 pitch 控制链路使用 */
+    float gy_wy_hist[NRF24_WY_HIST_SIZE];
+    int   gy_wy_idx;
+    int   gy_wy_count;
+    /* roll/pitch/yaw 历史循环缓冲区 (degrees) — 供 A-inverse 平均 */
+    float gy_roll_hist[NRF24_ANGLE_HIST_SIZE];
+    float gy_pitch_hist[NRF24_ANGLE_HIST_SIZE];
+    float gy_yaw_hist[NRF24_ANGLE_HIST_SIZE];
+    int   gy_angle_idx;
+    int   gy_angle_count;
 } nrf24_shared_state_t;
 
 extern nrf24_shared_state_t g_nrf24_state;
