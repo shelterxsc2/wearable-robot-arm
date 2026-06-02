@@ -20,7 +20,7 @@ void Servo_Motor_Control_Init(void)
     Servo_Motor_Handle[1].Motor_PWM_Channel = TIM_CHANNEL_3;
     Servo_Motor_Handle[1].Motor_Type        = Servo;
     /* 初始接口角度 0 rad（φ_servo = 0），经偏置后实际 0.6 rad，末端在小臂延长线上 */
-    Servo_Motor_Handle[1].Motor_Position    = 0.0f;
+    Servo_Motor_Handle[1].Motor_Position    = 1.57f;
     Servo_Motor_Handle[1].PWM_Pulse_Min     = A009_PWM_PULSE_MIN_US;
     Servo_Motor_Handle[1].PWM_Pulse_Max     = A009_PWM_PULSE_MAX_US;
     Servo_Motor_Handle[1].Angle_Offset_Rad  = A009_ANGLE_OFFSET_RAD;

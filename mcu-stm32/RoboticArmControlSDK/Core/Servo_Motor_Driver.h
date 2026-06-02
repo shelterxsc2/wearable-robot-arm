@@ -16,7 +16,7 @@
  */
 #define A009_PWM_PULSE_MIN_US       500u    /* 0.5 ms */
 #define A009_PWM_PULSE_MAX_US       2500u   /* 2.5 ms */
-#define A009_ANGLE_OFFSET_RAD       0.6f    /* 偏置：实际舵机角度 = 接口角度 + 0.6 */
+#define A009_ANGLE_OFFSET_RAD       0.0f    /* 偏置：实际舵机角度 = 接口角度 + 0.6 */
 #define A009_ANGLE_MIN_RAD          0.0f    /* 实际机械最小角 0° */
 #define A009_ANGLE_MAX_RAD          (PI)    /* 实际机械最大角 180° */
 

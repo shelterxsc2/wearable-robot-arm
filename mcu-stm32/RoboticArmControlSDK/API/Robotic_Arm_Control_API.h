@@ -11,7 +11,7 @@ void Robotic_Arm_Control(void);
 void Servo_Motor_Handle_Update(void);
 void LK4005_Motor_Handle_Update(void);
 
-extern uint8_t Test_Mode_Active;
 extern uint8_t Servo_Control_Active;
+extern uint8_t Init_Sequence_Trigger;
 
 #endif

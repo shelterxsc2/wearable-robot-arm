@@ -1,12 +1,14 @@
 #include "Robotic_Arm_Communication_HAL_STM32_Port.h"
 #include "string.h"
 #include "stdio.h"
+#include "math.h"
 #include "Servo_Motor_Driver.h"
 #include "LK4005_Motor_Driver.h"
 #include "Control_Algorithm.h"
 #include "Robotic_Arm_Control_API.h"
 
 uint8_t Usart_Used0_Rx_Buff[Usart_Used0_Rx_Buff_Length] = {0};
+uint8_t Feedback_Pending = 0;
 
 void Communication_Usart_Init(void)
 {
@@ -17,8 +19,46 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
     if (huart->Instance == Communication_Usart_Instance_Used0)
     {
-        if (Test_Mode_Active)
+        /* 检查是否是初始化指令: FF AA FF AA FF AA FF AA FF AA (10字节) */
+        uint8_t is_init_cmd = 0;
+        if (Size == 10)
         {
+            is_init_cmd = 1;
+            for (int i = 0; i < 10; i++)
+            {
+                if (Usart_Used0_Rx_Buff[i] != ((i % 2 == 0) ? 0xFF : 0xAA))
+                {
+                    is_init_cmd = 0;
+                    break;
+                }
+            }
+        }
+        
+        if (is_init_cmd)
+        {
+            /* 清除之前可能未完成的普通指令反馈 */
+            Feedback_Pending = 0;
+            
+            /* 舵机目标角度为0 */
+            if (Servo_Control_Active)
+            {
+                Servo_Motor_Handle[0].Motor_Position = 0.0f;
+                Servo_Motor_Handle[1].Motor_Position = 0.0f;
+            }
+            
+            /* 启动大臂到-7rad，小臂和云台先锁定当前位置 */
+            LK4005_Motor_Handle[1].Motor_Position_Target = -7.0f;
+            LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+            
+            LK4005_Motor_Handle[2].Motor_Position_Target = LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[0].Motor_Position_Actual;
+            LK4005_Motor_Handle[2].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+            
+            LK4005_Motor_Handle[0].Motor_Position_Target = LK4005_Motor_Handle[0].Motor_Position_PID_Control_Handle.Motor_Position_Actual;
+            LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+            
+            /* 触发顺序启动状态机 */
+            Init_Sequence_Trigger = 1;
+            
             HAL_UARTEx_ReceiveToIdle_DMA(Communication_Usart_Handle_Used0,
                                          Usart_Used0_Rx_Buff,
                                          Usart_Used0_Rx_Buff_Length);
@@ -74,62 +114,37 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
             last_Z = filt_Z;
             last_Servo1 = filt_Servo1;
             first_rx = 0;
+            
+            Feedback_Pending = 2; /* 标记待发送 move_success */
         }
-        /*
-        Usart_Used0_Rx_Buff[Size] = '\0';
-        if (strncmp((char *)Usart_Used0_Rx_Buff, "Motor", 5) == 0)
-        {
-            char tittle[8] = {0};
-            int subtittle = 0;
-            float temp1 = 0.0f;
-
-            sscanf((char *)Usart_Used0_Rx_Buff, "%s %d %f", tittle, &subtittle, &temp1);
-
-            if (subtittle == 0)
-            {
-                LK4005_Motor_Handle[1].Motor_Position_Target = temp1;
-                LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
-            }
-            else if (subtittle == 1)
-            {
-                LK4005_Motor_Handle[2].Motor_Position_Target = temp1;
-                LK4005_Motor_Handle[2].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
-            }
-        }
-        else if (strncmp((char *)Usart_Used0_Rx_Buff, "Servo", 5) == 0)
-        {
-            char tittle[8] = {0};
-            int subtittle = 0;
-            float temp1 = 0;
-
-            sscanf((char *)Usart_Used0_Rx_Buff, "%s %d %f", tittle, &subtittle, &temp1);
-
-            if (subtittle == 0)
-            {
-                if (Servo_Control_Active)
-                    Servo_Motor_Handle[0].Motor_Position = temp1;
-            }
-            else if (subtittle == 1)
-            {
-                if (Servo_Control_Active)
-                    Servo_Motor_Handle[1].Motor_Position = temp1;
-            }
-        }
-        */
+        
         HAL_UARTEx_ReceiveToIdle_DMA(Communication_Usart_Handle_Used0, Usart_Used0_Rx_Buff, Usart_Used0_Rx_Buff_Length);
     }
 }
 
-void Communication_Test(void)
+void Communication_Send_Init_Success(void)
 {
-    uint8_t package[16] = {0};
+    static uint8_t msg[] = "init success\r\n";
+    HAL_UART_Transmit_DMA(Communication_Usart_Handle_Used0, msg, sizeof(msg) - 1);
+}
 
-    memcpy(&package[0], &LK4005_Motor_Handle[0].Motor_Position_Target, 4);
-    memcpy(&package[4], &LK4005_Motor_Handle[0].Motor_Position_PID_Control_Handle.Motor_Position_Actual, 4);
-    package[12] = 0x00;
-    package[13] = 0x00;
-    package[14] = 0x80;
-    package[15] = 0x7f;
-    HAL_UART_Transmit_DMA(&huart1, package, 16);
-    HAL_Delay(3);
+void Communication_Send_Move_Success(void)
+{
+    static char tx_buf[128];
+    
+    float upper_motor_angle = LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].Motor_Position_Actual;
+    float fore_motor_angle  = LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[0].Motor_Position_Actual;
+    float theta1 = -upper_motor_angle / 4.0f;
+    float theta2 =  fore_motor_angle / 2.0f;
+    float gimbal = LK4005_Motor_Handle[0].Motor_Position_PID_Control_Handle.Motor_Position_Actual;
+    
+    float vx = -sinf(theta1 + theta2) * sinf(gimbal);
+    float vy = -sinf(theta1 + theta2) * cosf(gimbal);
+    float vz =  cosf(theta1 + theta2);
+    
+    int len = snprintf(tx_buf, sizeof(tx_buf), "move_success %.4f %.4f %.4f %.4f\r\n", vx, vy, vz, gimbal);
+    if (len > 0 && len < (int)sizeof(tx_buf))
+    {
+        HAL_UART_Transmit_DMA(Communication_Usart_Handle_Used0, (uint8_t *)tx_buf, len);
+    }
 }

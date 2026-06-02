@@ -1,116 +1,25 @@
 #include "Robotic_Arm_Control_API.h"
 
 static uint8_t Gimbal_Start_Complete = 0;
-static uint8_t Joint_Upper_Start_Complete = 0;
-static uint8_t Joint_Fore_Start_Complete = 0;
 static uint8_t Upper_Lock_Done = 0;
 static uint8_t Fore_Lock_Done = 0;
 
-/* 小臂启动完成后置 1，控制舵机何时开始跟踪目标值 */
+/* 初始化完成后置 1，控制舵机何时开始跟踪目标值 */
 uint8_t Servo_Control_Active = 0;
 
-/* ========== 自动测试状态机 ========== */
-uint8_t Test_Mode_Active = 0;
-
-/* 测试点：距离较远的四个角（单位：m，舵机固定在小臂延长线上 phi_servo=0） */
-static const float Test_Point[4][4] = {
-    {0.02f, 0.60f, 0.45f, 0.0f},   /* 右上  [0] */
-    {0.02f, 0.60f, 0.47f, 0.0f},   /* 右下  [1] */
-    {-0.02f, 0.60f, 0.47f, 0.0f},  /* 左下  [2] */
-    {-0.02f, 0.60f, 0.45f, 0.0f}   /* 左上  [3] */
-};
-
-#define TEST_POS_THR 0.05f
-#define TEST_CYCLES 3
-
+/* ========== FF初始化命令顺序状态机 ========== */
 typedef enum
 {
-    TEST_IDLE,
-    TEST_MOVE,
-    TEST_WAIT,
-    TEST_DONE
-} Test_State_t;
+    INIT_SEQ_IDLE,
+    INIT_SEQ_UPPER,
+    INIT_SEQ_FORE,
+    INIT_SEQ_GIMBAL,
+    INIT_SEQ_DONE
+} Init_Sequence_State_t;
 
-static Test_State_t Test_State = TEST_IDLE;
-static uint8_t Test_Point_Idx = 0;
-static uint8_t Test_Cycle_Count = 0;
-static uint32_t Test_Wait_Tick = 0;
-
-static void Test_Set_Target(uint8_t idx)
-{
-    float gimbal, upper, fore;
-    Coordinate_Inverse_Settlement(Test_Point[idx][0], Test_Point[idx][1],
-                                  Test_Point[idx][2], Test_Point[idx][3],
-                                  &gimbal, &upper, &fore);
-    LK4005_Motor_Handle[0].Motor_Position_Target = gimbal;        /* 云台：直接相连 */
-    LK4005_Motor_Handle[1].Motor_Position_Target = -4.0f * upper; /* 大臂：电机轴 = -4×关节角 */
-    LK4005_Motor_Handle[2].Motor_Position_Target =  2.0f * fore;  /* 小臂：电机轴 =  2×关节角 */
-    LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
-    LK4005_Motor_Handle[2].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
-    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
-}
-
-static uint8_t Test_Is_All_Stopped(void)
-{
-    uint8_t upper_done =
-        (LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.Speed_Plan_State == idle) &&
-        (fabsf(LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].Motor_Position_Actual -
-               LK4005_Motor_Handle[1].Motor_Position_Target) <= TEST_POS_THR);
-    uint8_t fore_done =
-        (LK4005_Motor_Handle[2].Motor_Speed_Plan_Handle.Speed_Plan_State == idle) &&
-        (fabsf(LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[0].Motor_Position_Actual -
-               LK4005_Motor_Handle[2].Motor_Position_Target) <= TEST_POS_THR);
-    uint8_t gimbal_done =
-        (LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State == idle) &&
-        (fabsf(LK4005_Motor_Handle[0].Motor_Position_PID_Control_Handle.Motor_Position_Actual -
-               LK4005_Motor_Handle[0].Motor_Position_Target) <= TEST_POS_THR);
-    return upper_done && fore_done && gimbal_done;
-}
-
-static void Test_Sequence_Run(void)
-{
-    if (!Test_Mode_Active)
-        return;
-    if (Joint_Fore_Start_Complete != 2)
-        return;
-    switch (Test_State)
-    {
-    case TEST_IDLE:
-        Test_Point_Idx = 0;
-        Test_Cycle_Count = 0;
-        Test_State = TEST_MOVE;
-        break;
-    case TEST_MOVE:
-        Test_Set_Target(Test_Point_Idx);
-        Test_State = TEST_WAIT;
-        break;
-    case TEST_WAIT:
-        if (Test_Is_All_Stopped())
-        {
-            Test_Wait_Tick = 0;
-            Test_Point_Idx++;
-            if (Test_Point_Idx >= 4)
-            {
-                Test_Point_Idx = 0;
-                Test_Cycle_Count++;
-                if (Test_Cycle_Count >= TEST_CYCLES)
-                {
-                    Test_State = TEST_DONE;
-                    break;
-                }
-            }
-            Test_State = TEST_MOVE;
-        }
-        break;
-    case TEST_DONE:
-        Test_Mode_Active = 0;
-        Test_State = TEST_IDLE;
-        break;
-    default:
-        break;
-    }
-}
-/* =================================== */
+static Init_Sequence_State_t Init_Sequence_State = INIT_SEQ_IDLE;
+uint8_t Init_Sequence_Trigger = 0;
+/* =========================================== */
 
 void Servo_Motor_Handle_Update(void)
 {
@@ -145,7 +54,7 @@ void LK4005_Motor_Handle_Update(void)
             {
                 Speed_Plan_Update(&LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle,
                                   LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0].Motor_Position_Actual,
-                                  LK4005_Motor_Handle[i].Motor_Position_Target);
+                                  LK4005_Motor_Handle[i].Motor_Position_Target, LK4005_Motor_Handle[i].Motor_Type);
                 if (LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle.Speed_Plan_State != idle)
                 {
                     LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0].Motor_Position_Target =
@@ -169,12 +78,6 @@ void LK4005_Motor_Handle_Update(void)
                         Upperarm_Gravity_Compensation(upper_motor_angle, fore_motor_angle, Servo_Motor_Handle[1].Motor_Position);
                     Motor_MIT_Control(&LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[1]);
                     LK4005_Motor_Torque_Control(LK4005_Motor_Handle[i], LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[1]);
-                }
-                if (fabsf(LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0].Motor_Position_Actual -
-                          LK4005_Motor_Handle[i].Motor_Position_Target) <= 0.1f &&
-                    Joint_Upper_Start_Complete == 0 && Gimbal_Start_Complete == 2)
-                {
-                    Joint_Upper_Start_Complete = 1;
                 }
             }
             /* ---------- 小臂 (Joint_Fore) ---------- */
@@ -182,7 +85,7 @@ void LK4005_Motor_Handle_Update(void)
             {
                 Speed_Plan_Update(&LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle,
                                   LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0].Motor_Position_Actual,
-                                  LK4005_Motor_Handle[i].Motor_Position_Target);
+                                  LK4005_Motor_Handle[i].Motor_Position_Target, LK4005_Motor_Handle[i].Motor_Type);
                 if (LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle.Speed_Plan_State != idle)
                 {
                     LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0].Motor_Position_Target =
@@ -207,19 +110,13 @@ void LK4005_Motor_Handle_Update(void)
                     Motor_MIT_Control(&LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[1]);
                     LK4005_Motor_Torque_Control(LK4005_Motor_Handle[i], LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[1]);
                 }
-                if (fabsf(LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[1].Motor_Position_Actual -
-                          LK4005_Motor_Handle[i].Motor_Position_Target) <= 0.1f &&
-                    Joint_Fore_Start_Complete == 0 && Joint_Upper_Start_Complete == 2)
-                {
-                    Joint_Fore_Start_Complete = 1;
-                }
             }
             /* ---------- 云台 (Gimbal) ---------- */
             if (LK4005_Motor_Handle[i].Motor_Type == Gimbal)
             {
                 Speed_Plan_Update(&LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle,
                                   LK4005_Motor_Handle[i].Motor_MIT_Control_Handle[0].Motor_Position_Actual,
-                                  LK4005_Motor_Handle[i].Motor_Position_Target);
+                                  LK4005_Motor_Handle[i].Motor_Position_Target, LK4005_Motor_Handle[i].Motor_Type);
                 if (LK4005_Motor_Handle[i].Motor_Speed_Plan_Handle.Speed_Plan_State != idle)
                 {
                     LK4005_Motor_Handle[i].Motor_Position_PID_Control_Handle.Motor_Position_Target =
@@ -233,15 +130,41 @@ void LK4005_Motor_Handle_Update(void)
                         LK4005_Motor_Handle[i].Motor_Position_Target;
                 }
                 LK4005_Motor_Position_Control(LK4005_Motor_Handle[i]);
-                if (fabsf(LK4005_Motor_Handle[i].Motor_Position_PID_Control_Handle.Motor_Position_Actual -
-                          LK4005_Motor_Handle[i].Motor_Position_Target) <= 0.1f &&
-                    Gimbal_Start_Complete == 0)
-                {
-                    Gimbal_Start_Complete = 1;
-                }
             }
             HAL_Delay(LK4005_Motor_Control_Cycle);
         }
+    }
+}
+
+static uint8_t Is_Motor_Arrived(uint8_t idx, float pos_thr)
+{
+    if (idx == 0) /* 云台 */
+    {
+        return (LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State == idle) &&
+               (fabsf(LK4005_Motor_Handle[0].Motor_Position_PID_Control_Handle.Motor_Position_Actual -
+                      LK4005_Motor_Handle[0].Motor_Position_Target) <= pos_thr);
+    }
+    else /* 大臂或小臂 */
+    {
+        return (LK4005_Motor_Handle[idx].Motor_Speed_Plan_Handle.Speed_Plan_State == idle) &&
+               (fabsf(LK4005_Motor_Handle[idx].Motor_MIT_Control_Handle[0].Motor_Position_Actual -
+                      LK4005_Motor_Handle[idx].Motor_Position_Target) <= pos_thr);
+    }
+}
+
+static void Check_And_Send_Feedback(void)
+{
+    extern uint8_t Feedback_Pending;
+    
+    if (Feedback_Pending == 0) return;
+    
+    if (Is_Motor_Arrived(0, 0.05f) && Is_Motor_Arrived(1, 0.05f) && Is_Motor_Arrived(2, 0.05f))
+    {
+        if (Feedback_Pending == 2)
+        {
+            Communication_Send_Move_Success();
+        }
+        Feedback_Pending = 0;
     }
 }
 
@@ -255,8 +178,10 @@ void Robotic_Arm_Control_Init(void)
 
 void Robotic_Arm_Control(void)
 {
-    /* 阶段0: 云台先启动，大臂和小臂锁定当前位置 */
-    if (Gimbal_Start_Complete == 0)
+    static uint8_t System_Init_Done = 0;
+    
+    /* 上电初始化：大臂和小臂保持位置，云台转到90° */
+    if (!System_Init_Done)
     {
         if (!Upper_Lock_Done && LK4005_Motor_Handle[1].Wait_Count >= 15)
         {
@@ -268,43 +193,74 @@ void Robotic_Arm_Control(void)
             LK4005_Motor_Handle[2].Motor_Position_Target = LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[1].Motor_Position_Actual;
             Fore_Lock_Done = 1;
         }
-    }
-    else if (Gimbal_Start_Complete == 1)
-    {
-        LK4005_Motor_Handle[1].Motor_Position_Target = -6.28f; /* 大臂电机轴角度目标 */
-        LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
-        Gimbal_Start_Complete = 2;
-    }
-    /* 阶段1: 大臂启动，小臂锁定当前位置 */
-    if (Joint_Upper_Start_Complete == 0)
-    {
-        if (!Fore_Lock_Done && LK4005_Motor_Handle[2].Wait_Count >= 15)
+        
+        if (Upper_Lock_Done && Fore_Lock_Done && Gimbal_Start_Complete == 0)
         {
-            LK4005_Motor_Handle[2].Motor_Position_Target = LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[1].Motor_Position_Actual;
-            Fore_Lock_Done = 1;
+            LK4005_Motor_Handle[0].Motor_Position_Target = PI / 2.0f; /* 云台转到90° */
+            LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+            Gimbal_Start_Complete = 1;
+        }
+        
+        if (Gimbal_Start_Complete == 1)
+        {
+            if (Is_Motor_Arrived(0, 0.1f))
+            {
+                Gimbal_Start_Complete = 2;
+                System_Init_Done = 1;
+                Servo_Control_Active = 1;  /* 初始化完成后，允许舵机跟踪目标值 */
+            }
         }
     }
-    else if (Joint_Upper_Start_Complete == 1)
+    
+    /* FF初始化命令顺序控制：先大臂 → 再小臂 → 最后云台 */
+    if (Init_Sequence_Trigger)
     {
-        LK4005_Motor_Handle[2].Motor_Position_Target = 3.14f; /* 小臂电机轴角度目标 */
-        LK4005_Motor_Handle[2].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
-        Joint_Upper_Start_Complete = 2;
+        Init_Sequence_Trigger = 0;
+        Init_Sequence_State = INIT_SEQ_UPPER;
     }
-    /* 阶段2: 小臂启动 */
-    if (Joint_Fore_Start_Complete == 1)
+    
+    if (Init_Sequence_State != INIT_SEQ_IDLE)
     {
-        Joint_Fore_Start_Complete = 2;
-        Servo_Control_Active = 1;  /* 小臂启动完成后，才允许舵机跟踪目标值 */
-        Test_Mode_Active = 1;      /* 小臂启动完成后，才启动测试模式 */
+        switch (Init_Sequence_State)
+        {
+        case INIT_SEQ_UPPER:
+            if (Is_Motor_Arrived(1, 0.05f))
+            {
+                /* 大臂到达，启动小臂到3.5rad */
+                LK4005_Motor_Handle[2].Motor_Position_Target = 3.5f;
+                LK4005_Motor_Handle[2].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+                Init_Sequence_State = INIT_SEQ_FORE;
+            }
+            break;
+        case INIT_SEQ_FORE:
+            if (Is_Motor_Arrived(2, 0.05f))
+            {
+                /* 小臂到达，启动云台归位到0° */
+                LK4005_Motor_Handle[0].Motor_Position_Target = 0.0f;
+                LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+                Init_Sequence_State = INIT_SEQ_GIMBAL;
+            }
+            break;
+        case INIT_SEQ_GIMBAL:
+            if (Is_Motor_Arrived(0, 0.05f))
+            {
+                Init_Sequence_State = INIT_SEQ_DONE;
+            }
+            break;
+        case INIT_SEQ_DONE:
+            Communication_Send_Init_Success();
+            Init_Sequence_State = INIT_SEQ_IDLE;
+            break;
+        default:
+            break;
+        }
     }
-
-    /* ---------- 四角循环测试 ---------- */
-    Test_Sequence_Run();
-
+    
     if (Servo_Control_Active)
     {
         Servo_Motor_Handle_Update();
     }
     LK4005_Motor_Handle_Update();
-    Communication_Test();
+    
+    Check_And_Send_Feedback();
 }

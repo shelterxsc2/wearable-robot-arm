@@ -35,7 +35,7 @@ static float Calc_Decel_Dist(float v, float a_max, float j)
     return (v * v) / (2.0f * a_max) + (v * a_max) / (2.0f * j);
 }
 
-void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_actual, float position_target)
+void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_actual, float position_target,Motor_Type_t Motor_Type)
 {
     uint32_t Current_Time = HAL_GetTick();
     float dt = (Current_Time - Speed_Plan_Handle->Time_Stamp) * 0.001f;
@@ -54,10 +54,27 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
     {
         float old_direction = Speed_Plan_Handle->direction_flag;
         Speed_Plan_Handle->error_s = position_target - position_actual;
-        Speed_Plan_Handle->position_initial = position_actual;
+        if(Motor_Type != Gimbal)
+        {
+            if (position_actual > 0.0f)
+            {
+                Speed_Plan_Handle->position_initial = position_actual + 0.02f;
+            }
+            else if (position_actual < 0.0f)
+            {
+                Speed_Plan_Handle->position_initial = position_actual - 0.02f;
+            }
+            else
+            {
+                Speed_Plan_Handle->position_initial = position_actual;
+            }
+        }
+        else
+        {
+            Speed_Plan_Handle->position_initial = position_actual;
+        }
 
-        /* 死区：误差 <= 0.05 rad (≈2.86°) 时直接结束，不做速度规划 */
-        if (fabsf(Speed_Plan_Handle->error_s) <= 0.05f)
+        if (fabsf(Speed_Plan_Handle->error_s) <= 0.025f)
         {
             Speed_Plan_Handle->a = 0;
             Speed_Plan_Handle->v = 0;
