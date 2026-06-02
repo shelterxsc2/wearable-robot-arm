@@ -9,15 +9,17 @@ static uint8_t Fore_Lock_Done = 0;
 /* 小臂启动完成后置 1，控制舵机何时开始跟踪目标值 */
 uint8_t Servo_Control_Active = 0;
 
+#define TEST_MODE_ENABLE  0
+
 /* ========== 自动测试状态机 ========== */
-uint8_t Test_Mode_Active = 0;
+uint8_t Test_Mode_Active = TEST_MODE_ENABLE;
 
 /* 测试点：距离较远的四个角（单位：m，舵机固定在小臂延长线上 phi_servo=0） */
 static const float Test_Point[4][4] = {
-    {0.02f, 0.60f, 0.45f, 0.0f},   /* 右上  [0] */
-    {0.02f, 0.60f, 0.47f, 0.0f},   /* 右下  [1] */
-    {-0.02f, 0.60f, 0.47f, 0.0f},  /* 左下  [2] */
-    {-0.02f, 0.60f, 0.45f, 0.0f}   /* 左上  [3] */
+    { 0.25f,  0.70f, 0.55f, 1.5708f },   /* 右上  [0] */
+    { 0.25f,  0.70f, 0.25f, 1.5708f },   /* 右下  [1] */
+    {-0.25f,  0.70f, 0.25f, 1.5708f },   /* 左下  [2] */
+    {-0.25f,  0.70f, 0.55f, 1.5708f }    /* 左上  [3] */
 };
 
 #define TEST_POS_THR 0.05f
@@ -82,6 +84,7 @@ static void Test_Sequence_Run(void)
         break;
     case TEST_MOVE:
         Test_Set_Target(Test_Point_Idx);
+        Test_Wait_Tick = HAL_GetTick();
         Test_State = TEST_WAIT;
         break;
     case TEST_WAIT:

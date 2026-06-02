@@ -3,6 +3,7 @@
  */
 #include "rga_npu.h"
 #include "uart_comm.h"
+#include "nrf24_linux.h"
 #include <rknn_api.h>
 #include <cstddef>
 #include <im2d.h>
@@ -465,6 +466,382 @@ static void draw_pose_indicator(uint8_t* nv12, int w, int h, double yaw, double 
             }
         }
     }
+}
+
+/* 角度归一化到 [-180, 180]，消除万向节环绕问题 */
+static inline float normalize_angle_deg(float deg)
+{
+    while (deg > 180.0f) deg -= 360.0f;
+    while (deg < -180.0f) deg += 360.0f;
+    return deg;
+}
+
+/* ========== 8 状态运动状态机（修复版）========== */
+typedef enum {
+    STATE_STOP_TO_ACCEL = 0,
+    STATE_ACCEL,
+    STATE_ACCEL_TO_CONST,
+    STATE_CONST_SPEED,
+    STATE_CONST_TO_DECEL,
+    STATE_DECEL_TO_STOP,
+    STATE_STOP,
+    STATE_DECEL_STOP_TO_ACCEL
+} MotionState;
+
+static const char* motion_state_name(MotionState s)
+{
+    switch (s) {
+        case STATE_STOP_TO_ACCEL:       return "静止→加速";
+        case STATE_ACCEL:               return "加速";
+        case STATE_ACCEL_TO_CONST:      return "加速→匀速";
+        case STATE_CONST_SPEED:         return "匀速";
+        case STATE_CONST_TO_DECEL:      return "匀速→减速";
+        case STATE_DECEL_TO_STOP:       return "减速→停止";
+        case STATE_STOP:                return "停止";
+        case STATE_DECEL_STOP_TO_ACCEL: return "减速→停止→加速";
+    }
+    return "未知";
+}
+
+/* ========== 基于 wz 历史（10ms 分辨率）的运动上下文 ==========
+ * 50ms 控制周期内，分析 NRF24 最近 5 帧（50ms）的完整 wz 序列，
+ * 而不是只读一个瞬时值。能检测峰值/谷值/过零/趋势。
+ */
+struct MotionContext {
+    float wz_first;          // 窗口第一个值
+    float wz_peak;           // 窗口峰值
+    float wz_valley;         // 窗口谷值
+    float wz_latest;         // 窗口最后一个值
+    float wz_avg;            // 窗口平均（用于停止判断）
+    bool  has_crossed_zero;  // 窗口内是否发生过零
+    bool  initialized;
+
+    MotionContext() : wz_first(0), wz_peak(0), wz_valley(0), wz_latest(0),
+                      wz_avg(0), has_crossed_zero(false), initialized(false) {}
+
+    /* 从 NRF24 wz 历史数组更新（取最近 max_samples 个） */
+    void update_from_hist(const float hist[], int count, int max_samples = 5) {
+        if (count <= 0) return;
+        int start = (count > max_samples) ? (count - max_samples) : 0;
+        int n = count - start;
+        if (n <= 0) return;
+
+        wz_first = hist[start];
+        wz_peak = hist[start];
+        wz_valley = hist[start];
+        wz_latest = hist[count - 1];
+        has_crossed_zero = false;
+
+        float sum = 0.0f;
+        for (int i = start; i < count; i++) {
+            float v = hist[i];
+            if (v > wz_peak) wz_peak = v;
+            if (v < wz_valley) wz_valley = v;
+            sum += v;
+            if (i > start && hist[i - 1] * v < 0.0f) has_crossed_zero = true;
+        }
+        wz_avg = sum / n;
+        if (!initialized) initialized = true;
+    }
+
+    /* 停止判断：窗口平均 */
+    bool is_stop() const { return std::fabs(wz_avg) < 5.0f; }
+
+    /* 加速趋势：速度绝对值在增大，且没有过零 */
+    bool accel_trend() const {
+        return !has_crossed_zero && std::fabs(wz_latest) > std::fabs(wz_first) + 10.0f;
+    }
+
+    /* 减速趋势：速度绝对值在减小，且没有过零 */
+    bool decel_trend() const {
+        return !has_crossed_zero && std::fabs(wz_latest) < std::fabs(wz_first) - 10.0f;
+    }
+
+    /* 稳态趋势：速度绝对值变化不大，且没有过零 */
+    bool steady_trend() const {
+        return !has_crossed_zero && std::fabs(std::fabs(wz_latest) - std::fabs(wz_first)) <= 10.0f;
+    }
+};
+
+static MotionState next_motion_state(MotionState prev, const MotionContext& ctx)
+{
+    bool is_stop = ctx.is_stop();
+    bool accel_trend = ctx.accel_trend();
+    bool decel_trend = ctx.decel_trend();
+    bool steady_trend = ctx.steady_trend();
+    bool crossed = ctx.has_crossed_zero;
+
+    switch (prev) {
+        case STATE_STOP:
+            if (!is_stop) return STATE_STOP_TO_ACCEL;
+            return STATE_STOP;
+
+        case STATE_STOP_TO_ACCEL:
+            if (is_stop) return STATE_STOP;
+            if (accel_trend) return STATE_ACCEL;
+            if (steady_trend) return STATE_ACCEL_TO_CONST;
+            return STATE_ACCEL;
+
+        case STATE_ACCEL:
+            if (is_stop) return STATE_STOP;
+            if (crossed) return STATE_DECEL_STOP_TO_ACCEL;
+            if (accel_trend) return STATE_ACCEL;
+            if (decel_trend) return STATE_CONST_TO_DECEL;
+            if (steady_trend) return STATE_ACCEL_TO_CONST;
+            return STATE_ACCEL;
+
+        case STATE_ACCEL_TO_CONST:
+            if (is_stop) return STATE_STOP;
+            if (steady_trend) return STATE_CONST_SPEED;
+            if (decel_trend) return STATE_CONST_TO_DECEL;
+            return STATE_CONST_SPEED;
+
+        case STATE_CONST_SPEED:
+            if (is_stop) return STATE_STOP;
+            if (decel_trend) return STATE_CONST_TO_DECEL;
+            if (accel_trend) return STATE_ACCEL_TO_CONST;
+            return STATE_CONST_SPEED;
+
+        case STATE_CONST_TO_DECEL:
+            if (is_stop) return STATE_STOP;
+            if (decel_trend) return STATE_DECEL_TO_STOP;
+            return STATE_DECEL_TO_STOP;
+
+        case STATE_DECEL_TO_STOP:
+            if (is_stop) return STATE_STOP;
+            if (!is_stop && accel_trend) return STATE_DECEL_STOP_TO_ACCEL;
+            return STATE_DECEL_TO_STOP;
+
+        case STATE_DECEL_STOP_TO_ACCEL:
+            if (is_stop) return STATE_STOP;
+            if (accel_trend) return STATE_ACCEL;
+            if (decel_trend) return STATE_DECEL_TO_STOP;
+            if (steady_trend) return STATE_ACCEL_TO_CONST;
+            return STATE_ACCEL;
+    }
+    return STATE_STOP;
+}
+
+/* ========== 终点预测器 ==========
+ * 核心思想：根据当前速度和运动状态，预测人脸最终停止位置，
+ * 提前发令让机械臂直接运动到预测终点，实现"同时到达"。
+ */
+struct EndpointPredictor {
+    float pred_delta_yaw;   // 相对于当前 yaw 的预测位移（度）
+    MotionState pred_state; // 预测时的状态
+    bool valid;
+
+    EndpointPredictor() : pred_delta_yaw(0.0f), valid(false), pred_state(STATE_STOP) {}
+
+    void reset() { pred_delta_yaw = 0.0f; valid = false; }
+
+    /* 更新预测：状态调制系数 k + 自适应预测窗口 dt */
+    void update(float wz, MotionState state) {
+        float abs_wz = std::fabs(wz);
+
+        /* 预测时间窗口 dt：速度越大，运动结束越早，窗口越短 */
+        float dt;
+        if (abs_wz < 20.0f)       dt = 0.50f;  // 低速：预测 500ms
+        else if (abs_wz < 60.0f)  dt = 0.35f;  // 中速：预测 350ms
+        else                      dt = 0.25f;  // 高速：预测 250ms
+
+        /* 状态调制系数 k：
+         * - 加速→匀速：速度平台确立，预测最确定，k 最大
+         * - 匀速：不知何时减速，最不确定，k 最小
+         * - 减速：可估算剩余位移，k 中等
+         */
+        float k;
+        switch (state) {
+            case STATE_ACCEL:            k = 0.35f; break;
+            case STATE_ACCEL_TO_CONST:   k = 0.70f; break;  // ★ 主窗口，最确定
+            case STATE_CONST_SPEED:      k = 0.30f; break;  // 不确定，保守
+            case STATE_CONST_TO_DECEL:   k = 0.60f; break;  // 修正窗口
+            case STATE_DECEL_TO_STOP:    k = 0.25f; break;  // 剩余少
+            case STATE_STOP:             k = 0.00f; break;
+            case STATE_STOP_TO_ACCEL:    k = 0.35f; break;
+            case STATE_DECEL_STOP_TO_ACCEL: k = 0.45f; break;
+            default:                     k = 0.40f; break;
+        }
+
+        pred_delta_yaw = wz * dt * k;
+        pred_state = state;
+        valid = (state != STATE_STOP);
+    }
+
+    float get_target_yaw(float current_yaw) const {
+        return current_yaw + pred_delta_yaw;
+    }
+};
+
+/* 独立的 NRF24 IMU 控制链路：俯仰控制（仿照偏航控制架构） */
+void nrf24_control_update(void)
+{
+    static const float NRF_FACE_X_CM = 0.0f;
+    static const float NRF_FACE_Y_CM = 10.0f;
+    static const float NRF_FACE_Z_CM = 40.0f;
+    static const float NRF_SERVO1_DEG = 50.0f;
+    static const float NRF_SERVO2_DEG = 145.0f;
+
+    /* [DEPRECATED] 偏航控制已注释掉
+    static bool yaw_baseline_set = false;
+    static float nrf_baseline_yaw_deg = 0.0f;
+    static MotionState prev_state_yaw = STATE_STOP;
+    static MotionContext ctx_yaw;
+    static EndpointPredictor predictor_yaw;
+    static uint64_t last_cmd_us_yaw = 0;
+    static float last_cmd_target_yaw = 0.0f;
+    static const float CMD_YAW_THRESHOLD_DEG = 5.0f;
+    */
+
+    /* 俯仰控制状态（完全仿照偏航控制架构） */
+    static bool pitch_baseline_set = false;
+    static float nrf_baseline_roll_deg = 0.0f;
+    static uint64_t last_update_us = 0;
+    static MotionState prev_state = STATE_STOP;
+    static MotionState prev_print_state = STATE_STOP;
+    static MotionContext ctx;
+    static EndpointPredictor predictor;
+
+    /* 发令控制状态 */
+    static uint64_t last_cmd_us = 0;
+    static float last_cmd_target_roll = 0.0f;
+    static const float CMD_ROLL_THRESHOLD_DEG = 5.0f;
+
+    uint64_t now_us = get_us();
+    if (now_us - last_update_us < 50000)   /* 50ms 采样周期 */
+        return;
+    last_update_us = now_us;
+
+    float current_roll_deg = 0.0f;
+    float wx = 0.0f;
+    bool imu_valid = false;
+    float wx_hist[NRF24_WX_HIST_SIZE];
+    int wx_count = 0;
+
+    pthread_mutex_lock(&g_nrf24_state.mutex);
+    current_roll_deg = g_nrf24_state.gy_roll;
+    wx = g_nrf24_state.gy_wx;
+    imu_valid = g_nrf24_state.imu_valid;
+    wx_count = g_nrf24_state.gy_wx_count;
+    if (wx_count > 0) {
+        for (int i = 0; i < wx_count; i++) {
+            int pos = (g_nrf24_state.gy_wx_idx - wx_count + i + NRF24_WX_HIST_SIZE)
+                      % NRF24_WX_HIST_SIZE;
+            wx_hist[i] = g_nrf24_state.gy_wx_hist[pos];
+        }
+    }
+    pthread_mutex_unlock(&g_nrf24_state.mutex);
+
+    if (!imu_valid) {
+        /* printf("[NRF-STATE] 无效数据\n"); */
+        return;
+    }
+
+    /* 基准标定 */
+    if (!pitch_baseline_set) {
+        nrf_baseline_roll_deg = current_roll_deg;
+        pitch_baseline_set = true;
+        last_cmd_target_roll = current_roll_deg;
+        predictor.reset();
+    }
+
+    /* 用 wx 历史（10ms 分辨率）更新运动上下文并运行状态机 */
+    ctx.update_from_hist(wx_hist, wx_count, 5);   /* 取最近 5 个 ≈ 50ms */
+    MotionState curr_state = next_motion_state(prev_state, ctx);
+    prev_state = curr_state;
+
+    /* 更新终点预测 */
+    predictor.update(wx, curr_state);
+
+    /* 只在状态变化时打印 */
+    if (curr_state != prev_print_state) {
+        /* printf("[NRF-STATE] wx=%+.2f pred=%+.1f° | %s\n",
+               wx, predictor.pred_delta_yaw, motion_state_name(curr_state)); */
+        prev_print_state = curr_state;
+    }
+
+    /* ========== 预测终点驱动的发令策略 ========== */
+    bool is_stop = ctx.is_stop();
+
+    /* 计算目标 roll：
+     * - 运动中：使用预测终点（current_roll + pred_delta）
+     * - 停止中：使用当前实际位置（消除预测残余误差）
+     */
+    float target_roll_deg = is_stop ? current_roll_deg
+                                    : predictor.get_target_yaw(current_roll_deg);
+
+    /* 相对于上一次发令目标的变化 */
+    float delta_roll_deg = normalize_angle_deg(target_roll_deg - last_cmd_target_roll);
+    bool moved_enough = std::fabs(delta_roll_deg) > CMD_ROLL_THRESHOLD_DEG;
+
+    /* 自适应间隔：
+     * - 主窗口（加速→匀速）：150ms
+     * - 修正窗口（匀速→减速）：150ms
+     * - 常规修正：200ms
+     * - 停止对准：200ms
+     */
+    uint64_t interval = 200000;
+    bool is_first_window  = (curr_state == STATE_ACCEL_TO_CONST);
+    bool is_second_window = (curr_state == STATE_CONST_TO_DECEL);
+    if (is_first_window || is_second_window) {
+        interval = 150000;
+    }
+    bool interval_ok = (now_us - last_cmd_us) >= interval;
+
+    /* 发令条件：
+     * 1. 间隔足够
+     * 2. 预测目标变化 > 5°
+     * 3. 满足以下任一：
+     *    - 主窗口（速度平台确立，首次预测）
+     *    - 修正窗口（开始减速，修正预测）
+     *    - 人脸已停止（精确对准，消除累积误差）
+     *    - 常规：预测目标持续变化
+     */
+    bool should_cmd = false;
+    if (interval_ok && moved_enough) {
+        if (is_first_window) {
+            /* 速度平台确立，首次发预测令 */
+            should_cmd = true;
+        } else if (is_second_window) {
+            /* 开始减速，修正预测 */
+            should_cmd = true;
+        } else if (is_stop) {
+            /* 人脸已停，精确对准当前位置 */
+            should_cmd = true;
+            predictor.reset();
+        } else {
+            /* 常规修正：预测目标持续漂移 > 5° */
+            should_cmd = true;
+        }
+    }
+
+    static float last_tx = NRF_FACE_X_CM;
+    static float last_ty = NRF_FACE_Y_CM;
+    static float last_tz = NRF_FACE_Z_CM;
+
+    if (should_cmd) {
+        /* 极性定义: gy_roll 减小 = 抬头, gy_roll 增大 = 低头 */
+        float delta_roll_deg = normalize_angle_deg(target_roll_deg - nrf_baseline_roll_deg);
+        float cum_pitch_offset = -delta_roll_deg * (float)M_PI / 180.0f;
+        if (cum_pitch_offset > (float)M_PI / 4.0f)
+            cum_pitch_offset = (float)M_PI / 4.0f;
+        if (cum_pitch_offset < -(float)M_PI / 4.0f)
+            cum_pitch_offset = -(float)M_PI / 4.0f;
+
+        last_tx = NRF_FACE_X_CM;
+        last_ty = 67.0f;
+        last_tz = NRF_FACE_Z_CM + 15.0f * std::sin(cum_pitch_offset);
+
+        uart_send_arm_target(last_tx, last_ty, last_tz,
+                             NRF_SERVO1_DEG, NRF_SERVO2_DEG);
+
+        last_cmd_target_roll = target_roll_deg;
+        last_cmd_us = now_us;
+    }
+
+    /* 每 50ms 打印实际发送的坐标 + wx + roll */
+    printf("[NRF-DEBUG] tx=%.1f ty=%.1f tz=%.1f wx=%+.2f roll=%+.2f\n",
+           last_tx, last_ty, last_tz, wx, current_roll_deg);
 }
 
 static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h, const PoseDetection& det) {
@@ -942,225 +1319,10 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h, const Po
 
     draw_pose_indicator(nv12, img_w, img_h, head_yaw, head_pitch);
 
+    /* [DEPRECATED] 旧 PnP-based 控制链路已注释掉，改用 NRF24 IMU 控制链路
     // ========== 人脸跟随验证模式（舵机固定，只调机械臂位置） ==========
-    // 坐标系：原点为云台电机（基座系）
-    //   +X: 穿戴者右侧
-    //   +Y: 人脸前方（远离底座，钓鱼竿伸出的方向）
-    //   +Z: 竖直向上
-    //
-    // 核心逻辑：人脸可以绕竖直轴转动（偏头），相机跟随人脸朝向在水平面内摆动。
-    // 舵机固定（就当没有舵机），只控制机械臂三个关节改变相机位置。
-    // 人脸朝 +Y 时相机在 (0, 67, 40)；人脸右转朝 +X 时相机右摆到 (57, 10, 40) 附近。
-
-    // 人脸固定位置 (cm)
-    static const float FACE_X_CM = 0.0f;
-    static const float FACE_Y_CM = 10.0f;
-    static const float FACE_Z_CM = 40.0f;
-    // 相机始终保持在人脸正前方的水平距离 (cm)
-    static const float TRACK_DIST_CM = 57.0f;   // 使得 yaw=0 时相机 y=67
-    // 相机比人脸固定高出的高度 (cm)
-    static const float CAM_HEIGHT_OFFSET_CM = 0.0f;  // z = 35 + 0 = 35
-    // 舵机角度固定（上电初始值，验证过程中不变）
-    // SERVO1: 360°控速电机，50 = 停止（速度为0）
-    static const float SERVO1_DEG = 50.0f;
-    static const float SERVO2_DEG = 145.0f;
-
-    // 从 PnP 获取人脸偏航角/俯仰角（rad）
-    //   head_yaw ≈ 0  : 人脸正对前方 (+Y)
-    //   head_yaw > 0  : 人脸右转 (+X方向)，相机应跟随右摆
-    //   head_yaw < 0  : 人脸左转 (-X方向)，相机应跟随左摆
-    //   head_pitch ≈ 0: 人脸正视前方（不抬头不低头）
-    //   head_pitch > 0: 人脸抬头，相机应升高（或降低，实测后反向即可）
-    //   head_pitch < 0: 人脸低头，相机应降低（或升高）
-    // 如果实测发现方向相反，给 head_yaw / head_pitch 加负号即可
-    float yaw_rad = (float)head_yaw;
-    float pitch_rad = -(float)head_pitch;  // 极性取反，实测后确认方向
-
-    // ---------- 偏航方向：带死区的积分跟随 + 速度前馈 + 大角度P助推 + 冻结停稳 + 死区微调 ----------
-    static const float DEAD_ZONE_RAD = 5.0f * (float)M_PI / 180.0f;
-    static const float CHASE_K     = 0.08f;
-    static const float FINE_K      = 0.008f;                        // 微调系数 (1/10)
-    static const float FINE_MAX_RAD= 5.0f * (float)M_PI / 180.0f;   // 微调量上限 ±5°
-    static const float FF_GAIN     = 0.35f;
-    static const float BOOST_THRESH_RAD = 10.0f * (float)M_PI / 180.0f; // >10°触发
-    static const float BOOST_K     = 0.0125f;                        // 大角度P助推系数 (再减半)
-
-    static float cum_yaw_offset    = 0.0f;
-    static float frozen_yaw_offset = 0.0f;
-    static float fine_offset       = 0.0f;
-    static float prev_yaw          = 0.0f;
-    static int   stable_cnt        = 0;
-    static bool  frozen            = false;
-
-    // 发送周期内各分量累加（用于日志）
-    static float acc_big_integ  = 0.0f;
-    static float acc_ff         = 0.0f;
-    static float acc_boost      = 0.0f;
-    static float acc_fine_integ = 0.0f;
-    static float last_sent_yaw  = 0.0f;
-
-    // 最近两次发送记录（用于显示历史坐标）
-    static float prev1_x=0.0f, prev1_y=0.0f, prev1_z=0.0f, prev1_yaw=0.0f;
-    static float prev2_x=0.0f, prev2_y=0.0f, prev2_z=0.0f, prev2_yaw=0.0f;
-
-    float yaw_delta = yaw_rad - prev_yaw;
-    prev_yaw = yaw_rad;
-    // 限幅：防止 PnP 跳变或首帧异常导致前馈冲击
-    if (yaw_delta > 0.20f) yaw_delta = 0.20f;
-    if (yaw_delta < -0.20f) yaw_delta = -0.20f;
-
-    bool in_dead_zone = (std::abs(yaw_rad) <= DEAD_ZONE_RAD);
-    float big_integ = 0.0f, feedforward = 0.0f, fine_integ = 0.0f, boost = 0.0f;
-
-    if (!in_dead_zone) {
-        // S1: 粗调追踪
-        frozen = false;
-        stable_cnt = 0;
-        fine_offset = 0.0f;
-        float eff_yaw = (yaw_rad > 0.0f) ? (yaw_rad - DEAD_ZONE_RAD)
-                                          : (yaw_rad + DEAD_ZONE_RAD);
-        big_integ = CHASE_K * eff_yaw;
-        feedforward = FF_GAIN * yaw_delta;
-        cum_yaw_offset += big_integ + feedforward;
-        // 大角度额外P助推（持续推力，弥补积分滞后）
-        if (std::abs(yaw_rad) > BOOST_THRESH_RAD) {
-            cum_yaw_offset += BOOST_K * yaw_rad;
-        }
-        frozen_yaw_offset = cum_yaw_offset;
-    } else {
-        // 在死区内
-        if (!frozen) {
-            stable_cnt++;
-            if (stable_cnt >= 3) {
-                // 进入冻结微调
-                frozen = true;
-                frozen_yaw_offset = cum_yaw_offset;
-                fine_offset = 0.0f;
-            } else {
-                // S2: 过渡缓冲，保留前馈
-                feedforward = FF_GAIN * yaw_delta;
-                cum_yaw_offset += feedforward;
-                frozen_yaw_offset = cum_yaw_offset;
-            }
-        }
-    }
-
-    if (frozen) {
-        // S3: 冻结微调
-        fine_integ = FINE_K * yaw_rad;
-        fine_offset += fine_integ;
-        if (fine_offset > FINE_MAX_RAD)  fine_offset = FINE_MAX_RAD;
-        if (fine_offset < -FINE_MAX_RAD) fine_offset = -FINE_MAX_RAD;
-        cum_yaw_offset = frozen_yaw_offset + fine_offset;
-    }
-
-    // 输出限幅
-    if (cum_yaw_offset > (float)M_PI / 2.0f)  cum_yaw_offset = (float)M_PI / 2.0f;
-    if (cum_yaw_offset < -(float)M_PI / 2.0f) cum_yaw_offset = -(float)M_PI / 2.0f;
-
-    // 累加本帧各分量
-    acc_big_integ  += big_integ;
-    acc_ff         += feedforward;
-    acc_boost      += boost;
-    acc_fine_integ += fine_integ;
-
-    // ---------- 俯仰方向：已禁用，固定高度 ----------
-    static float cum_pitch_offset = 0.0f;
-    cum_pitch_offset = 0.0f;
-    float pitch_output = 0.0f;
-
-    float target_x = FACE_X_CM + TRACK_DIST_CM * std::sin(cum_yaw_offset);
-    float target_y = FACE_Y_CM + TRACK_DIST_CM * std::cos(cum_yaw_offset);
-    static const float NEUTRAL_Z_CM = FACE_Z_CM + CAM_HEIGHT_OFFSET_CM;
-    static const float PITCH_RANGE_CM = 15.0f;
-    float target_z = NEUTRAL_Z_CM + PITCH_RANGE_CM * std::sin(pitch_output);
-
-    // 发送历史（用于 60cm 软限幅）
-    static float last_sent_x = 0.0f, last_sent_y = 0.0f;
-    static bool has_last_sent = false;
-    static int skip_streak = 0;          // 连续被SKIP的帧数
-    static bool was_clamped = false;     // 本帧是否被60cm软限幅
-
-    // 1. 60cm 软限幅（而非硬丢弃）：超限时发送边界点并同步控制器状态
-    bool should_send = true;
-    was_clamped = false;
-    if (has_last_sent) {
-        float dx = target_x - last_sent_x;
-        float dy = target_y - last_sent_y;
-        float dist_to_last = std::sqrt(dx*dx + dy*dy);
-        if (dist_to_last > 60.0f) {
-            float ratio = 60.0f / dist_to_last;
-            float clamped_x = last_sent_x + dx * ratio;
-            float clamped_y = last_sent_y + dy * ratio;
-            float clamped_yaw = std::atan2(clamped_x - FACE_X_CM, clamped_y - FACE_Y_CM);
-
-            target_x = clamped_x;
-            target_y = clamped_y;
-            // 关键：把积分器状态也拉回，防止持续漂移导致永远超限
-            cum_yaw_offset = clamped_yaw;
-            frozen_yaw_offset = clamped_yaw;
-            frozen = false;
-            stable_cnt = 0;
-            fine_offset = 0.0f;
-            was_clamped = true;
-
-            printf("[GUARD] Soft-clamp 60cm: orig_dist=%.1fcm, yaw clamped to %+.2f°\n",
-                   dist_to_last, clamped_yaw * 180.0f / (float)M_PI);
-        }
-    }
-
-    // 2. 防死锁：连续 SKIP 超过 20 帧，强制发一次（安全网）
-    // （当前只有 60cm 限幅会导致 SKIP，若持续超限说明人脸在快速甩头）
-    if (!should_send) {
-        skip_streak++;
-        if (skip_streak >= 20) {
-            should_send = true;
-            printf("[GUARD] Force send after %d consecutive skips (anti-stall)\n", skip_streak);
-            skip_streak = 0;
-        }
-    } else {
-        skip_streak = 0;
-    }
-
-    if (should_send) {
-        uart_send_arm_target(target_x, target_y, target_z,
-                             SERVO1_DEG, SERVO2_DEG);
-
-        // 更新发送历史
-        last_sent_x = target_x;
-        last_sent_y = target_y;
-        has_last_sent = true;
-
-        float delta_yaw = cum_yaw_offset - last_sent_yaw;
-        float yaw_deg   = cum_yaw_offset * 180.0f / (float)M_PI;
-
-        printf("\n[SEND] yaw=%+.2f°  Δ=%+.3f°  (big=%+.3f°  ff=%+.3f°  boost=%+.3f°  fine=%+.3f°)\n",
-               yaw_deg,
-               delta_yaw * 180.0f / (float)M_PI,
-               acc_big_integ  * 180.0f / (float)M_PI,
-               acc_ff         * 180.0f / (float)M_PI,
-               acc_boost      * 180.0f / (float)M_PI,
-               acc_fine_integ * 180.0f / (float)M_PI);
-        printf("  CUR:  x=%6.1f y=%6.1f z=%5.1f | yaw=%+.2f°\n",
-               target_x, target_y, target_z, yaw_deg);
-        printf("  PREV: x=%6.1f y=%6.1f z=%5.1f | yaw=%+.2f°\n",
-               prev1_x, prev1_y, prev1_z,
-               prev1_yaw * 180.0f / (float)M_PI);
-        printf("  PRE2: x=%6.1f y=%6.1f z=%5.1f | yaw=%+.2f°\n",
-               prev2_x, prev2_y, prev2_z,
-               prev2_yaw * 180.0f / (float)M_PI);
-
-        // 移位历史记录（日志显示用）
-        prev2_x = prev1_x; prev2_y = prev1_y; prev2_z = prev1_z; prev2_yaw = prev1_yaw;
-        prev1_x = target_x; prev1_y = target_y; prev1_z = target_z; prev1_yaw = cum_yaw_offset;
-
-        // 重置周期累加器
-        acc_big_integ  = 0.0f;
-        acc_ff         = 0.0f;
-        acc_boost      = 0.0f;
-        acc_fine_integ = 0.0f;
-        last_sent_yaw  = cum_yaw_offset;
-    }
+    // ... 原控制逻辑已注释 ...
+    */
 }
 
 // ========== FP16/FP32转换 ==========

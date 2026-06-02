@@ -110,7 +110,7 @@ int uart_init(const char* device, int baudrate)
     }
 
     tcflush(g_uart_fd, TCIOFLUSH);
-    printf("[UART] %s opened @ %d baud (8N1, no flow ctrl)\n", device, baudrate);
+    /* printf("[UART] %s opened @ %d baud (8N1, no flow ctrl)\n", device, baudrate); */
     return 0;
 }
 
@@ -121,19 +121,19 @@ void uart_cleanup(void)
         tcflush(g_uart_fd, TCIOFLUSH);
         close(g_uart_fd);
         g_uart_fd = -1;
-        printf("[UART] closed\n");
+        /* printf("[UART] closed\n"); */
     }
 }
 
 int uart_send_raw(const uint8_t* data, size_t len)
 {
     if (g_uart_fd < 0) return -1;
-    printf("[UART] TX (%zu bytes):", len);
+    /* printf("[UART] TX (%zu bytes):", len);
     for (size_t i = 0; i < len && i < 32; ++i) {
         printf(" %02X", data[i]);
     }
     if (len > 32) printf(" ...");
-    printf("\n");
+    printf("\n"); */
     ssize_t w = write(g_uart_fd, data, len);
     if ((size_t)w != len) {
         fprintf(stderr, "[UART] write failed: %zd/%zu (%s)\n", w, len, strerror(errno));
@@ -181,7 +181,7 @@ static int send_frame(uint8_t cmd, const uint8_t* payload, uint8_t len)
 
 int uart_send_heartbeat(void)
 {
-    printf("[UART] sending heartbeat...\n");
+    /* printf("[UART] sending heartbeat...\n"); */
     return send_frame(CMD_HEARTBEAT, NULL, 0);
 }
 
@@ -201,7 +201,7 @@ int uart_send_target_pose(const Pose6D* pose)
 
 int uart_send_arm_target(float x, float y, float z, float k1, float k2)
 {
-    printf("[UART] TX ARM_TARGET: x=%.1f y=%.1f z=%.1f k1=%.1f k2=%.1f\n", x, y, z, k1, k2);
+    /* printf("[UART] TX ARM_TARGET: x=%.1f y=%.1f z=%.1f k1=%.1f k2=%.1f\n", x, y, z, k1, k2); */
     int16_t data[5];
     data[0] = (int16_t)x;
     data[1] = (int16_t)y;
@@ -224,7 +224,7 @@ static void* recv_thread_func(void* arg)
     (void)arg;
     uint8_t rx_buf[64];
 
-    printf("[UART] receiver thread started (binary mode)\n");
+    /* printf("[UART] receiver thread started (binary mode)\n"); */
 
     static char rx_text[128];
     static int  rx_text_len = 0;
@@ -233,12 +233,12 @@ static void* recv_thread_func(void* arg)
         int n = uart_recv_raw(rx_buf, sizeof(rx_buf), 100);
         if (n <= 0) continue;
 
-        printf("[UART] RX (%d bytes):", n);
+        /* printf("[UART] RX (%d bytes):", n);
         for (int i = 0; i < n && i < 16; ++i) {
             printf(" %02X", rx_buf[i]);
         }
         if (n > 16) printf(" ...");
-        printf("\n");
+        printf("\n"); */
 
         /* 简单文本缓冲: 检测 "move complete" */
         int copy = n;
@@ -260,7 +260,7 @@ static void* recv_thread_func(void* arg)
         }
     }
 
-    printf("[UART] receiver thread stopped\n");
+    /* printf("[UART] receiver thread stopped\n"); */
     return NULL;
 }
 

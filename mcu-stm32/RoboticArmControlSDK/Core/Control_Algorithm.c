@@ -52,6 +52,7 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
     }
     case init:
     {
+        float old_direction = Speed_Plan_Handle->direction_flag;
         Speed_Plan_Handle->error_s = position_target - position_actual;
         Speed_Plan_Handle->position_initial = position_actual;
 
@@ -62,6 +63,12 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
         else
         {
             Speed_Plan_Handle->direction_flag = -1.0f;
+        }
+
+        /* Direction reversal: attenuate inherited velocity to reduce Kd shock */
+        if (old_direction * Speed_Plan_Handle->direction_flag < 0.0f)
+        {
+            Speed_Plan_Handle->v *= 0.3f;
         }
 
         /* Adaptive v_limit: pre-compute peak speed for this displacement */
