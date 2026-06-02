@@ -56,8 +56,8 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
         Speed_Plan_Handle->error_s = position_target - position_actual;
         Speed_Plan_Handle->position_initial = position_actual;
 
-        /* 死区：误差 <= 0.1° 时直接结束，不做速度规划 */
-        if (fabsf(Speed_Plan_Handle->error_s) <= 0.1f * PI / 180.0f)
+        /* 死区：误差 <= 0.05 rad (≈2.86°) 时直接结束，不做速度规划 */
+        if (fabsf(Speed_Plan_Handle->error_s) <= 0.05f)
         {
             Speed_Plan_Handle->a = 0;
             Speed_Plan_Handle->v = 0;
