@@ -27,22 +27,6 @@ typedef enum
 
 typedef struct
 {
-    float Roll_Target;
-    float Pitch_Target;
-    float Yaw_Target;
-    float X_Target;
-    float Y_target;
-    float Z_target;
-    float Roll_Actual;
-    float Pitch_Actual;
-    float Yaw_Actual;
-    float X_Actual;
-    float Y_Actual;
-    float Z_Actual;
-} FaceBased_Data_t;
-
-typedef struct
-{
     float Accel_X;
     float Accel_Y;
     float Accel_Z;
@@ -96,7 +80,7 @@ typedef struct
     float Motor_Torque_Friction;
     float MIT_Kp;
     float MIT_Kd;
-    float Output; //达妙电机由于其特殊的CAN报文控制用不到这个变量
+    float Output;
 } Motor_MIT_Control_Handle_t;
 
 typedef struct
@@ -104,14 +88,6 @@ typedef struct
     float Motor_Position_Actual; //范围:0~2pi,单位为rad
     volatile float Motor_Position_Target; // 范围:0~2pi,单位为rad
 } Motor_Position_PID_Control_Handle_t; //供云台电机使用
-
-typedef struct
-{
-    Motor_Type_t Motor_Type;
-    TIM_HandleTypeDef *Motor_PWM_Timer; // PWM输出的定时器句柄
-    uint32_t Motor_PWM_Channel;         // PWM输出的定时器通道
-    volatile float Motor_Position;               // 舵机的目标角度,也认为是实际角度,单位为rad
-} LFD01M_Motor_Handle_t;
 
 typedef struct
 {
@@ -132,25 +108,27 @@ typedef struct
     FDCAN_HandleTypeDef *Motor_FDCAN_Handle;
     uint16_t Motor_ID;
     float Motor_Position_Target;                         // 单位为rad
-    Motor_MIT_Control_Handle_t Motor_MIT_Control_Handle[2]; // Position范围:0~2pi,单位为rad,Output范围:-33A~33A,单位为A
+    Motor_MIT_Control_Handle_t Motor_MIT_Control_Handle[2]; // Output范围:-33A~33A,单位为A
     Motor_Position_PID_Control_Handle_t Motor_Position_PID_Control_Handle;
     Speed_Plan_Handle_t Motor_Speed_Plan_Handle;
     uint64_t Wait_Count;
 } LK4005_Motor_Handle_t;
 
 #define PI 3.14159f
-#define LFD01M_Motor_Number 2
-#define DMJ4310_Motor_Number 1
-#define LK4005_Motor_Number 2
-#define Robotic_Arm_Mass_L1 0.75f //大臂机械臂的质量,单位为kg
-#define Robotic_Arm_Mass_L2 0.8f // 小臂机械臂的质量,单位为kg
-#define Robotic_Arm_Length_L1 0.40f // 大臂机械臂的长度,单位为m
-#define Robotic_Arm_Length_L2 0.411f // 小臂机械臂的长度,单位为m
-#define Robotic_Arm_Length_Connect 0.44f //大臂电机与云台连接杆的长度,单位为m   
-#define Robotic_Arm_Mass_Forearm_Motor 0.154f // 小臂电机的质量,单位为kg
-#define Robotic_Arm_Mass_End 0.13f           // 末端舵机,摄像头等的总质量,单位为kg
+#define Servo_Motor_Number 2
+#define LK4005_Motor_Number 3
+#define Robotic_Arm_Mass_Gear1 0.04f // Gear1 摇臂质量,单位为kg
+#define Robotic_Arm_Mass_L1 0.25f //大臂机械臂的质量,单位为kg
+#define Robotic_Arm_Mass_Gear2 0.04f // Gear2 摇臂质量,单位为kg
+#define Robotic_Arm_Mass_L2 0.25f // 小臂机械臂的质量,单位为kg
+#define Robotic_Arm_Mass_End 0.08f   // 末端舵机,摄像头等的总质量,单位为kg
+#define Robotic_Arm_Length_L1 0.44f // 大臂机械臂的长度,单位为m
+#define Robotic_Arm_Length_L2 0.30f // 小臂机械臂的长度,单位为m
+#define Robotic_Arm_Length_Connect 0.35f //大臂与云台连接杆的长度,单位为m   
 #define Robotic_Arm_Angle_Offset 1.571f //整体机械臂(云台)相对于地面的夹角,单位为rad 
-#define Robotic_Arm_Length_End 0.07845f
+#define Robotic_Arm_Length_End 0.073f
+#define Robotic_Arm_Length_Gear1 0.054f //第一个齿轮连接杆的长度
+#define Robotic_Arm_Length_Gear2 0.026f // 第二个齿轮连接杆的长度
 #define g 9.7913f
 
 #endif

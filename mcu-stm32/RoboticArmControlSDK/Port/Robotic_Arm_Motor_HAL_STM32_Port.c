@@ -1,16 +1,13 @@
 #include "Robotic_Arm_Motor_HAL_STM32_Port.h"
-#include "DMJ4310_Motor_Driver.h"
-#include "LFD01M_Motor_Driver.h"
+#include "Servo_Motor_Driver.h"
 #include "LK4005_Motor_Driver.h"
 #include "Robotic_Arm_Control_API.h"
 
 void Motor_Control_Init(void)
 {
-    LFD01M_Motor_Control_Init();
-    DMJ4310_Motor_Control_Init();
+    Servo_Motor_Control_Init();
     LK4005_Motor_Control_Init();
     HAL_FDCAN_Start(&hfdcan1);
-    HAL_FDCAN_Start(&hfdcan2);
 }
 
 void FDCAN_Send_Standard(FDCAN_HandleTypeDef *FDCAN_Handle, uint16_t std_id, uint8_t *data, uint8_t length)
@@ -56,14 +53,9 @@ float Uint_To_Float(int x_int, float x_min, float x_max, int bits)
 
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 {
-    FDCAN_RxHeaderTypeDef FDCAN_Rx_Head_Temp;
-    uint8_t FDCAN_Rx_Data_Temp[DMJ4310_Motor_FDCAN_Length] = {0};
-    HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &FDCAN_Rx_Head_Temp, FDCAN_Rx_Data_Temp);
-    uint8_t i = 0;
-    for (i = 0; i < DMJ4310_Motor_Number; i++)
-    {
-        DMJ4310_Motor_Response_Data_Explain(hfdcan, FDCAN_Rx_Head_Temp, FDCAN_Rx_Data_Temp ,&DMJ4310_Motor_Handle[i]);
-    }
+    /* 三个电机都移到FDCAN1的FIFO1，FIFO0不再使用 */
+    (void)hfdcan;
+    (void)RxFifo0ITs;
 }
 
 void HAL_FDCAN_RxFifo1Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo1ITs)

@@ -10,8 +10,8 @@
 #define Reduction_Ratio 10.0f
 #define Position_Conversion_Ratio 0.01f
 #define Torque_Conversion_Ratio 62.0606f
-#define Angle_Gimbal_Offset 0.75f //云台电机测得的角度比实际角度大的值,单位为rad
-#define Angle_Joint_Fore_Offset -0.18f // 关节电机测得的角度比实际角度大的值,单位为rad
+#define Angle_Joint_Fore_Offset -0.1f //小臂电机偏置角
+#define Angle_Joint_Upper_Offset 0.1f // 大臂电机偏置角
 #define LK4005_Motor_Control_Cycle 1 //控制周期(不计算等待FDCAN的4ms),单位为ms
 
 extern LK4005_Motor_Handle_t LK4005_Motor_Handle[];
