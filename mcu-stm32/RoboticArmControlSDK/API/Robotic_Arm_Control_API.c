@@ -183,6 +183,14 @@ void Robotic_Arm_Control(void)
     /* 上电初始化：大臂和小臂保持位置，云台转到90° */
     if (!System_Init_Done)
     {
+        /* 尽早设置云台目标为90°，不等大臂小臂锁定，避免云台先向0°跑 */
+        if (Gimbal_Start_Complete == 0 && LK4005_Motor_Handle[0].Wait_Count >= 15)
+        {
+            LK4005_Motor_Handle[0].Motor_Position_Target = PI / 2.0f; /* 云台转到90° */
+            LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+            Gimbal_Start_Complete = 1;
+        }
+        
         if (!Upper_Lock_Done && LK4005_Motor_Handle[1].Wait_Count >= 15)
         {
             LK4005_Motor_Handle[1].Motor_Position_Target = LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].Motor_Position_Actual;
@@ -194,16 +202,10 @@ void Robotic_Arm_Control(void)
             Fore_Lock_Done = 1;
         }
         
-        if (Upper_Lock_Done && Fore_Lock_Done && Gimbal_Start_Complete == 0)
-        {
-            LK4005_Motor_Handle[0].Motor_Position_Target = PI / 2.0f; /* 云台转到90° */
-            LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
-            Gimbal_Start_Complete = 1;
-        }
-        
         if (Gimbal_Start_Complete == 1)
         {
-            if (Is_Motor_Arrived(0, 0.1f))
+            /* 必须云台到达90° 且 大臂小臂都锁定后，才算初始化完成 */
+            if (Is_Motor_Arrived(0, 0.1f) && Upper_Lock_Done && Fore_Lock_Done)
             {
                 Gimbal_Start_Complete = 2;
                 System_Init_Done = 1;
@@ -233,7 +235,7 @@ void Robotic_Arm_Control(void)
             }
             break;
         case INIT_SEQ_FORE:
-            if (Is_Motor_Arrived(2, 0.05f))
+            if (Is_Motor_Arrived(2, 0.2f))
             {
                 /* 小臂到达，启动云台归位到0° */
                 LK4005_Motor_Handle[0].Motor_Position_Target = 0.0f;

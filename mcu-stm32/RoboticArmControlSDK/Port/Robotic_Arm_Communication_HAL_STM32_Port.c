@@ -19,18 +19,23 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
     if (huart->Instance == Communication_Usart_Instance_Used0)
     {
-        /* 检查是否是初始化指令: FF AA FF AA FF AA FF AA FF AA (10字节) */
-        uint8_t is_init_cmd = 0;
-        if (Size == 10)
+        /* 只处理恰好 10 字节的完整帧，其他长度直接丢弃 */
+        if (Size != 10)
         {
-            is_init_cmd = 1;
-            for (int i = 0; i < 10; i++)
+            HAL_UARTEx_ReceiveToIdle_DMA(Communication_Usart_Handle_Used0,
+                                         Usart_Used0_Rx_Buff,
+                                         Usart_Used0_Rx_Buff_Length);
+            return;
+        }
+        
+        /* 检查是否是初始化指令: FF AA FF AA FF AA FF AA FF AA */
+        uint8_t is_init_cmd = 1;
+        for (int i = 0; i < 10; i++)
+        {
+            if (Usart_Used0_Rx_Buff[i] != ((i % 2 == 0) ? 0xFF : 0xAA))
             {
-                if (Usart_Used0_Rx_Buff[i] != ((i % 2 == 0) ? 0xFF : 0xAA))
-                {
-                    is_init_cmd = 0;
-                    break;
-                }
+                is_init_cmd = 0;
+                break;
             }
         }
         
@@ -38,13 +43,6 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
         {
             /* 清除之前可能未完成的普通指令反馈 */
             Feedback_Pending = 0;
-            
-            /* 舵机目标角度为0 */
-            if (Servo_Control_Active)
-            {
-                Servo_Motor_Handle[0].Motor_Position = 0.0f;
-                Servo_Motor_Handle[1].Motor_Position = 0.0f;
-            }
             
             /* 启动大臂到-7rad，小臂和云台先锁定当前位置 */
             LK4005_Motor_Handle[1].Motor_Position_Target = -7.0f;
@@ -65,6 +63,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
             return;
         }
         
+        /* ========== 普通坐标指令 (10字节) ========== */
         #define POS_DEADZONE_M      0.015f   // 位置死区 1cm (单位: m)
         #define SERVO1_DEADZONE_RAD 0.05f   // 舵机1死区 ≈ 2.9° (单位: rad)
         #define ALPHA               0.65f    // 一阶低通系数

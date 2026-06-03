@@ -118,9 +118,9 @@ typedef struct
 #define Servo_Motor_Number 2
 #define LK4005_Motor_Number 3
 #define Robotic_Arm_Mass_Gear1 0.05f // Gear1 摇臂质量,单位为kg
-#define Robotic_Arm_Mass_L1 0.32f //大臂机械臂的质量,单位为kg
+#define Robotic_Arm_Mass_L1 0.3f //大臂机械臂的质量,单位为kg
 #define Robotic_Arm_Mass_Gear2 0.05f // Gear2 摇臂质量,单位为kg
-#define Robotic_Arm_Mass_L2 0.32f // 小臂机械臂的质量,单位为kg
+#define Robotic_Arm_Mass_L2 0.3f // 小臂机械臂的质量,单位为kg
 #define Robotic_Arm_Mass_End 0.09f   // 末端舵机,摄像头等的总质量,单位为kg
 #define Robotic_Arm_Length_L1 0.44f // 大臂机械臂的长度,单位为m
 #define Robotic_Arm_Length_L2 0.30f // 小臂机械臂的长度,单位为m

@@ -34,10 +34,10 @@ void LK4005_Motor_Control_Init(void)
     LK4005_Motor_Handle[2].Motor_FDCAN_Handle = &hfdcan1;
     LK4005_Motor_Handle[2].Motor_ID = 0x142;
     LK4005_Motor_Handle[2].Motor_Type = Joint_Fore;
-    LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[0].MIT_Kp = 19.0f;
-    LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[1].MIT_Kp = 19.0f;
-    LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[0].MIT_Kd = 0.872f;
-    LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[1].MIT_Kd = 0.872f;
+    LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[0].MIT_Kp = 19.6f;
+    LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[1].MIT_Kp = 19.6f;
+    LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[0].MIT_Kd = 0.6f;
+    LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[1].MIT_Kd = 0.6f;
     LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[1].Motor_Torque_Friction = 0.0f;
     LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[0].Output = 0.0f;
     LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[1].Output = 0.0f;
