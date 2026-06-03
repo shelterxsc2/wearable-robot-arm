@@ -7,8 +7,8 @@
 extern uint8_t Usart_Used0_Rx_Buff[];
 extern uint8_t Feedback_Pending;
 
-#define Communication_Usart_Handle_Used0 &huart10
-#define Communication_Usart_Instance_Used0 USART10
+#define Communication_Usart_Handle_Used0 &huart1
+#define Communication_Usart_Instance_Used0 USART1
 #define Usart_Used0_Rx_Buff_Length 32
 
 void Communication_Usart_Init(void);
