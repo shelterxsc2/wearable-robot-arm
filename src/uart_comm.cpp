@@ -15,6 +15,7 @@
 #include <atomic>
 #include <time.h>
 #include <stdarg.h>
+#include <sys/time.h>
 
 /* ---------- 协议常量 ---------- */
 #define FRAME_HEAD0       0xAA
@@ -33,6 +34,12 @@ static uart_pose_callback_t g_pose_cb = NULL;
 /* 运动完成状态: 1=完成/空闲, 0=运动中 */
 volatile int g_uart_move_complete = 0;
 
+/* 下位机初始化成功: 1=已收到 "init success", 0=未收到 */
+volatile int g_uart_init_success = 0;
+
+/* 下位机归位完成: 1=已收到归位后的首次 "move_success", 0=未收到 */
+volatile int g_uart_homing_done = 0;
+
 /* 头部静止状态: 1=头部当前静止(wx/wz<3), 0=头部在动 */
 volatile int g_head_stationary = 0;
 
@@ -43,6 +50,16 @@ volatile int g_arm_stable = 0;
 static FILE* g_diag_fp = NULL;
 static pthread_mutex_t g_diag_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct timespec g_prog_start;
+
+static void print_timestamp(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm tm_info;
+    localtime_r(&tv.tv_sec, &tm_info);
+    printf("[%02d:%02d:%02d.%03d] ", tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec,
+           (int)(tv.tv_usec / 1000));
+}
 
 static void diag_init(void) {
     if (g_diag_fp) return;
@@ -61,11 +78,17 @@ static double get_runtime_ms(void) {
 void diag_log(const char* fmt, ...) {
     if (!g_diag_fp) diag_init();
     pthread_mutex_lock(&g_diag_mutex);
-    double ms = get_runtime_ms();
-    int sec = (int)(ms / 1000);
-    int msec = (int)(ms) % 1000;
 
-    fprintf(g_diag_fp, "[%3d.%03d] ", sec, msec);
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm tm_info;
+    localtime_r(&tv.tv_sec, &tm_info);
+    char ts[32];
+    snprintf(ts, sizeof(ts), "[%02d:%02d:%02d.%03d] ",
+             tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec,
+             (int)(tv.tv_usec / 1000));
+
+    fprintf(g_diag_fp, "%s", ts);
     va_list args;
     va_start(args, fmt);
     vfprintf(g_diag_fp, fmt, args);
@@ -73,7 +96,7 @@ void diag_log(const char* fmt, ...) {
     fprintf(g_diag_fp, "\n");
     fflush(g_diag_fp);
 
-    printf("[%3d.%03d] ", sec, msec);
+    printf("%s", ts);
     va_start(args, fmt);
     vprintf(fmt, args);
     va_end(args);
@@ -281,7 +304,7 @@ static void* recv_thread_func(void* arg)
 
     /* printf("[UART] receiver thread started (binary mode)\n"); */
 
-    static char rx_text[128];
+    static char rx_text[512];
     static int  rx_text_len = 0;
 
     while (g_recv_running.load()) {
@@ -291,6 +314,7 @@ static void* recv_thread_func(void* arg)
         /* --- Step 1 诊断：打印原始 RX 字节流 --- */
         char rx_line[256];
         int pos = 0;
+        print_timestamp();
         pos += snprintf(rx_line + pos, sizeof(rx_line) - pos, "[UART-RX] n=%d | ", n);
         for (int i = 0; i < n && i < 64; ++i) {
             if (rx_buf[i] >= 32 && rx_buf[i] <= 126)
@@ -300,6 +324,7 @@ static void* recv_thread_func(void* arg)
         }
         printf("%s\n", rx_line);
 
+        print_timestamp();
         printf("[UART] RX (%d bytes):", n);
         for (int i = 0; i < n && i < 16; ++i) {
             printf(" %02X", rx_buf[i]);
@@ -315,13 +340,20 @@ static void* recv_thread_func(void* arg)
             rx_text[rx_text_len++] = (char)rx_buf[i];
         rx_text[rx_text_len] = '\0';
 
-        if (strstr(rx_text, "complete") != NULL) {
+        if (strstr(rx_text, "init success") != NULL) {
+            g_uart_init_success = 1;
+            rx_text_len = 0;
+            rx_text[0] = '\0';
+        } else if (strstr(rx_text, "move_success") != NULL) {
+            if (!g_uart_homing_done) {
+                g_uart_homing_done = 1;
+            }
             g_uart_move_complete = 1;
             rx_text_len = 0;
             rx_text[0] = '\0';
         }
         /* 防垃圾堆积 */
-        if (rx_text_len > 80) {
+        if (rx_text_len > 400) {
             rx_text_len = 0;
             rx_text[0] = '\0';
         }

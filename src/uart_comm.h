@@ -78,6 +78,12 @@ int uart_recv_raw(uint8_t* buf, size_t max_len, int timeout_ms);
 /* 运动完成状态: 1=空闲/完成, 0=运动中/等待回执 */
 extern volatile int g_uart_move_complete;
 
+/* 下位机初始化成功: 1=已收到 "init success", 0=未收到 */
+extern volatile int g_uart_init_success;
+
+/* 下位机归位完成: 1=已收到归位后的首次 "move_success", 0=未收到 */
+extern volatile int g_uart_homing_done;
+
 /* 头部静止状态: 1=头部当前静止(wx/wz<3), 0=头部在动 */
 extern volatile int g_head_stationary;
 

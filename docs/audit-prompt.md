@@ -2,7 +2,9 @@
 你是 RK3588 可穿戴机械臂项目的代码维护助手。
 
 # 任务
-读取以下文件，理解当前 `imu-v2state-hat` 分支的实现状态，并给出一份简明扼要的项目状态汇报。
+读取以下文件，理解当前 `imu-newbi-hat` 分支的实现状态，并给出一份简明扼要的项目状态汇报。
+
+本分支是在 `imu-v2state-hat` 基础上，针对 **NRF24 IMU 控制机械臂**进行深度优化的版本。重点看 NRF24 IMU 控制链路的改动（A-inverse、握手时序、运动学公式、发令策略、舵机映射、位置死区、退出帧），视觉链路和 RuleEngine v2 基本继承前序分支。
 
 # 需要读取的文件
 
@@ -10,7 +12,7 @@
 项目总览文档。重点了解：
 - 硬件组成（RK3588 + STM32 + NRF24 + IMU + 摄像头）
 - 数据流（NRF24 IMU 控制链路 vs 视觉链路 vs 手势控制链路）
-- 当前控制逻辑的状态（A-inverse 解耦、Pitch/Yaw 双轴、舵机控制设计、手势状态机）
+- 当前控制逻辑的状态（A-inverse 解耦、Pitch/Yaw 双轴、舵机控制设计、运动学公式重构、发令策略分化）
 - 已知问题和待办事项
 
 ## 2. docs/servo-control-design.md
@@ -73,15 +75,22 @@ Python Unix Socket 推理服务。重点看：
 ## 8. src/rga_npu.cpp — NRF24 控制核心（nrf24_control_update）
 重点看：
 - **A-inverse 矩阵解耦**：`eulerZYXToMat()` / `matToEulerZYX()` / `R_current × R_init.t()`
-- **延迟初始化**：`first_complete_received` 标志，等待 `g_uart_move_complete` 后才捕获 `R_init`
-- **控制轴映射**：Pitch (`wy`) → `tz`（垂直）；Yaw (`wz`) → `tx/ty`（水平）
-- **极性**：低头（pitch+）→ tz 增大（臂上升）；头左偏（yaw+）→ tx 负（左移）
-- `r_init_set` 门禁：A-init 完成前 `return`，不发令
-- Pitch/Yaw 双轴状态机 + 终点预测器 + 发令判断
-- 发令频率（150ms/200ms 自适应）和阈值（5°）
-- 标定模式基础设施（`/tmp/calib_mode.txt`、`/tmp/servo_calib.txt`）
-- 头部静止检测（滞后带、800ms 持续判断）
-- 当前舵机配置：`k1=50`、`k2=145`
+- **握手时序与 A-init**：`g_wait_a_init` 由 `handshake_thread` 置位，`nrf24_control_update` 在下一帧有效 IMU 时捕获 `R_init`；流程为 `init success` → 发 `FF AA...` 验证帧 → 等 7s 归位 → A-init → `g_host_state=4` NORMAL
+- **运动学公式重构（球坐标）**：  
+  `tx = 57·sin(yaw)·cos(pitch)`  
+  `ty = 10 - 10·sin(pitch) + 57·cos(pitch)·cos(yaw)`  
+  `tz = 10 + 10·cos(pitch) + 57·sin(pitch)·cos(yaw)`
+- **控制轴映射**：Pitch (`wy`) → tz/ty 耦合；Yaw (`wz`) → tx/ty 耦合
+- **极性**：`use_yaw = -rel_yaw`（偏航反向）；俯仰保持原始 `rel_pitch`
+- **门禁**：`g_r_init_set` 且 `g_host_state >= 4` 才发令
+- **Pitch/Yaw 双轴状态机 + 终点预测器 + 发令判断**
+- **发令策略分化**：
+  - Yaw：只在 `STATE_ACCEL_TO_CONST` 主窗口发一次预测令；静止态直接掐死不发；其他运动态不发
+  - Pitch：主窗口 / 第二窗口 / 静止态均发令（`is_stop` 时 `predictor.reset()`）
+- **发令频率与阈值**：150ms/200ms 自适应，5° 阈值
+- **位置死区**：坐标变化 < 1cm 不发令，抑制 Y 轴附近 `atan2` 高灵敏度导致的微抖
+- **动态舵机映射**：J4 俯仰 `servo1 = 120 - 1.2·Δpitch`（0~180°）；J5 水平 `servo2 = 50 + 0.4·Δyaw`（0~270°）
+- **头部静止检测**：滞后带（进入 <2°/s，退出 >5°/s）
 - 所有 `[CALIB]`、`[IMU]`、`[CMD]`、`[NRF-STATE]` 调试打印是否已注释
 
 ## 9. src/rga_npu.cpp — PnP 姿态解算
@@ -187,25 +196,37 @@ Bluetooth SPP stub。重点看：
    - PnP：12 点选取、坐标系、姿态解算
    - 整体性能（7 模块统计）
    - **输入格式**：YUY2 1920×1080@30fps，RGA 硬件转 NV12
-5. **NRF24 控制链路现状**：
+5. **NRF24 控制链路现状**（本分支重点）：
    - 传感器数据流（IMU → NRF24 → SPI → 上位机）
    - A-inverse 矩阵解耦原理（R_current × R_init^T）
-   - 延迟初始化机制（等待 move_complete 后捕获 R_init）
-   - 控制策略（8 状态机 + 终点预测）
-   - 双轴控制架构（Pitch/wy → tz，Yaw/wz → tx/ty）
-   - 极性定义（低头 → tz 增大；头左偏 → tx 负）
-   - 发令频率、阈值、关键参数
-   - 标定模式基础设施状态
+   - **握手时序**：`init success` → 发 `FF AA...` 验证帧 → 等 7s 归位 → A-init → NORMAL
+   - **运动学公式重构**：球坐标，tx/ty/tz 同时受 pitch 和 yaw 影响
+   - 双轴控制架构（Pitch/wy → tz/ty，Yaw/wz → tx/ty）
+   - 极性定义：`use_yaw = -rel_yaw`（偏航反向）；俯仰保持原始 `rel_pitch`
+   - **发令策略分化**：Yaw 只在主窗口发一次预测令、静止态掐死；Pitch 主窗口/第二窗口/静止态均发令
+   - **位置死区**：1cm，抑制 Y 轴附近高灵敏度微抖
+   - **动态舵机映射**：J4 俯仰 `120 - 1.2·Δpitch`；J5 水平 `50 + 0.4·Δyaw`
+   - 发令频率（150ms/200ms 自适应）和阈值（5°）
+   - Ctrl+C 退出帧：`AA FF AA FF AA FF AA FF AA FF`
 6. **视觉/推流链路现状**：RTMP vs RTSP 自动选择机制、identity handoff + RGA 转码设计、AI 处理参与情况
 7. **云端交互现状**：WebSocket 注册时序、心跳机制、帧计数上报
 8. **端侧控制现状**：HTTP API 端点、标定/舵机/命令控制
 9. **通信链路现状**：UART 协议格式、波特率、是否双向、`[UART-TX]` 打印状态、诊断日志、move_complete 检测方式
 10. **已知问题**：当前有哪些明显缺陷或陷阱？
-11. **最新进度**：相比 `imu-3states-hat`，`imu-v2state-hat` 改动了什么关键逻辑？
-    - RuleEngine 升级到 v2（rule_engine_v2.rknn）
-    - 输入增加 bbox（检测框全局空间上下文）
-    - 协议从 296B 升级到 312B（44f20f7q）
-    - Python 端固定 NPU_CORE_0 + warmup
-12. **下一步**：J4 舵机标定准备状态 + Body 模型优化方向 + UART 协议升级
+11. **最新进度**：相比 `imu-v2state-hat`，`imu-newbi-hat` 改动了什么关键逻辑？
+    - NRF24 IMU 控制链路深度优化：
+      - 握手时序重构：`init success` → `FF AA...` 验证帧 → 7s 归位等待 → A-init → NORMAL
+      - 运动学公式从平面投影改为球坐标（pitch/yaw 耦合到 tx/ty/tz）
+      - 极性校准：`use_yaw = -rel_yaw`
+      - 动态舵机映射：J4 `120 - 1.2·Δpitch`，J5 `50 + 0.4·Δyaw`
+      - 位置死区 1cm，抑制 Y 轴附近微抖
+      - 发令策略分化：Yaw 主窗口只发一次 + 静止态掐死；Pitch 保持多窗口/静止态发令
+      - Ctrl+C 退出帧 `AA FF...` 安全停机
+    - RuleEngine v2、两阶段视觉链路、推流链路继承前序分支，基本未动
+12. **下一步**：
+    - Pitch/Yaw 发令策略统一评估（当前分化是否为最优）
+    - 位置死区阈值根据实际测试微调（当前 1cm）
+    - 下位机 S 曲线尾部打断问题继续观察
+    - UART 协议升级（统一帧头+CRC 双向通信）
 
-要求：简明扼要，不要大段粘贴代码，用工程师能理解的语言总结。重点突出 `imu-v2state-hat` 相比前序分支的核心变化（RuleEngine v2、bbox 输入、协议升级、NPU 隔离、warmup）。
+要求：简明扼要，不要大段粘贴代码，用工程师能理解的语言总结。重点突出 `imu-newbi-hat` 相比 `imu-v2state-hat` 的核心变化（NRF24 IMU 控制链路优化：运动学公式重构、发令策略分化、位置死区、动态舵机映射、握手时序、退出帧）。

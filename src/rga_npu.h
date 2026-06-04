@@ -32,6 +32,15 @@ void report_gst_encode_us(uint64_t us);
 /* NRF24 IMU 独立控制链路（不依赖视觉帧） */
 void nrf24_control_update(void);
 
+/* A-inverse R_init 捕获标志: 1=已捕获 */
+extern volatile int g_r_init_set;
+
+/* 握手线程信号: 置1后 nrf24_control_update() 在下一帧 IMU 时捕获 R_init */
+extern volatile int g_wait_a_init;
+
+/* 上位机握手状态: 0=wait_init, 1=a_init, 2=send_ff, 3=wait_homing, 4=normal */
+extern volatile int g_host_state;
+
 #ifdef __cplusplus
 }
 #endif

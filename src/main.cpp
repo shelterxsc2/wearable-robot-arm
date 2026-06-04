@@ -56,6 +56,9 @@ static GMainLoop *g_loop = NULL;
 static volatile sig_atomic_t g_should_quit = 0;
 static volatile sig_atomic_t g_ws_ready = 0;
 
+/* 上位机-下位机握手状态: 0=wait_init, 1=a_init, 2=send_ff, 3=wait_homing, 4=normal */
+volatile int g_host_state = 0;
+
 // 设置CPU性能模式 (RK3588 big.LITTLE: policy0 + policy4)
 static void set_cpu_governor(const char* policy, int freq) {
     char path[128];
@@ -232,6 +235,51 @@ static void *ws_worker_thread(void *arg) {
     return NULL;
 }
 
+/* 握手线程信号：置1后 nrf24_control_update() 在下一帧 IMU 时捕获 R_init */
+volatile int g_wait_a_init = 0;
+
+/* ========== 上位机-下位机握手线程（阻塞式）==========
+ * 1. 阻塞等待 "init success"
+ * 2. 发送 FF 验证帧
+ * 3. 阻塞等待 move_complete（下位机归位完成）
+ * 4. 等下一帧 IMU 做 A-init（g_wait_a_init = 1）
+ * 5. 进入 NORMAL，开始 UART-Tx
+ */
+static void* handshake_thread(void* arg) {
+    (void)arg;
+
+    // 1. 阻塞等待 init success
+    printf("[Handshake] Waiting for init success...\n");
+    while (!g_uart_init_success) {
+        usleep(10000);  // 10ms
+    }
+    printf("[Handshake] Init success received.\n");
+
+    // 2. 发 FF 验证帧
+    uint8_t ff_frame[10] = {0xFF, 0xAA, 0xFF, 0xAA, 0xFF, 0xAA, 0xFF, 0xAA, 0xFF, 0xAA};
+    uart_send_raw(ff_frame, 10);
+    printf("[Handshake] FF verification frame sent.\n");
+
+    // 3. 等待下位机归位完成（暂用 7s 延时替代阻塞等 move_complete）
+    printf("[Handshake] Waiting 7s for homing...\n");
+    usleep(7000000);
+    printf("[Handshake] 7s homing wait done.\n");
+
+    // 4. A-init：等下一帧 IMU
+    g_wait_a_init = 1;
+    printf("[Handshake] Waiting for next IMU frame for A-init...\n");
+    while (!g_r_init_set) {
+        usleep(10000);
+    }
+    printf("[Handshake] A-init (R_init) captured.\n");
+
+    // 5. 进入 NORMAL，开始 UART-Tx
+    g_host_state = 4;
+    printf("[Handshake] Entering NORMAL.\n");
+
+    return NULL;
+}
+
 int main(int argc, char *argv[]) {
     // 取消 stdout 缓冲，确保日志实时落盘
     setbuf(stdout, NULL);
@@ -373,6 +421,14 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // 上位机-下位机握手：阻塞线程，init success → 等 move complete → A-init → 发 FF → NORMAL
+    pthread_t handshake_tid;
+    if (pthread_create(&handshake_tid, NULL, handshake_thread, NULL) == 0) {
+        printf("[Main] Host handshake thread started\n");
+    } else {
+        fprintf(stderr, "[Main] Failed to start handshake thread\n");
+    }
+
     // NRF24 IMU 控制：用 GLib 定时器每 50ms 独立运行，不依赖视频帧
     g_timeout_add(50, [](gpointer) -> gboolean {
         nrf24_control_update();
@@ -402,6 +458,13 @@ int main(int argc, char *argv[]) {
     }
 
     printf("\n[Main] Cleaning up...\n");
+
+    /* 发送结束帧给下位机 */
+    uint8_t exit_frame[10] = {0xAA, 0xFF, 0xAA, 0xFF, 0xAA, 0xFF, 0xAA, 0xFF, 0xAA, 0xFF};
+    uart_send_raw(exit_frame, 10);
+    printf("[Main] Exit frame sent to MCU\n");
+    usleep(50000);  /* 等 50ms 确保帧发出去 */
+
     g_running = FALSE;
     if (ws_started) pthread_join(ws_tid, NULL);
     if (g_nrf24_enabled) {

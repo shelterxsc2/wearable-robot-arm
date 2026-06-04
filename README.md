@@ -1,9 +1,10 @@
 # 可穿戴机械臂 — v2 手势状态机 + NRF24 IMU 控制
 
-> **分支**: `imu-v2state-hat`  
-> **核心路径**: NRF24 无线 IMU → 8 状态运动预测 → UART → STM32；20 关键点 + bbox → RuleEngine v2 → 手势状态机  
-> **视觉链路**: 两阶段 NPU 推理（Body → ROI → Face 468 landmarks）+ Python Socket RuleEngine v2  
+> **分支**: `imu-newbi-hat`  
+> **核心路径**: NRF24 无线 IMU → A-inverse 矩阵解耦 → 8 状态运动预测/终点预测 → UART → STM32（舵机 + 电机）  
+> **视觉链路**: 两阶段 NPU 推理（Body → ROI → Face 468 landmarks）+ Python Socket RuleEngine v2（手势状态机保留但非本分支重点）  
 > **RuleEngine**: 基于 `rule_engine_v2.rknn`，输入 20 关键点 + bbox + valid_mask + 7 状态反馈  
+> **本分支重点**: 优化 NRF24 IMU 控制机械臂的响应、急停/抖动、极性校准与舵机映射  
 > **云端交互**: WebSocket 注册 + 心跳 (device-003)  
 > **端侧控制**: HTTP API @ 8080
 
@@ -183,33 +184,46 @@ models/             # RKNN 模型（best.rknn / face_landmark_468_fp16.rknn / ru
 - **NPU 隔离**：Python 端固定使用 `NPU_CORE_0`，与 C++ Body/Face 的三核负载隔离，避免多进程 NPU 互锁
 - **Warmup**：启动时用 dummy zeros 预跑一遍，消除首次 `rknn.inference()` 的初始化延迟（否则会导致 GStreamer 流线程阻塞 6s+）
 
-### 2. A-inverse 矩阵解耦
+### 2. A-inverse 矩阵解耦与握手时序
 - 用 `R_rel = R_current × R_init^T` 消除 IMU 初始安装角，替代早期的标量 baseline 减法
-- **延迟初始化**：等待下位机首次 `move_complete` 后才捕获 `R_init`，防止初始姿态噪声污染基准
-- 控制轴从 Roll/wx 切换到 Pitch/wy（更符合人头俯仰对应机械臂升降的物理直觉）
+- **握手时序**：阻塞等 `init success` → 发 `FF AA...` 验证帧 → 等 7s 归位 → 下一帧 IMU 捕获 `R_init` → 进入 NORMAL
+- 控制轴：Pitch (`wy`) → tz/ty 耦合；Yaw (`wz`) → tx/ty 耦合
+- 极性校准：`use_yaw = -rel_yaw`（偏航反向），俯仰保持原始 `rel_pitch`
 
-### 3. 手势识别状态机
+### 3. IMU 控制机械臂优化（本分支核心）
+- **运动学公式重构**：从平面投影改为球坐标，引入俯仰-偏航耦合  
+  `tx = 57·sin(yaw)·cos(pitch)`  
+  `ty = 10 - 10·sin(pitch) + 57·cos(pitch)·cos(yaw)`  
+  `tz = 10 + 10·cos(pitch) + 57·sin(pitch)·cos(yaw)`
+- **动态舵机映射**：J4 俯仰 `servo1 = 120 - 1.2·Δpitch`；J5 水平 `servo2 = 50 + 0.4·Δyaw`，限幅 0~180°/0~270°
+- **位置死区**：坐标变化 < 1cm 不发令，抑制 Y 轴附近 `atan2` 高灵敏度导致的云台微抖
+- **发令策略分化**：
+  - Yaw：主窗口（`STATE_ACCEL_TO_CONST`）发一次预测令，静止态掐死不发，其他运动态不发（防 S 曲线尾部打断）
+  - Pitch：回退到主窗口/第二窗口/静止态均发令（保持头部静止后的微调能力）
+- **退出帧**：Ctrl+C 时先发 `AA FF AA FF AA FF AA FF AA FF` 再清理，通知下位机安全停机
+
+### 4. 手势识别状态机
 - **3 状态**：Idle (0) / Mode1 (1) / Mode2 (2)
 - **20 关键点构成**：COCO 17 点 + 面部 3 点（左嘴角、右嘴角、下巴）
 - **Observer 视角交换**：COCO left/right 成对点在发送前互换（1↔2, 3↔4, ..., 15↔16），使模型始终以观察者视角判断左右
 - **Face 点处理**：Face LM 成功时填入 3 个面部坐标；失败时设为 `0.0f + valid_mask=0`
 
-### 4. 两阶段 NPU 推理（Body → Face）
+### 5. 两阶段 NPU 推理（Body → Face）
 - **Stage 1**：`best.rknn` 在 640×640 上检测 17 COCO 关键点，提取鼻/肩几何估算面部 ROI
 - **Stage 2**：RGA 硬件 `imcrop` + `imresize` + `imcvtcolor` 将 ROI 转为 192×192，送入 `face_landmark_468_fp16.rknn`
 - **PnP**：从 468 点中选取 12 个稳定点（眼、鼻、嘴、眉），通过 `solvePnP` 解算头部姿态，叠加 3D 立方体和坐标轴（仅显示，控制已废弃）
 - **OneEuroFilter**：当前禁用（`PNP_USE_FILTER 0`），依赖硬丢弃策略（重投影误差 >25px、镜像解、旋转跳变 >60°）
 
-### 5. RGA NV12 stride 对齐约束
+### 6. RGA NV12 stride 对齐约束
 - `wrapbuffer_virtualaddr` 的 `wstride` 在 NV12 模式下必须 **16 字节对齐**
 - 面部 ROI 宽度在 `imcrop` 前需对齐：`roi_w = (roi_w / 16) * 16`
 - ROI 高度设为与宽度相等（正方形），且 `roi_x`/`roi_y` 需为偶数（NV12 色度子采样）
 
-### 6. RKNN 输出内存分配
+### 7. RKNN 输出内存分配
 - `rknn_create_mem` 必须使用 `rknn_query` 返回的 `attr->size`，而非 `n_elems * sizeof(element)`
 - 对于 FP16 模型，`attr->size` 可能包含 padding，手动计算会导致堆损坏
 
-### 7. 7 模块滚动时序统计
+### 8. 7 模块滚动时序统计
 - 30 帧滑动窗口统计：`get_frame`、`rga_preprocess`、`npu_body`、`roi_crop`、`npu_face_lm`、`draw`、`encode_push`
 
 ---

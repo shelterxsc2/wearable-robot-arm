@@ -810,12 +810,15 @@ static inline void matToEulerZYX(const cv::Mat& R, float& roll_deg, float& pitch
     yaw_deg   = yy * 180.0f / (float)M_PI;
 }
 
+/* A-inverse R_init 捕获标志 */
+volatile int g_r_init_set = 0;
+
 /* 独立的 NRF24 IMU 控制链路：俯仰控制（仿照偏航控制架构） */
 void nrf24_control_update(void)
 {
     static const float NRF_FACE_X_CM = 0.0f;
     static const float NRF_FACE_Y_CM = 10.0f;
-    static const float NRF_FACE_Z_CM = 40.0f;
+    static const float NRF_FACE_Z_CM = 30.0f;
     static const float NRF_TRACK_DIST_CM = 57.0f;
     static const float NRF_SERVO1_DEG = 50.0f;
     static const float NRF_SERVO2_DEG = 145.0f;
@@ -830,6 +833,9 @@ void nrf24_control_update(void)
     static uint64_t last_cmd_us_yaw = 0;
     static float last_cmd_target_yaw = 0.0f;
     static const float CMD_YAW_THRESHOLD_DEG = 5.0f;
+    static bool yaw_stop_cmd_sent = false;
+    static uint64_t yaw_move_complete_us = 0;
+    static bool yaw_last_move_complete = false;
 
     /* 俯仰控制状态 */
     static bool pitch_baseline_set = false;
@@ -841,16 +847,10 @@ void nrf24_control_update(void)
     static EndpointPredictor predictor;
 
     /* A-inverse 初始姿态矩阵 */
-    static bool r_init_set = false;
     static cv::Mat R_init;
     static float rel_roll = 0.0f, rel_pitch = 0.0f, rel_yaw = 0.0f;
 
-    /* 等待下位机第一次 move complete 后再确定 A */
-    static bool first_complete_received = false;
-    if (!first_complete_received && g_uart_move_complete) {
-        first_complete_received = true;
-        printf("[A-INIT] First move complete received. Will capture R_init on next valid IMU.\n");
-    }
+    /* A-init 触发信号由握手线程控制 (g_wait_a_init) */
 
     /* 发令控制状态 */
     static uint64_t last_cmd_us = 0;
@@ -905,16 +905,20 @@ void nrf24_control_update(void)
     pthread_mutex_unlock(&g_nrf24_state.mutex);
 
     /* ========== A-inverse：消除 IMU 初始安装角 ========== */
-    if (imu_valid && first_complete_received) {
-        cv::Mat R_current = eulerZYXToMat(current_roll_deg, current_pitch_deg, current_yaw_deg);
-        if (!r_init_set) {
+    if (imu_valid) {
+        if (g_wait_a_init && !g_r_init_set) {
+            cv::Mat R_current = eulerZYXToMat(current_roll_deg, current_pitch_deg, current_yaw_deg);
             R_init = R_current.clone();
-            r_init_set = true;
+            g_r_init_set = 1;
+            g_wait_a_init = 0;
             printf("[A-INIT] R_init captured: roll=%.2f pitch=%.2f yaw=%.2f\n",
                    current_roll_deg, current_pitch_deg, current_yaw_deg);
         }
-        cv::Mat R_rel_mat = R_current * R_init.t();
-        matToEulerZYX(R_rel_mat, rel_roll, rel_pitch, rel_yaw);
+        if (g_r_init_set) {
+            cv::Mat R_current = eulerZYXToMat(current_roll_deg, current_pitch_deg, current_yaw_deg);
+            cv::Mat R_rel_mat = R_current * R_init.t();
+            matToEulerZYX(R_rel_mat, rel_roll, rel_pitch, rel_yaw);
+        }
     }
 
     /* printf("[IMU] roll=%+.2f pitch=%+.2f yaw=%+.2f | wx=%+.2f wz=%+.2f valid=%d\n",
@@ -1008,7 +1012,7 @@ void nrf24_control_update(void)
     /* 计算 50ms 内角度历史的 A-inverse 平均值 */
     float avg_rel_roll = 0.0f, avg_rel_pitch = 0.0f, avg_rel_yaw = 0.0f;
     int avg_n = 0;
-    if (r_init_set) {
+    if (g_r_init_set) {
         pthread_mutex_lock(&g_nrf24_state.mutex);
         int angle_count = g_nrf24_state.gy_angle_count;
         for (int i = 0; i < angle_count; i++) {
@@ -1041,7 +1045,13 @@ void nrf24_control_update(void)
     }
 
     /* A-init 完成前不发令，防止 predictor 初始噪声误触发 */
-    if (!r_init_set) {
+    if (!g_r_init_set) {
+        return;
+    }
+
+    /* 握手完成前不发坐标指令（但允许 A-init 捕获继续运行） */
+    extern volatile int g_host_state;
+    if (g_host_state < 4) {
         return;
     }
 
@@ -1109,8 +1119,9 @@ void nrf24_control_update(void)
     }
 
     bool is_stop_yaw = ctx_yaw.is_stop();
-    float target_yaw_deg = is_stop_yaw ? rel_yaw
-                                       : predictor_yaw.get_target_yaw(rel_yaw);
+    float use_yaw = -rel_yaw;  // 极性修正
+    float target_yaw_deg = is_stop_yaw ? use_yaw
+                                       : predictor_yaw.get_target_yaw(use_yaw);
     float delta_yaw_deg = normalize_angle_deg(target_yaw_deg - last_cmd_target_yaw);
     bool yaw_moved_enough = std::fabs(delta_yaw_deg) > CMD_YAW_THRESHOLD_DEG;
 
@@ -1124,13 +1135,13 @@ void nrf24_control_update(void)
     if (yaw_interval_ok && yaw_moved_enough) {
         if (yaw_first_window) {
             yaw_should_cmd = true;
-        } else if (yaw_second_window) {
-            yaw_should_cmd = true;
         } else if (is_stop_yaw) {
-            yaw_should_cmd = true;
-            predictor_yaw.reset();
+            // 静止态直接掐死，不再发修正
+            yaw_should_cmd = false;
         } else {
             yaw_should_cmd = true;
+            yaw_stop_cmd_sent = false;      // 头部重新运动，允许下次静止再发一次
+            yaw_last_move_complete = false; // 头部运动态重置稳定计时
         }
     }
 
@@ -1144,28 +1155,72 @@ void nrf24_control_update(void)
            rel_yaw, target_yaw_deg, delta_yaw_deg, yaw_moved_enough ? "" : "_thr",
            pitch_should_cmd, yaw_should_cmd, last_tx, last_ty, last_tz); */
     if (should_cmd) {
-        /* Pitch → tz (pitch 增大 = 低头 = tz 增大) */
         float delta_pitch_deg = normalize_angle_deg(target_pitch_deg - nrf_baseline_roll_deg);
         float cum_pitch_offset = delta_pitch_deg * (float)M_PI / 180.0f;
-        if (cum_pitch_offset > (float)M_PI / 4.0f)
-            cum_pitch_offset = (float)M_PI / 4.0f;
-        if (cum_pitch_offset < -(float)M_PI / 4.0f)
-            cum_pitch_offset = -(float)M_PI / 4.0f;
-        last_tz = NRF_FACE_Z_CM + 15.0f * std::sin(cum_pitch_offset);
+        if (cum_pitch_offset > (float)M_PI / 2.0f)
+            cum_pitch_offset = (float)M_PI / 2.0f;
+        if (cum_pitch_offset < -(float)M_PI / 2.0f)
+            cum_pitch_offset = -(float)M_PI / 2.0f;
 
-        /* Yaw → tx, ty */
         float delta_yaw_deg = normalize_angle_deg(target_yaw_deg - nrf_baseline_yaw_deg);
         float cum_yaw_offset = -delta_yaw_deg * (float)M_PI / 180.0f;
         if (cum_yaw_offset > (float)M_PI / 2.0f)
             cum_yaw_offset = (float)M_PI / 2.0f;
         if (cum_yaw_offset < -(float)M_PI / 2.0f)
             cum_yaw_offset = -(float)M_PI / 2.0f;
-        last_tx = NRF_FACE_X_CM + NRF_TRACK_DIST_CM * std::sin(cum_yaw_offset);
-        last_ty = NRF_FACE_Y_CM + NRF_TRACK_DIST_CM * std::cos(cum_yaw_offset);
 
-        /* 控制指令: k1=50, k2=145 */
+        last_tx = 57.0f * std::sin(cum_yaw_offset) * std::cos(cum_pitch_offset);
+        last_ty = 10.0f - 10.0f * std::sin(cum_pitch_offset) + 57.0f * std::cos(cum_pitch_offset) * std::cos(cum_yaw_offset);
+        last_tz = 10.0f + 10.0f * std::cos(cum_pitch_offset) + 57.0f * std::sin(cum_pitch_offset) * std::cos(cum_yaw_offset);
+
+        // 位置死区：坐标变化 < 2cm 不发令，抑制 Y 轴附近 atan2 敏感导致的微抖
+        static float prev_sent_tx = 0.0f;
+        static float prev_sent_ty = 0.0f;
+        static float prev_sent_tz = 0.0f;
+        static bool prev_sent_initialized = false;
+        const float POS_DEADZONE_CM = 1.0f;
+
+        bool pos_changed_enough = false;
+        if (!prev_sent_initialized) {
+            pos_changed_enough = true;
+        } else {
+            pos_changed_enough =
+                std::fabs(last_tx - prev_sent_tx) >= POS_DEADZONE_CM ||
+                std::fabs(last_ty - prev_sent_ty) >= POS_DEADZONE_CM ||
+                std::fabs(last_tz - prev_sent_tz) >= POS_DEADZONE_CM;
+        }
+        if (!pos_changed_enough) {
+            should_cmd = false;
+        } else {
+            prev_sent_tx = last_tx;
+            prev_sent_ty = last_ty;
+            prev_sent_tz = last_tz;
+            prev_sent_initialized = true;
+        }
+
+        /* ========== 舵机控制 ========== */
+        // 俯仰舵机（J4）：仰头变小，低头变大
+        static const float SERVO1_BASELINE = 120.0f;
+        static const float K_PITCH_SERVO = -1.2f;  // 幅度加大，先验证极性
+
+        float servo1 = SERVO1_BASELINE + K_PITCH_SERVO * delta_pitch_deg;
+
+        // 限幅 0~180°（俯仰舵机安全范围）
+        if (servo1 > 180.0f) servo1 = 180.0f;
+        if (servo1 < 0.0f)   servo1 = 0.0f;
+
+        // 偏转舵机（J5）：50°正对面部，跟随偏航角
+        static const float SERVO2_BASELINE = 50.0f;
+        static const float K_YAW_SERVO = 0.4f;   // 映射比例，反了改 -0.4f
+
+        float servo2 = SERVO2_BASELINE + K_YAW_SERVO * delta_yaw_deg;
+
+        // 限幅 0~270°（280°舵机留余量）
+        if (servo2 > 270.0f) servo2 = 270.0f;
+        if (servo2 < 0.0f)   servo2 = 0.0f;
+
         uart_send_arm_target(last_tx, last_ty, last_tz,
-                             NRF_SERVO1_DEG, NRF_SERVO2_DEG);
+                             servo2, servo1);
 
         if (pitch_should_cmd) {
             last_cmd_target_pitch = target_pitch_deg;
