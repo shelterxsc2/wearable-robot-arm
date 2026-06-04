@@ -63,6 +63,27 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
             return;
         }
         
+        /* 检查是否是关闭指令: AA FF AA FF AA FF AA FF AA FF */
+        uint8_t is_shutdown_cmd = 1;
+        for (int i = 0; i < 10; i++)
+        {
+            if (Usart_Used0_Rx_Buff[i] != ((i % 2 == 0) ? 0xAA : 0xFF))
+            {
+                is_shutdown_cmd = 0;
+                break;
+            }
+        }
+        
+        if (is_shutdown_cmd)
+        {
+            Robotic_Arm_Shutdown();
+            
+            HAL_UARTEx_ReceiveToIdle_DMA(Communication_Usart_Handle_Used0,
+                                         Usart_Used0_Rx_Buff,
+                                         Usart_Used0_Rx_Buff_Length);
+            return;
+        }
+        
         /* ========== 普通坐标指令 (10字节) ========== */
         #define POS_DEADZONE_M      0.015f   // 位置死区 1cm (单位: m)
         #define SERVO1_DEADZONE_RAD 0.05f   // 舵机1死区 ≈ 2.9° (单位: rad)

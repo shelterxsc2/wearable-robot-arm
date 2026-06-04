@@ -8,6 +8,7 @@
 
 void Robotic_Arm_Control_Init(void);
 void Robotic_Arm_Control(void);
+void Robotic_Arm_Shutdown(void);
 void Servo_Motor_Handle_Update(void);
 void LK4005_Motor_Handle_Update(void);
 
