@@ -327,6 +327,10 @@ void Robotic_Arm_Control(void)
             }
             break;
         case SHUTDOWN_SEQ_DONE:
+            /* 重置舵机到初始位置 */
+            Servo_Motor_Handle[0].Motor_Position = 0.9f;   /* FT90M 初始角度 */
+            Servo_Motor_Handle[1].Motor_Position = 0.0f;   /* A009 φ_servo=0，末端与小臂共线 */
+            
             /* 归位完成，允许舵机跟踪，发送成功反馈 */
             Servo_Control_Active = 1;
             Communication_Send_Init_Success();
