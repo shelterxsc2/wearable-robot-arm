@@ -8,7 +8,7 @@
 
 /* 国华 A009 舵机：与小臂相连
  * 20ms 时基，0.5ms ~ 2.5ms 对应 0° ~ 180°
- * 机械安装：0.6rad 时舵机与小臂在一条线上（φ_servo = 0）
+ * 机械安装：1.1rad 时舵机与小臂在一条线上（φ_servo = 0）
  * 接口角度定义：Motor_Position 直接等于 φ_servo（末端相对小臂延长线的偏角）
  *   接口 0       → 末端在小臂延长线上（φ_servo = 0）
  *   接口 π/2     → 末端垂直于小臂向上（φ_servo = π/2）
@@ -16,7 +16,7 @@
  */
 #define A009_PWM_PULSE_MIN_US       500u    /* 0.5 ms */
 #define A009_PWM_PULSE_MAX_US       2500u   /* 2.5 ms */
-#define A009_ANGLE_OFFSET_RAD       0.0f    /* 偏置：实际舵机角度 = 接口角度 + 0.6 */
+#define A009_ANGLE_OFFSET_RAD       1.1f    /* 偏置：实际舵机角度 = 接口角度 + 1.1 */
 #define A009_ANGLE_MIN_RAD          0.0f    /* 实际机械最小角 0° */
 #define A009_ANGLE_MAX_RAD          (PI)    /* 实际机械最大角 180° */
 

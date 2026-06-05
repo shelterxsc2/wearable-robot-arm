@@ -120,11 +120,11 @@ typedef struct
 #define Robotic_Arm_Mass_Gear1 0.05f // Gear1 摇臂质量,单位为kg
 #define Robotic_Arm_Mass_L1 0.3f //大臂机械臂的质量,单位为kg
 #define Robotic_Arm_Mass_Gear2 0.05f // Gear2 摇臂质量,单位为kg
-#define Robotic_Arm_Mass_L2 0.3f // 小臂机械臂的质量,单位为kg
+#define Robotic_Arm_Mass_L2 0.34 // 小臂机械臂的质量,单位为kg
 #define Robotic_Arm_Mass_End 0.09f   // 末端舵机,摄像头等的总质量,单位为kg
-#define Robotic_Arm_Length_L1 0.44f // 大臂机械臂的长度,单位为m
-#define Robotic_Arm_Length_L2 0.30f // 小臂机械臂的长度,单位为m
-#define Robotic_Arm_Length_Connect 0.35f //大臂与云台连接杆的长度,单位为m   
+#define Robotic_Arm_Length_L1 0.48f // 大臂机械臂的长度,单位为m
+#define Robotic_Arm_Length_L2 0.48f // 小臂机械臂的长度,单位为m
+#define Robotic_Arm_Length_Connect 0.31f //大臂与云台连接杆的长度,单位为m   
 #define Robotic_Arm_Angle_Offset 1.571f //整体机械臂(云台)相对于地面的夹角,单位为rad 
 #define Robotic_Arm_Length_End 0.073f
 #define Robotic_Arm_Length_Gear1 0.054f //第一个齿轮连接杆的长度
