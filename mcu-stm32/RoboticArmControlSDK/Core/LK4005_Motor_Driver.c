@@ -11,19 +11,19 @@ void LK4005_Motor_Control_Init(void)
     LK4005_Motor_Handle[0].Motor_ID = 0x145;
     LK4005_Motor_Handle[0].Motor_Type = Gimbal;
     LK4005_Motor_Handle[0].Motor_Position_PID_Control_Handle.Motor_Position_Target = 0.0f;
-    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.j = 10.5f;
-    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.a_max = 3.5f;
-    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.v_max = 1.85f;
+    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.j = 7.0f;
+    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.a_max = 2.2f;
+    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.v_max = 1.5f;
 
     /* [1] 大臂 (Joint_Upper) — 原DMJ4310位置，新LK电机 */
     LK4005_Motor_Handle[1].Motor_FDCAN_Handle = &hfdcan1;
     LK4005_Motor_Handle[1].Motor_ID = 0x143;
     LK4005_Motor_Handle[1].Motor_Type = Joint_Upper;
-    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].MIT_Kp = 22.0f;
-    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[1].MIT_Kp = 22.0f;
-    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].MIT_Kd = 0.862f;
-    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[1].MIT_Kd = 0.862f;
-    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[1].Motor_Torque_Friction = 0.1f;
+    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].MIT_Kp = 20.0f;
+    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[1].MIT_Kp = 20.0f;
+    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].MIT_Kd = 0.64f;
+    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[1].MIT_Kd = 0.64f;
+    LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[1].Motor_Torque_Friction = 0.08f;
     LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].Output = 0.0f;
     LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[1].Output = 0.0f;
     LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.j = 32.5f;
@@ -34,11 +34,11 @@ void LK4005_Motor_Control_Init(void)
     LK4005_Motor_Handle[2].Motor_FDCAN_Handle = &hfdcan1;
     LK4005_Motor_Handle[2].Motor_ID = 0x142;
     LK4005_Motor_Handle[2].Motor_Type = Joint_Fore;
-    LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[0].MIT_Kp = 19.6f;
-    LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[1].MIT_Kp = 19.6f;
-    LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[0].MIT_Kd = 0.6f;
-    LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[1].MIT_Kd = 0.6f;
-    LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[1].Motor_Torque_Friction = 0.0f;
+    LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[0].MIT_Kp = 22.7f;
+    LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[1].MIT_Kp = 22.7f;
+    LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[0].MIT_Kd = 0.62f;
+    LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[1].MIT_Kd = 0.62f;
+    LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[1].Motor_Torque_Friction = 0.1f;
     LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[0].Output = 0.0f;
     LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[1].Output = 0.0f;
     LK4005_Motor_Handle[2].Motor_Speed_Plan_Handle.j = 30.5f;

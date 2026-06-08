@@ -66,6 +66,7 @@ typedef struct
     float s1;
     float v1;
     Speed_Plan_State_type Speed_Plan_State;
+    uint8_t cmd_type;           /* 0x00=预测指令(prediction), 0x01=最终确认指令(confirm) */
 
 }Speed_Plan_Handle_t;
 
@@ -118,12 +119,12 @@ typedef struct
 #define Servo_Motor_Number 2
 #define LK4005_Motor_Number 3
 #define Robotic_Arm_Mass_Gear1 0.05f // Gear1 摇臂质量,单位为kg
-#define Robotic_Arm_Mass_L1 0.3f //大臂机械臂的质量,单位为kg
+#define Robotic_Arm_Mass_L1 0.45f //大臂机械臂的质量,单位为kg
 #define Robotic_Arm_Mass_Gear2 0.05f // Gear2 摇臂质量,单位为kg
-#define Robotic_Arm_Mass_L2 0.34 // 小臂机械臂的质量,单位为kg
+#define Robotic_Arm_Mass_L2 0.45 // 小臂机械臂的质量,单位为kg
 #define Robotic_Arm_Mass_End 0.09f   // 末端舵机,摄像头等的总质量,单位为kg
-#define Robotic_Arm_Length_L1 0.48f // 大臂机械臂的长度,单位为m
-#define Robotic_Arm_Length_L2 0.48f // 小臂机械臂的长度,单位为m
+#define Robotic_Arm_Length_L1 0.45f // 大臂机械臂的长度,单位为m
+#define Robotic_Arm_Length_L2 0.45f // 小臂机械臂的长度,单位为m
 #define Robotic_Arm_Length_Connect 0.31f //大臂与云台连接杆的长度,单位为m   
 #define Robotic_Arm_Angle_Offset 1.571f //整体机械臂(云台)相对于地面的夹角,单位为rad 
 #define Robotic_Arm_Length_End 0.073f

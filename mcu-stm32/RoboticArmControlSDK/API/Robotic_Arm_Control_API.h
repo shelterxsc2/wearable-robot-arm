@@ -8,11 +8,12 @@
 
 void Robotic_Arm_Control_Init(void);
 void Robotic_Arm_Control(void);
-void Robotic_Arm_Shutdown(void);
 void Servo_Motor_Handle_Update(void);
 void LK4005_Motor_Handle_Update(void);
 
 extern uint8_t Servo_Control_Active;
 extern uint8_t Init_Sequence_Trigger;
+extern uint8_t Retract_Sequence_Trigger;
+extern uint8_t PowerOn_Init_Sending;
 
 #endif

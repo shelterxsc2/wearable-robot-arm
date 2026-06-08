@@ -3,14 +3,13 @@
 static uint8_t Gimbal_Start_Complete = 0;
 static uint8_t Upper_Lock_Done = 0;
 static uint8_t Fore_Lock_Done = 0;
-static uint8_t System_Init_Done = 0;
-
-/* 上电时刻记录的大小臂位置，用于关闭时归位 */
-static float Upper_Power_On_Position = 0.0f;
-static float Fore_Power_On_Position = 0.0f;
+static uint8_t Retract_Done_Flag = 0;
 
 /* 初始化完成后置 1，控制舵机何时开始跟踪目标值 */
 uint8_t Servo_Control_Active = 0;
+
+/* 上电初始化阶段持续发送 init success 的使能标志，收到 FF AA 后清零 */
+uint8_t PowerOn_Init_Sending = 1;
 
 /* ========== FF初始化命令顺序状态机 ========== */
 typedef enum
@@ -26,18 +25,20 @@ static Init_Sequence_State_t Init_Sequence_State = INIT_SEQ_IDLE;
 uint8_t Init_Sequence_Trigger = 0;
 /* =========================================== */
 
-/* ========== 关闭序列状态机（FFAA初始化的逆运动） ========== */
+/* ========== AAFF收回命令顺序状态机 ========== */
 typedef enum
 {
-    SHUTDOWN_SEQ_IDLE,
-    SHUTDOWN_SEQ_GIMBAL,
-    SHUTDOWN_SEQ_FORE,
-    SHUTDOWN_SEQ_UPPER,
-    SHUTDOWN_SEQ_DONE
-} Shutdown_Sequence_State_t;
+    RETRACT_SEQ_IDLE,
+    RETRACT_SEQ_GIMBAL,
+    RETRACT_SEQ_UPPER_FIRST,
+    RETRACT_SEQ_FORE,
+    RETRACT_SEQ_UPPER,
+    RETRACT_SEQ_DONE
+} Retract_Sequence_State_t;
 
-static Shutdown_Sequence_State_t Shutdown_Sequence_State = SHUTDOWN_SEQ_IDLE;
-/* ========================================================== */
+static Retract_Sequence_State_t Retract_Sequence_State = RETRACT_SEQ_IDLE;
+uint8_t Retract_Sequence_Trigger = 0;
+/* =========================================== */
 
 void Servo_Motor_Handle_Update(void)
 {
@@ -176,7 +177,7 @@ static void Check_And_Send_Feedback(void)
     
     if (Feedback_Pending == 0) return;
     
-    if (Is_Motor_Arrived(0, 0.05f) && Is_Motor_Arrived(1, 0.05f) && Is_Motor_Arrived(2, 0.05f))
+    if (Is_Motor_Arrived(0, 0.05f) && Is_Motor_Arrived(1, 0.1f) && Is_Motor_Arrived(2, 0.3f))
     {
         if (Feedback_Pending == 2)
         {
@@ -184,29 +185,6 @@ static void Check_And_Send_Feedback(void)
         }
         Feedback_Pending = 0;
     }
-}
-
-void Robotic_Arm_Shutdown(void)
-{
-    /* 停止自由运动和FF初始化序列 */
-    Init_Sequence_Trigger = 0;
-    Init_Sequence_State = INIT_SEQ_IDLE;
-    Servo_Control_Active = 0;
-
-    /* 清除待反馈标记 */
-    extern uint8_t Feedback_Pending;
-    Feedback_Pending = 0;
-
-    /* 重置舵机到初始位置并立即输出PWM（与云台90°同步） */
-    Servo_Motor_Handle[0].Motor_Position = 0.9f;   /* FT90M 初始角度 */
-    Servo_Motor_Handle[1].Motor_Position = 0.0f;   /* A009 φ_servo=0，末端与小臂共线 */
-    Servo_Motor_Set_Angle(&Servo_Motor_Handle[0]);
-    Servo_Motor_Set_Angle(&Servo_Motor_Handle[1]);
-
-    /* 启动关闭序列第一步：云台转到90° */
-    LK4005_Motor_Handle[0].Motor_Position_Target = PI / 2.0f;
-    LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
-    Shutdown_Sequence_State = SHUTDOWN_SEQ_GIMBAL;
 }
 
 void Robotic_Arm_Control_Init(void)
@@ -219,6 +197,7 @@ void Robotic_Arm_Control_Init(void)
 
 void Robotic_Arm_Control(void)
 {
+    static uint8_t System_Init_Done = 0;
     
     /* 上电初始化：大臂和小臂保持位置，云台转到90° */
     if (!System_Init_Done)
@@ -233,14 +212,12 @@ void Robotic_Arm_Control(void)
         
         if (!Upper_Lock_Done && LK4005_Motor_Handle[1].Wait_Count >= 15)
         {
-            Upper_Power_On_Position = LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].Motor_Position_Actual;
-            LK4005_Motor_Handle[1].Motor_Position_Target = Upper_Power_On_Position;
+            LK4005_Motor_Handle[1].Motor_Position_Target = LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].Motor_Position_Actual;
             Upper_Lock_Done = 1;
         }
         if (!Fore_Lock_Done && LK4005_Motor_Handle[2].Wait_Count >= 15)
         {
-            Fore_Power_On_Position = LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[0].Motor_Position_Actual;
-            LK4005_Motor_Handle[2].Motor_Position_Target = Fore_Power_On_Position;
+            LK4005_Motor_Handle[2].Motor_Position_Target = LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[1].Motor_Position_Actual;
             Fore_Lock_Done = 1;
         }
         
@@ -252,7 +229,6 @@ void Robotic_Arm_Control(void)
                 Gimbal_Start_Complete = 2;
                 System_Init_Done = 1;
                 Servo_Control_Active = 1;  /* 初始化完成后，允许舵机跟踪目标值 */
-                Communication_Send_Init_Success();
             }
         }
     }
@@ -269,18 +245,9 @@ void Robotic_Arm_Control(void)
         switch (Init_Sequence_State)
         {
         case INIT_SEQ_UPPER:
-            if (Is_Motor_Arrived(1, 0.05f))
+            if (Is_Motor_Arrived(1, 0.15f) && Is_Motor_Arrived(2, 0.4f))
             {
-                /* 大臂到达，启动小臂到3.5rad */
-                LK4005_Motor_Handle[2].Motor_Position_Target = 3.5f;
-                LK4005_Motor_Handle[2].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
-                Init_Sequence_State = INIT_SEQ_FORE;
-            }
-            break;
-        case INIT_SEQ_FORE:
-            if (Is_Motor_Arrived(2, 0.2f))
-            {
-                /* 小臂到达，启动云台归位到0° */
+                /* 大臂和小臂都到达后，再启动云台归位到0° */
                 LK4005_Motor_Handle[0].Motor_Position_Target = 0.0f;
                 LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
                 Init_Sequence_State = INIT_SEQ_GIMBAL;
@@ -293,6 +260,11 @@ void Robotic_Arm_Control(void)
             }
             break;
         case INIT_SEQ_DONE:
+            /* FF AA 执行完毕后不发 init success，改发与普通命令一样的 move_success */
+            {
+                extern uint8_t Feedback_Pending;
+                Feedback_Pending = 2;
+            }
             Init_Sequence_State = INIT_SEQ_IDLE;
             break;
         default:
@@ -300,43 +272,58 @@ void Robotic_Arm_Control(void)
         }
     }
     
-    /* 关闭序列（FFAA初始化的逆运动）：先云台90° → 再大小臂收回 → 锁定 */
-    if (Shutdown_Sequence_State != SHUTDOWN_SEQ_IDLE)
+    /* AAFF收回命令顺序控制：云台 → 大臂(6.28rad) → 小臂(12rad) → 大臂(-0.22rad) */
+    if (Retract_Sequence_Trigger)
     {
-        switch (Shutdown_Sequence_State)
+        Retract_Sequence_Trigger = 0;
+        Retract_Sequence_State = RETRACT_SEQ_GIMBAL;
+        LK4005_Motor_Handle[0].Motor_Position_Target = PI / 2.0f;
+        LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+    }
+    
+    if (Retract_Sequence_State != RETRACT_SEQ_IDLE)
+    {
+        switch (Retract_Sequence_State)
         {
-        case SHUTDOWN_SEQ_GIMBAL:
-            if (Is_Motor_Arrived(0, 0.1f))
+        case RETRACT_SEQ_GIMBAL:
+            if (Is_Motor_Arrived(0, 0.05f))
             {
-                /* 云台到达90°，先启动小臂收回，目标给过冲确保机械到位 */
-                LK4005_Motor_Handle[2].Motor_Position_Target = Fore_Power_On_Position - 0.1f;
-                LK4005_Motor_Handle[2].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
-                Shutdown_Sequence_State = SHUTDOWN_SEQ_FORE;
-            }
-            break;
-        case SHUTDOWN_SEQ_FORE:
-            /* 小臂目标虽给过冲，但检查实际位置是否已回到原始上电位置即可 */
-            if (fabsf(LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[0].Motor_Position_Actual - Fore_Power_On_Position) <= 0.05f)
-            {
-                /* 启动大臂收回，目标同样给过冲 */
-                LK4005_Motor_Handle[1].Motor_Position_Target = Upper_Power_On_Position + 0.1f;
+                /* 云台到达90°后，大臂电机转动到 -4.8 rad */
+                LK4005_Motor_Handle[1].Motor_Position_Target = -4.8f;
                 LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
-                Shutdown_Sequence_State = SHUTDOWN_SEQ_UPPER;
+                Retract_Sequence_State = RETRACT_SEQ_UPPER_FIRST;
             }
             break;
-        case SHUTDOWN_SEQ_UPPER:
-            /* 大臂检查实际位置是否已回到原始上电位置 */
-            if (fabsf(LK4005_Motor_Handle[1].Motor_MIT_Control_Handle[0].Motor_Position_Actual - Upper_Power_On_Position) <= 0.05f)
+        case RETRACT_SEQ_UPPER_FIRST:
+            if (Is_Motor_Arrived(1, 0.1f))
             {
-                /* 大臂到达上电位置 */
-                Shutdown_Sequence_State = SHUTDOWN_SEQ_DONE;
+                /* 大臂电机到达6.28 rad后，小臂电机转动到12 rad */
+                LK4005_Motor_Handle[2].Motor_Position_Target = 12.0f;
+                LK4005_Motor_Handle[2].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+                Retract_Sequence_State = RETRACT_SEQ_FORE;
             }
             break;
-        case SHUTDOWN_SEQ_DONE:
-            /* 归位完成，允许舵机跟踪，发送成功反馈 */
-            Servo_Control_Active = 1;
-            Communication_Send_Init_Success();
-            Shutdown_Sequence_State = SHUTDOWN_SEQ_IDLE;
+        case RETRACT_SEQ_FORE:
+            if (Is_Motor_Arrived(2, 0.3f))
+            {
+                /* 小臂电机到达12 rad后，大臂电机转动到-0.22 rad */
+                LK4005_Motor_Handle[1].Motor_Position_Target = -0.22f;
+                LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+                Retract_Sequence_State = RETRACT_SEQ_UPPER;
+            }
+            break;
+        case RETRACT_SEQ_UPPER:
+            if (Is_Motor_Arrived(1, 0.1f))
+            {
+                Retract_Sequence_State = RETRACT_SEQ_DONE;
+            }
+            break;
+        case RETRACT_SEQ_DONE:
+            Retract_Done_Flag = 1;  /* AAFF 收回到位后，标记持续发送 init success */
+            /* 收回到位后，舵机复位到默认位置 */
+            Servo_Motor_Handle[0].Motor_Position = 0.9f;
+            Servo_Motor_Handle[1].Motor_Position = -1.57f;
+            Retract_Sequence_State = RETRACT_SEQ_IDLE;
             break;
         default:
             break;
@@ -350,4 +337,10 @@ void Robotic_Arm_Control(void)
     LK4005_Motor_Handle_Update();
     
     Check_And_Send_Feedback();
+    
+    /* 上电初始化完成且未被 FF AA 打断时，或 AAFF 收回到位后，持续发送 init success */
+    if ((PowerOn_Init_Sending && System_Init_Done) || Retract_Done_Flag)
+    {
+        Communication_Send_Init_Success();
+    }
 }

@@ -10,6 +10,8 @@
 uint8_t Usart_Used0_Rx_Buff[Usart_Used0_Rx_Buff_Length] = {0};
 uint8_t Feedback_Pending = 0;
 
+extern uint8_t Retract_Sequence_Trigger;
+
 void Communication_Usart_Init(void)
 {
     HAL_UARTEx_ReceiveToIdle_DMA(Communication_Usart_Handle_Used0, Usart_Used0_Rx_Buff, Usart_Used0_Rx_Buff_Length);
@@ -19,8 +21,8 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
     if (huart->Instance == Communication_Usart_Instance_Used0)
     {
-        /* 只处理恰好 10 字节的完整帧，其他长度直接丢弃 */
-        if (Size != 10)
+        /* 处理 10 字节特殊指令 或 11 字节坐标指令 */
+        if (Size != 10 && Size != 11)
         {
             HAL_UARTEx_ReceiveToIdle_DMA(Communication_Usart_Handle_Used0,
                                          Usart_Used0_Rx_Buff,
@@ -28,63 +30,81 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
             return;
         }
         
-        /* 检查是否是初始化指令: FF AA FF AA FF AA FF AA FF AA */
-        uint8_t is_init_cmd = 1;
-        for (int i = 0; i < 10; i++)
+        /* Size == 10: 检查特殊指令 (初始化 / 收回) */
+        if (Size == 10)
         {
-            if (Usart_Used0_Rx_Buff[i] != ((i % 2 == 0) ? 0xFF : 0xAA))
+            /* 检查是否是初始化指令: FF AA FF AA FF AA FF AA FF AA */
+            uint8_t is_init_cmd = 1;
+            for (int i = 0; i < 10; i++)
             {
-                is_init_cmd = 0;
-                break;
+                if (Usart_Used0_Rx_Buff[i] != ((i % 2 == 0) ? 0xFF : 0xAA))
+                {
+                    is_init_cmd = 0;
+                    break;
+                }
             }
-        }
-        
-        if (is_init_cmd)
-        {
-            /* 清除之前可能未完成的普通指令反馈 */
-            Feedback_Pending = 0;
             
-            /* 启动大臂到-7rad，小臂和云台先锁定当前位置 */
-            LK4005_Motor_Handle[1].Motor_Position_Target = -7.0f;
-            LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
-            
-            LK4005_Motor_Handle[2].Motor_Position_Target = LK4005_Motor_Handle[2].Motor_MIT_Control_Handle[0].Motor_Position_Actual;
-            LK4005_Motor_Handle[2].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
-            
-            LK4005_Motor_Handle[0].Motor_Position_Target = LK4005_Motor_Handle[0].Motor_Position_PID_Control_Handle.Motor_Position_Actual;
-            LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
-            
-            /* 触发顺序启动状态机 */
-            Init_Sequence_Trigger = 1;
-            
-            HAL_UARTEx_ReceiveToIdle_DMA(Communication_Usart_Handle_Used0,
-                                         Usart_Used0_Rx_Buff,
-                                         Usart_Used0_Rx_Buff_Length);
-            return;
-        }
-        
-        /* 检查是否是关闭指令: AA FF AA FF AA FF AA FF AA FF */
-        uint8_t is_shutdown_cmd = 1;
-        for (int i = 0; i < 10; i++)
-        {
-            if (Usart_Used0_Rx_Buff[i] != ((i % 2 == 0) ? 0xAA : 0xFF))
+            if (is_init_cmd)
             {
-                is_shutdown_cmd = 0;
-                break;
+                /* 清除之前可能未完成的普通指令反馈 */
+                Feedback_Pending = 0;
+                
+                /* 大臂和小臂同时启动，云台先锁定当前位置 */
+                LK4005_Motor_Handle[1].Motor_Position_Target = -7.8f;
+                LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+                
+                LK4005_Motor_Handle[2].Motor_Position_Target = 3.5f;
+                LK4005_Motor_Handle[2].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+                
+                LK4005_Motor_Handle[0].Motor_Position_Target = LK4005_Motor_Handle[0].Motor_Position_PID_Control_Handle.Motor_Position_Actual;
+                LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
+                
+                /* 触发顺序启动状态机 */
+                Init_Sequence_Trigger = 1;
+                
+                /* 收到 FF AA 后，停止上电初始化阶段的 init success 持续发送 */
+                extern uint8_t PowerOn_Init_Sending;
+                PowerOn_Init_Sending = 0;
+                
+                HAL_UARTEx_ReceiveToIdle_DMA(Communication_Usart_Handle_Used0,
+                                             Usart_Used0_Rx_Buff,
+                                             Usart_Used0_Rx_Buff_Length);
+                return;
             }
-        }
-        
-        if (is_shutdown_cmd)
-        {
-            Robotic_Arm_Shutdown();
             
+            /* 检查是否是收回指令: AA FF AA FF AA FF AA FF AA FF */
+            uint8_t is_retract_cmd = 1;
+            for (int i = 0; i < 10; i++)
+            {
+                if (Usart_Used0_Rx_Buff[i] != ((i % 2 == 0) ? 0xAA : 0xFF))
+                {
+                    is_retract_cmd = 0;
+                    break;
+                }
+            }
+            
+            if (is_retract_cmd)
+            {
+                /* 清除之前可能未完成的普通指令反馈 */
+                Feedback_Pending = 0;
+                
+                /* 触发收回状态机：云台 → 小臂 → 大臂 */
+                Retract_Sequence_Trigger = 1;
+                
+                HAL_UARTEx_ReceiveToIdle_DMA(Communication_Usart_Handle_Used0,
+                                             Usart_Used0_Rx_Buff,
+                                             Usart_Used0_Rx_Buff_Length);
+                return;
+            }
+            
+            /* 10 字节且不是特殊指令，丢弃 */
             HAL_UARTEx_ReceiveToIdle_DMA(Communication_Usart_Handle_Used0,
                                          Usart_Used0_Rx_Buff,
                                          Usart_Used0_Rx_Buff_Length);
             return;
         }
         
-        /* ========== 普通坐标指令 (10字节) ========== */
+        /* ========== 普通坐标指令 (11字节) ========== */
         #define POS_DEADZONE_M      0.015f   // 位置死区 1cm (单位: m)
         #define SERVO1_DEADZONE_RAD 0.05f   // 舵机1死区 ≈ 2.9° (单位: rad)
         #define ALPHA               0.65f    // 一阶低通系数
@@ -100,7 +120,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
         float Servo2_Temp = (float)(int16_t)((Usart_Used0_Rx_Buff[9] << 8) | Usart_Used0_Rx_Buff[8]) / 180.0f * PI;//与小臂相连的舵机(A009)
         /* 不使用滤波和死区，直接赋值 */
         filt_X = X_Temp;
-        filt_Y = Y_Temp;
+        filt_Y = Y_Temp - 0.1f;
         filt_Z = Z_Temp;
         filt_Servo1 = Servo1_Temp;
 
@@ -114,8 +134,14 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
                                           &gimbal_joint, &upper_joint, &fore_joint);
 
             LK4005_Motor_Handle[0].Motor_Position_Target = gimbal_joint;            //云台
-            LK4005_Motor_Handle[1].Motor_Position_Target = -4.0f * upper_joint;     //大臂：电机轴 = -4×关节角
-            LK4005_Motor_Handle[2].Motor_Position_Target =  2.0f * fore_joint;      //小臂：电机轴 =  2×关节角
+            LK4005_Motor_Handle[1].Motor_Position_Target = -4.0f * (upper_joint + 0.17f);     //大臂：电机轴 = -4×关节角
+            LK4005_Motor_Handle[2].Motor_Position_Target =  2.0f * (fore_joint + 0.17f);      //小臂：电机轴 =  2×关节角
+
+            /* 解析第11字节指令类型: 0x00=预测, 0x01=最终确认 */
+            uint8_t cmd_type = Usart_Used0_Rx_Buff[10];
+            LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.cmd_type = cmd_type;
+            LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.cmd_type = cmd_type;
+            LK4005_Motor_Handle[2].Motor_Speed_Plan_Handle.cmd_type = cmd_type;
 
             LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
             LK4005_Motor_Handle[2].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
@@ -145,7 +171,11 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 void Communication_Send_Init_Success(void)
 {
     static uint8_t msg[] = "init success\r\n";
-    HAL_UART_Transmit_DMA(Communication_Usart_Handle_Used0, msg, sizeof(msg) - 1);
+    HAL_UART_StateTypeDef state = HAL_UART_GetState(Communication_Usart_Handle_Used0);
+    if ((state != HAL_UART_STATE_BUSY_TX) && (state != HAL_UART_STATE_BUSY_TX_RX))
+    {
+        HAL_UART_Transmit_DMA(Communication_Usart_Handle_Used0, msg, sizeof(msg) - 1);
+    }
 }
 
 void Communication_Send_Move_Success(void)

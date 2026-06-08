@@ -58,11 +58,11 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
         {
             if (position_actual > 0.0f)
             {
-                Speed_Plan_Handle->position_initial = position_actual + 0.02f;
+                Speed_Plan_Handle->position_initial = position_actual + 0.03f;
             }
             else if (position_actual < 0.0f)
             {
-                Speed_Plan_Handle->position_initial = position_actual - 0.02f;
+                Speed_Plan_Handle->position_initial = position_actual - 0.03f;
             }
             else
             {
@@ -74,7 +74,7 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
             Speed_Plan_Handle->position_initial = position_actual;
         }
 
-        if (fabsf(Speed_Plan_Handle->error_s) <= 0.025f)
+        if (fabsf(Speed_Plan_Handle->error_s) <= 0.05f)
         {
             Speed_Plan_Handle->a = 0;
             Speed_Plan_Handle->v = 0;
@@ -116,15 +116,15 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
             float scale = 1.0f;
             if (S < 0.08f)
             {
-                scale = 0.15f;   /* tiny step: 30% */
+                scale = 0.30f;   /* tiny step: 30% -> 60% (relaxed for speed) */
             }
             else if (S < 0.12f)
             {
-                scale = 0.2f;   /* small step: 40% */
+                scale = 0.40f;   /* small step: 40% -> 80% (relaxed for speed) */
             }
             else if (S < 0.30f)
             {
-                scale = 0.3f;   /* medium step: 60% */
+                scale = 0.60f;   /* medium step: 60% -> 100% (relaxed for speed) */
             }
             v_peak *= scale;
 
@@ -164,6 +164,63 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
             }
         }
 
+        /* ========== Velocity safety & smart phase jump on re-planning ========== */
+        float v_abs = fabsf(Speed_Plan_Handle->v);
+
+        /* Prediction cmd (0x00): use original init logic for smooth preview motion */
+        if (Speed_Plan_Handle->cmd_type == 0x00)
+        {
+            Speed_Plan_Handle->a = 0.0f;
+            Speed_Plan_Handle->s = 0.0f;
+            Speed_Plan_Handle->Speed_Plan_State = phase1;
+            break;
+        }
+
+        /* Confirm cmd (0x01): use v9 safety logic for final execution */
+        /* 1. Clamp inherited velocity to new v_limit (with 20% overshoot margin) */
+        if (v_abs > Speed_Plan_Handle->v_limit * 1.2f)
+        {
+            float v_clamp = Speed_Plan_Handle->v_limit * 1.2f;
+            if (v_clamp > Speed_Plan_Handle->v_max)
+            {
+                v_clamp = Speed_Plan_Handle->v_max;
+            }
+            Speed_Plan_Handle->v = (Speed_Plan_Handle->v >= 0.0f ? 1.0f : -1.0f) * v_clamp;
+            v_abs = v_clamp;
+        }
+
+        /* 2. Brake-distance safety: if we can't stop in error_s, force lower speed */
+        float decel_needed = Calc_Decel_Dist(v_abs,
+                                              Speed_Plan_Handle->a_limit,
+                                              Speed_Plan_Handle->j_limit);
+        if (decel_needed >= fabsf(Speed_Plan_Handle->error_s))
+        {
+            float v_safe = v_abs;
+            /* Iteratively reduce speed until we can stop within the distance,
+               or floor at a minimal crawl speed */
+            while (decel_needed >= fabsf(Speed_Plan_Handle->error_s) && v_safe > 0.10f)
+            {
+                v_safe *= 0.92f;
+                decel_needed = Calc_Decel_Dist(v_safe,
+                                                Speed_Plan_Handle->a_limit,
+                                                Speed_Plan_Handle->j_limit);
+            }
+            Speed_Plan_Handle->v = (Speed_Plan_Handle->v >= 0.0f ? 1.0f : -1.0f) * v_safe;
+            Speed_Plan_Handle->a = 0.0f;
+            Speed_Plan_Handle->s = 0.0f;
+            Speed_Plan_Handle->Speed_Plan_State = phase3_end;
+            break;
+        }
+
+        /* 3. Smart phase jump: if already fast, skip acceleration phase */
+        if (v_abs > Speed_Plan_Handle->v_limit * 0.6f)
+        {
+            Speed_Plan_Handle->a = 0.0f;
+            Speed_Plan_Handle->s = 0.0f;
+            Speed_Plan_Handle->Speed_Plan_State = phase3_end;
+            break;
+        }
+
         Speed_Plan_Handle->a = 0;
         Speed_Plan_Handle->s = 0;
 
@@ -181,6 +238,11 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
             Speed_Plan_Handle->a = Speed_Plan_Handle->a_limit;
             Speed_Plan_Handle->Speed_Plan_State = phase2;
         }
+        /* RUNTIME SAFE: prevent accelerating past v_limit */
+        if (Speed_Plan_Handle->v >= Speed_Plan_Handle->v_limit)
+        {
+            Speed_Plan_Handle->Speed_Plan_State = phase3;
+        }
         break;
     }
     case phase2:
@@ -192,12 +254,22 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
         {
             Speed_Plan_Handle->Speed_Plan_State = phase3;
         }
+        /* RUNTIME SAFE: prevent accelerating past v_limit */
+        if (Speed_Plan_Handle->v >= Speed_Plan_Handle->v_limit)
+        {
+            Speed_Plan_Handle->Speed_Plan_State = phase3;
+        }
         break;
     }
     case phase3:
     {
         Speed_Plan_Handle->a -= Speed_Plan_Handle->j_limit * dt;
         Speed_Plan_Handle->v += Speed_Plan_Handle->a * dt;
+        /* RUNTIME SAFE: clamp v during P3 to prevent overshoot past v_limit */
+        if (Speed_Plan_Handle->v > Speed_Plan_Handle->v_limit)
+        {
+            Speed_Plan_Handle->v = Speed_Plan_Handle->v_limit;
+        }
         Speed_Plan_Handle->s += Speed_Plan_Handle->v * dt;
 
         if (Speed_Plan_Handle->a <= 0)
@@ -240,6 +312,17 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *Speed_Plan_Handle, float position_ac
         Speed_Plan_Handle->a -= Speed_Plan_Handle->j * dt;
         Speed_Plan_Handle->v += Speed_Plan_Handle->a * dt;
         Speed_Plan_Handle->s += Speed_Plan_Handle->v * dt;
+
+        /* RUNTIME SAFE: hard protection if not decelerating fast enough */
+        float remaining = fabsf(Speed_Plan_Handle->error_s) - Speed_Plan_Handle->s;
+        if (remaining > 0.001f && Speed_Plan_Handle->v > 0.1f)
+        {
+            float min_a_needed = -(Speed_Plan_Handle->v * Speed_Plan_Handle->v) / (2.0f * remaining);
+            if (Speed_Plan_Handle->a > min_a_needed)
+            {
+                Speed_Plan_Handle->a = min_a_needed;
+            }
+        }
 
         if (Speed_Plan_Handle->a <= -Speed_Plan_Handle->a_limit)
         {

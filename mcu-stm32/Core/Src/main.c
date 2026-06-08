@@ -28,6 +28,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "Robotic_Arm_Control_API.h"
+#include "LK4005_Motor_Driver.h"
+#include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -110,6 +112,28 @@ int main(void)
     /* USER CODE BEGIN 3 */
     Robotic_Arm_Control();
     //Communication_Usart();
+
+    /* ========== VOFA JustFloat Test: Gimbal Speed Plan ========== */
+    {
+      static uint32_t vofa_last_tick = 0;
+      uint32_t vofa_now = HAL_GetTick();
+
+      if (vofa_now - vofa_last_tick >= 10)  /* 100Hz sampling */
+      {
+        vofa_last_tick = vofa_now;
+
+        float vofa_buf[4];
+        Speed_Plan_Handle_t *sp = &LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle;
+
+        vofa_buf[0] = sp->s;        /* planned displacement */
+        vofa_buf[1] = sp->v;        /* planned velocity */
+        vofa_buf[2] = sp->a;        /* planned acceleration */
+        vofa_buf[3] = INFINITY;     /* tail: 0x00 0x00 0x80 0x7F */
+
+        HAL_UART_Transmit(&huart1, (uint8_t *)vofa_buf, sizeof(vofa_buf), 5);
+      }
+    }
+    /* ========================================================== */
   }
   /* USER CODE END 3 */
 }
