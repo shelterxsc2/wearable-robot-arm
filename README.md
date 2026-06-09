@@ -1,11 +1,15 @@
-# 可穿戴机械臂 — v2 手势状态机 + NRF24 IMU 控制
+# 可穿戴机械臂 — `imu-victor-hat` 分支
 
-> **分支**: `imu-newbi-hat`  
-> **核心路径**: NRF24 无线 IMU → A-inverse 矩阵解耦 → 8 状态运动预测/终点预测 → UART → STM32（舵机 + 电机）  
-> **视觉链路**: 两阶段 NPU 推理（Body → ROI → Face 468 landmarks）+ Python Socket RuleEngine v2（手势状态机保留但非本分支重点）  
+> **分支**: `imu-victor-hat`  
+> **核心路径**: NRF24 无线 IMU → A-inverse 矩阵解耦 → 8 状态运动预测/终点预测 → 11 字节 UART(flag=0x00/0x01) → STM32  
+> **视觉链路**: 两阶段 NPU 推理（Body → ROI → Face 468 landmarks）+ Python Socket RuleEngine v2  
 > **RuleEngine**: 基于 `rule_engine_v2.rknn`，输入 20 关键点 + bbox + valid_mask + 7 状态反馈  
-> **本分支重点**: 优化 NRF24 IMU 控制机械臂的响应、急停/抖动、极性校准与舵机映射  
-> **云端交互**: WebSocket 注册 + 心跳 (device-003)  
+> **本分支重点**: 
+> - NRF24 IMU 控制：运动学公式重构(l1~l4)、发令策略分化、舵机映射、位置死区、flag标志位
+> - 握手时序重构：`g_uart_block_tx` 延时拦截 + A-init
+> - 视觉 PnP 精调闭环规划（静止态偏差补偿）
+> - 云端 LL-HLS 监控系统对接
+> **云端交互**: WebSocket 注册 + 心跳 + LL-HLS 低延迟直播 (~3s)  
 > **端侧控制**: HTTP API @ 8080
 
 ---
@@ -26,7 +30,20 @@
 
 ### 控制链路（双轨并行）
 
-**手势控制链路（RuleEngine v2）:**
+**IMU 控制链路:**
+```
+IMU (头部) → NRF24 无线 → RK3588 SPI
+                              ↓
+                    A-inverse 矩阵解耦（R_current × R_init^T）
+                              ↓
+                    8 状态运动状态机 + 终点预测器
+                              ↓
+                    球坐标目标 (tx,ty,tz) + 舵机 (servo1,servo2)
+                              ↓
+                    UART 11字节 @ 115200 → STM32 → 电机
+```
+
+**手势控制链路:**
 ```
 USB Camera → Body NPU (17 COCO kpts) + Face LM (3 点)
                               ↓
@@ -39,20 +56,7 @@ USB Camera → Body NPU (17 COCO kpts) + Face LM (3 点)
                     UART → STM32 → 电机/舵机
 ```
 
-**IMU 控制链路:**
-```
-IMU (头部) → NRF24 无线 → RK3588 SPI
-                              ↓
-                    A-inverse 矩阵解耦（R_current × R_init^T）
-                              ↓
-                    8 状态运动状态机 + 终点预测器
-                              ↓
-                    目标位姿 (tx,ty,tz) + 舵机 (k1,k2)
-                              ↓
-                    UART 115200 @ 5~7Hz → STM32 → 电机
-```
-
-### 视觉/推流链路（两阶段）
+### 视觉/推流链路
 ```
 USB Camera (YUY2 1920×1080@30fps)
     → v4l2src → identity handoff → RGA(YUYV→NV12)
@@ -66,7 +70,7 @@ USB Camera (YUY2 1920×1080@30fps)
         → appsrc → mpph264enc → h264parse → flvmux → rtmpsink / rtph264pay
 ```
 
-### 云端/端侧交互
+### 云端交互
 ```
 RTMP: rtmp://47.93.162.124:1935/live/device-003
 WS  : ws://47.93.162.124/ws?deviceId=device-003
@@ -116,6 +120,13 @@ sudo ./build/cc
 6. 启动 NRF24 接收线程 + 50ms 控制定时器
 7. 探测 RTMP 服务器 → 自动选择 RTMP（+WebSocket）或 RTSP
 
+**握手时序**：
+```
+init success → FF AA 验证帧 → 7s 延时(g_uart_block_tx=1) → A-init → NORMAL
+```
+- 7s 延时期间：UART 发送被 `g_uart_block_tx` 完全拦截（不打印、不发数据）
+- A-init 完成后：`g_uart_block_tx=0`，恢复正常发令
+
 ---
 
 ## RuleEngine v2 协议
@@ -155,20 +166,22 @@ sudo ./build/cc
 ```
 src/
   main.cpp            # 主入口：初始化、推流、控制服务器、RuleEngine 服务生命周期
-  rga_npu.cpp         # 视觉链路 + RuleEngine Socket 客户端 + NRF24 控制核心
-  rga_npu.h           # 视觉/控制对外接口声明
+  rga_npu.cpp/h       # 视觉链路 + RuleEngine Socket 客户端 + NRF24 控制核心
   nrf24_linux.c/h     # NRF24 SPI 驱动 + IMU 帧解析 + 历史缓冲
-  uart_comm.cpp/h     # UART 通信（raw int16 发送 + 文本 complete 检测）
+  uart_comm.cpp/h     # UART 通信（11字节发送含flag + 文本 complete 检测）
   gst_rtmp.cpp/h      # GStreamer RTMP 推流（identity handoff）
   gst_rtsp.cpp/h      # GStreamer RTSP 推流（appsink 桥接）
   stream_manager.cpp/h# 推流管理器：RTMP 探测 + 自动选择 RTMP/RTSP
   ctrl_server.cpp/h   # 端侧 HTTP 控制服务器（零依赖 socket 实现）
   ws_client.cpp/h     # WebSocket 客户端（注册帧 + 100ms 心跳）
   wifi.cpp/h          # WiFi 连接（wpa_supplicant）
+  bluetooth_spp.c/h   # BLE（已禁用，bt_stub.c 空实现）
 scripts/
   rule_engine_server.py  # Python Unix Socket 推理服务（rknn-toolkit-lite2 v2）
   calibrate.py           # 标定脚本
-docs/               # 项目文档（控制设计、标定指南、调试日志、审计提示）
+docs/
+  midterm-report-prompt.md  # 中期检查报告生成 Prompt（含云端系统）
+  audit-prompt.md           # 代码审计 Prompt
 calib/              # 相机标定参数
 models/             # RKNN 模型（best.rknn / face_landmark_468_fp16.rknn / rule_engine_v2.rknn）
 ```
@@ -177,73 +190,62 @@ models/             # RKNN 模型（best.rknn / face_landmark_468_fp16.rknn / ru
 
 ## 关键设计决策
 
-### 1. RuleEngine v2：Python Socket 推理服务
-- **模型**：`rule_engine_v2.rknn`，10 个输入（kpts + bbox + valid_mask + 7 state）
-- **输入协议**：312 字节 `44f20f7q`（kpts 40f + bbox 4f + valid_mask 20f + state_fb 7q）
-- **bbox 作用**：为模型提供全局空间上下文，辅助区分相似手势在不同人体位置时的语义
-- **NPU 隔离**：Python 端固定使用 `NPU_CORE_0`，与 C++ Body/Face 的三核负载隔离，避免多进程 NPU 互锁
-- **Warmup**：启动时用 dummy zeros 预跑一遍，消除首次 `rknn.inference()` 的初始化延迟（否则会导致 GStreamer 流线程阻塞 6s+）
+### 1. 11 字节 UART 协议（新增 flag 标志位）
+- 前 10 字节：`[x][y][z][k1][k2]` 各 int16 小端
+- 第 11 字节：`flag`
+  - `0x00` = 预测/猜测坐标（头部运动中，predictor 输出）
+  - `0x01` = 确定/最终坐标（头部静止后，实际角度）
+- 下位机可据此区分预测阶段（允许 overshoot）和确定阶段（精确到位）
 
-### 2. A-inverse 矩阵解耦与握手时序
-- 用 `R_rel = R_current × R_init^T` 消除 IMU 初始安装角，替代早期的标量 baseline 减法
-- **握手时序**：阻塞等 `init success` → 发 `FF AA...` 验证帧 → 等 7s 归位 → 下一帧 IMU 捕获 `R_init` → 进入 NORMAL
-- 控制轴：Pitch (`wy`) → tz/ty 耦合；Yaw (`wz`) → tx/ty 耦合
-- 极性校准：`use_yaw = -rel_yaw`（偏航反向），俯仰保持原始 `rel_pitch`
+### 2. `g_uart_block_tx` 延时拦截
+- 替代 `g_host_state` 的多用途状态机，简化逻辑
+- 发完 `FF AA` 验证帧后置位，7s 后清零
+- 延时期间：任何 UART 发送（包括标定/HTTP）都被拦截，不打印、不发数据
+- NRF24 RX 线程不受影响，持续接收 IMU 数据
 
-### 3. IMU 控制机械臂优化（本分支核心）
-- **运动学公式重构**：从平面投影改为球坐标，引入俯仰-偏航耦合  
-  `tx = 57·sin(yaw)·cos(pitch)`  
-  `ty = 10 - 10·sin(pitch) + 57·cos(pitch)·cos(yaw)`  
-  `tz = 10 + 10·cos(pitch) + 57·sin(pitch)·cos(yaw)`
-- **动态舵机映射**：J4 俯仰 `servo1 = 120 - 1.2·Δpitch`；J5 水平 `servo2 = 50 + 0.4·Δyaw`，限幅 0~180°/0~270°
-- **位置死区**：坐标变化 < 1cm 不发令，抑制 Y 轴附近 `atan2` 高灵敏度导致的云台微抖
-- **发令策略分化**：
-  - Yaw：主窗口（`STATE_ACCEL_TO_CONST`）发一次预测令，静止态掐死不发，其他运动态不发（防 S 曲线尾部打断）
-  - Pitch：回退到主窗口/第二窗口/静止态均发令（保持头部静止后的微调能力）
-- **退出帧**：Ctrl+C 时先发 `AA FF AA FF AA FF AA FF AA FF` 再清理，通知下位机安全停机
+### 3. 球坐标运动学（参数化 l1~l4）
+```
+tx = l3·sin(yaw)·cos(pitch)
+ty = l4 - l1·sin(pitch) + l3·cos(pitch)·cos(yaw)
+tz = l2 + l1·cos(pitch) + l3·sin(pitch)·cos(yaw)
+```
+当前参数：`l1=8`, `l2=12`, `l3=52`, `l4=12`（单位 cm）
 
-### 4. 手势识别状态机
-- **3 状态**：Idle (0) / Mode1 (1) / Mode2 (2)
-- **20 关键点构成**：COCO 17 点 + 面部 3 点（左嘴角、右嘴角、下巴）
-- **Observer 视角交换**：COCO left/right 成对点在发送前互换（1↔2, 3↔4, ..., 15↔16），使模型始终以观察者视角判断左右
-- **Face 点处理**：Face LM 成功时填入 3 个面部坐标；失败时设为 `0.0f + valid_mask=0`
+### 4. 舵机映射（新定义）
+- J4 俯仰：`servo1 = 30 + (-1.2)·Δpitch`，限幅 [-90°, +90°]
+- J5 水平：`servo2 = 50 + 0.4·Δyaw`，限幅 [0°, 270°]
+- 0° = 竖直向下，正 = 向内（低头），负 = 向外（抬头）
 
-### 5. 两阶段 NPU 推理（Body → Face）
-- **Stage 1**：`best.rknn` 在 640×640 上检测 17 COCO 关键点，提取鼻/肩几何估算面部 ROI
-- **Stage 2**：RGA 硬件 `imcrop` + `imresize` + `imcvtcolor` 将 ROI 转为 192×192，送入 `face_landmark_468_fp16.rknn`
-- **PnP**：从 468 点中选取 12 个稳定点（眼、鼻、嘴、眉），通过 `solvePnP` 解算头部姿态，叠加 3D 立方体和坐标轴（仅显示，控制已废弃）
-- **OneEuroFilter**：当前禁用（`PNP_USE_FILTER 0`），依赖硬丢弃策略（重投影误差 >25px、镜像解、旋转跳变 >60°）
+### 5. 发令策略分化
+- **Yaw**：只在 `STATE_ACCEL_TO_CONST` 主窗口发一次预测令；静止态掐死不发
+- **Pitch**：主窗口/第二窗口/静止态均发令（保持微调能力）
 
-### 6. RGA NV12 stride 对齐约束
-- `wrapbuffer_virtualaddr` 的 `wstride` 在 NV12 模式下必须 **16 字节对齐**
-- 面部 ROI 宽度在 `imcrop` 前需对齐：`roi_w = (roi_w / 16) * 16`
-- ROI 高度设为与宽度相等（正方形），且 `roi_x`/`roi_y` 需为偶数（NV12 色度子采样）
-
-### 7. RKNN 输出内存分配
-- `rknn_create_mem` 必须使用 `rknn_query` 返回的 `attr->size`，而非 `n_elems * sizeof(element)`
-- 对于 FP16 模型，`attr->size` 可能包含 padding，手动计算会导致堆损坏
-
-### 8. 7 模块滚动时序统计
-- 30 帧滑动窗口统计：`get_frame`、`rga_preprocess`、`npu_body`、`roi_crop`、`npu_face_lm`、`draw`、`encode_push`
+### 6. 视觉 PnP 精调闭环（规划中）
+- 头部静止后（`g_arm_stable=1`），启动 PnP 偏差补偿
+- `|pnp_yaw - target_yaw| > 2°` 时触发微调
+- 视觉增益 0.5，限幅 ±10°
+- 仅修正，不替代 IMU 主控制链路
 
 ---
 
 ## 已知问题
 
-1. **Body 模型瓶颈**：`best.rknn` 占 AI 总耗时 ~85%，是整体帧率的主要瓶颈
-2. **wx 噪声**：静止时 wx 仍有尖峰，可能误判运动状态
+1. **Body 模型瓶颈**：`best.rknn` 占 AI 总耗时 ~85%
+2. **wx 噪声**：静止时 wx 仍有尖峰
 3. **5° 发令阈值延迟**：小角度头部动作不触发发令
 4. **STM32 短距减速**：小位移响应极慢（`<3cm → 15%` 速度）
 5. **纯开环**：上位机不知道机械臂实际位置，无关节角反馈
-6. **UART 协议不一致**：发送侧仍是 10 字节 raw int16，接收侧已实现帧头+CRC，但未双向统一
-7. **identity handoff 同步阻塞**：`process_frame` 耗时若 >33ms 会降低有效帧率
-8. **视觉算力浪费**：PnP 解算和 3D 绘制仅用于 OSD 显示，控制链路已废弃
+6. **俯仰极性偶发反转**：A-init 时头部姿态不同导致矩阵解耦符号不稳
+7. **云-端控制协议割裂**：云端离散状态(x,y,z)，端侧连续坐标(tx,ty,tz)
+8. **云端延迟**：RTMP ~3s，WebSocket 100ms
 
 ---
 
 ## 下一步
 
-- J4 舵机标定（方案 A：简单映射，基础设施 `/tmp/calib_mode.txt` + `/tmp/servo_calib.txt` 已就绪）
-- Body 模型优化（轻量化或降分辨率以突破帧率瓶颈）
-- UART 协议升级（统一为帧头+CRC 双向通信，下位机回传关节角）
-- RuleEngine 手势扩展（更多状态或自定义触发条件）
+- J4 舵机标定上机实测
+- Body 模型优化（轻量化突破帧率瓶颈）
+- 下位机回传关节角（UART 双向通信）
+- 视觉 PnP 精调闭环集成
+- 云-端协议统一（离散状态 vs 连续坐标融合）
+- 参数热加载
