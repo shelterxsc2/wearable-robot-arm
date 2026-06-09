@@ -993,7 +993,7 @@ void nrf24_control_update(void)
             if (now_us - last_calib_cmd_us > 200000) {
                 /* 控制指令: k1=50, k2=145 */
                 uart_send_arm_target(calib_locked_tx, calib_locked_ty, calib_locked_tz,
-                                     NRF_SERVO1_DEG, NRF_SERVO2_DEG);
+                                     NRF_SERVO1_DEG, NRF_SERVO2_DEG, 0x01);
                 last_calib_cmd_us = now_us;
                 /* printf("[CALIB] J4(k2)=%.1f | roll=%+.2f yaw=%+.2f (locked roll=%.2f yaw=%.2f)\n",
                        calib_servo1, current_roll_deg, current_yaw_deg,
@@ -1036,7 +1036,7 @@ void nrf24_control_update(void)
         }
     }
     /* printf("[IMU-AVG] rel_roll=%+.2f rel_pitch=%+.2f rel_yaw=%+.2f (n=%d) valid=%d init=%d | nrf_rx=%u err=%u\n",
-           avg_rel_roll, avg_rel_pitch, avg_rel_yaw, avg_n, (int)imu_valid, (int)r_init_set,
+           avg_rel_roll, avg_rel_pitch, avg_rel_yaw, avg_n, (int)imu_valid, (int)g_r_init_set,
            nrf_rx_count, nrf_err_count); */
 
     if (!imu_valid) {
@@ -1049,11 +1049,7 @@ void nrf24_control_update(void)
         return;
     }
 
-    /* 握手完成前不发坐标指令（但允许 A-init 捕获继续运行） */
-    extern volatile int g_host_state;
-    if (g_host_state < 4) {
-        return;
-    }
+    /* A-init 完成前不发坐标指令（由 !g_r_init_set 在上文拦截） */
 
     /* 基准标定（A-inverse 后初始姿态已归零，标量 baseline 不再需要） */
     if (!pitch_baseline_set) {
@@ -1150,10 +1146,10 @@ void nrf24_control_update(void)
     static float last_tz = NRF_FACE_Z_CM;
 
     bool should_cmd = pitch_should_cmd || yaw_should_cmd;
-    /* printf("[CMD] pitch=%+.2f->%+.2f(d=%+.2f%s) yaw=%+.2f->%+.2f(d=%+.2f%s) | p_cmd=%d y_cmd=%d | tx=%.1f ty=%.1f tz=%.1f\n",
+    printf("[CMD] pitch=%+.2f->%+.2f(d=%+.2f%s) yaw=%+.2f->%+.2f(d=%+.2f%s) | p_cmd=%d y_cmd=%d | tx=%.1f ty=%.1f tz=%.1f\n",
            rel_pitch, target_pitch_deg, delta_pitch_deg, pitch_moved_enough ? "" : "_thr",
            rel_yaw, target_yaw_deg, delta_yaw_deg, yaw_moved_enough ? "" : "_thr",
-           pitch_should_cmd, yaw_should_cmd, last_tx, last_ty, last_tz); */
+           pitch_should_cmd, yaw_should_cmd, last_tx, last_ty, last_tz);
     if (should_cmd) {
         float delta_pitch_deg = normalize_angle_deg(target_pitch_deg - nrf_baseline_roll_deg);
         float cum_pitch_offset = delta_pitch_deg * (float)M_PI / 180.0f;
@@ -1169,9 +1165,13 @@ void nrf24_control_update(void)
         if (cum_yaw_offset < -(float)M_PI / 2.0f)
             cum_yaw_offset = -(float)M_PI / 2.0f;
 
-        last_tx = 57.0f * std::sin(cum_yaw_offset) * std::cos(cum_pitch_offset);
-        last_ty = 10.0f - 10.0f * std::sin(cum_pitch_offset) + 57.0f * std::cos(cum_pitch_offset) * std::cos(cum_yaw_offset);
-        last_tz = 10.0f + 10.0f * std::cos(cum_pitch_offset) + 57.0f * std::sin(cum_pitch_offset) * std::cos(cum_yaw_offset);
+        const float l1 = 8.0f;
+        const float l2 = 12.0f;
+        const float l3 = 52.0f;
+        const float l4 = 12.0f;
+        last_tx = l3 * std::sin(cum_yaw_offset) * std::cos(cum_pitch_offset);
+        last_ty = l4 - l1 * std::sin(cum_pitch_offset) + l3 * std::cos(cum_pitch_offset) * std::cos(cum_yaw_offset);
+        last_tz = l2 + l1 * std::cos(cum_pitch_offset) + l3 * std::sin(cum_pitch_offset) * std::cos(cum_yaw_offset);
 
         // 位置死区：坐标变化 < 2cm 不发令，抑制 Y 轴附近 atan2 敏感导致的微抖
         static float prev_sent_tx = 0.0f;
@@ -1199,15 +1199,15 @@ void nrf24_control_update(void)
         }
 
         /* ========== 舵机控制 ========== */
-        // 俯仰舵机（J4）：仰头变小，低头变大
-        static const float SERVO1_BASELINE = 120.0f;
-        static const float K_PITCH_SERVO = -1.2f;  // 幅度加大，先验证极性
+        // 俯仰舵机（J4）：0度=竖直向下，正度数向内(低头)，负度数向外(抬头)
+        static const float SERVO1_BASELINE = 30.0f;
+        static const float K_PITCH_SERVO = -1.2f;
 
         float servo1 = SERVO1_BASELINE + K_PITCH_SERVO * delta_pitch_deg;
 
-        // 限幅 0~180°（俯仰舵机安全范围）
-        if (servo1 > 180.0f) servo1 = 180.0f;
-        if (servo1 < 0.0f)   servo1 = 0.0f;
+        // 限幅 -90~+90
+        if (servo1 > 90.0f)  servo1 = 90.0f;
+        if (servo1 < -90.0f) servo1 = -90.0f;
 
         // 偏转舵机（J5）：50°正对面部，跟随偏航角
         static const float SERVO2_BASELINE = 50.0f;
@@ -1219,8 +1219,13 @@ void nrf24_control_update(void)
         if (servo2 > 270.0f) servo2 = 270.0f;
         if (servo2 < 0.0f)   servo2 = 0.0f;
 
+        bool is_prediction = false;
+        if (pitch_should_cmd && !is_stop) is_prediction = true;
+        if (yaw_should_cmd && !is_stop_yaw) is_prediction = true;
+        uint8_t flag = is_prediction ? 0x00 : 0x01;
+
         uart_send_arm_target(last_tx, last_ty, last_tz,
-                             servo2, servo1);
+                             servo2, servo1, flag);
 
         if (pitch_should_cmd) {
             last_cmd_target_pitch = target_pitch_deg;

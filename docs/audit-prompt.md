@@ -114,8 +114,8 @@ Python Unix Socket 推理服务。重点看：
 
 ## 11. src/gst_rtmp.cpp / src/gst_rtmp.h
 RTMP 云端推流。重点看：
-- Pipeline 结构（v4l2src(YUY2) → identity → RGA(YUYV→NV12) → process_frame → appsrc → mpph264enc → flvmux → rtmpsink）
-- `identity_handoff()` 同步回调：如何抓取 YUY2 帧、RGA 转 NV12、调用 `process_frame`、推送 `appsrc`
+- Pipeline 结构（v4l2src(MJPEG) → mppjpegdec → identity → memcpy(NV12) → process_frame → appsrc → mpph264enc → flvmux → rtmpsink）
+- `identity_handoff()` 同步回调：如何抓取 MJPEG 解码后的 NV12 帧、处理 MPP 16 字节高度对齐、调用 `process_frame`、推送 `appsrc`
 - 时间戳处理：`GstClock` running time 计算
 - `config-interval=1`, `gop=15` 编码参数
 - `get_rtmp_frame_count()` 暴露给 WS 心跳
@@ -123,10 +123,10 @@ RTMP 云端推流。重点看：
 
 ## 12. src/gst_rtsp.cpp / src/gst_rtsp.h
 RTSP 推流核心（降级模式）。重点看：
-- Pipeline 结构（v4l2src → identity → RGA → appsink → appsrc → mpph264enc → rtph264pay）
+- Pipeline 结构（v4l2src(MJPEG) → mppjpegdec → tee → appsink → appsrc → mpph264enc → rtph264pay）
 - `media_configure_cb` 中 `appsrc` 的配置（`is-live`、`do-timestamp`、`stream-type`、`format`）
 - `new_sample_cb` 中 AI 处理（`process_frame`）和 buffer 推送
-- YUY2 输入、RGA 转 NV12、framerate=30/1
+- MJPEG 输入、mppjpegdec 解码为 NV12、framerate=30/1
 
 ## 13. src/stream_manager.cpp / src/stream_manager.h
 推流管理器。重点看：
@@ -195,7 +195,7 @@ Bluetooth SPP stub。重点看：
    - Stage 2：Face 468 landmarks（RGA 预处理、模型、分辨率、耗时、输出）
    - PnP：12 点选取、坐标系、姿态解算
    - 整体性能（7 模块统计）
-   - **输入格式**：YUY2 1920×1080@30fps，RGA 硬件转 NV12
+   - **输入格式**：MJPEG 1920×1080@30fps，mppjpegdec 硬解为 NV12
 5. **NRF24 控制链路现状**（本分支重点）：
    - 传感器数据流（IMU → NRF24 → SPI → 上位机）
    - A-inverse 矩阵解耦原理（R_current × R_init^T）
@@ -230,3 +230,7 @@ Bluetooth SPP stub。重点看：
     - UART 协议升级（统一帧头+CRC 双向通信）
 
 要求：简明扼要，不要大段粘贴代码，用工程师能理解的语言总结。重点突出 `imu-newbi-hat` 相比 `imu-v2state-hat` 的核心变化（NRF24 IMU 控制链路优化：运动学公式重构、发令策略分化、位置死区、动态舵机映射、握手时序、退出帧）。
+
+重要注意事项：每次修改完代码后执行
+cd /home/elf/work/twice && g++ -std=c++17 -O2 \ src/main.cpp src/rga_npu.cpp src/gst_rtsp.cpp src/gst_rtmp.cpp \ src/stream_manager.cpp src/ctrl_server.cpp src/ws_client.cpp \ src/uart_comm.cpp src/wifi.cpp \ src/nrf24_linux.c src/bt_stub.c \ -o build/cc \ $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtsp-server-1.0) \ -I/usr/include/opencv4 -lopencv_core -lopencv_imgproc -lopencv_calib3d \ -lrknnrt -lrga -lwpa_client -lpthread 2>&1 | grep -E 'error:|build/cc' || echo "编译完成"
+  进行编译，但是不要运行

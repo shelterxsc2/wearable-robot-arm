@@ -50,7 +50,7 @@ int uart_send_target_pose(const Pose6D* pose);
  *   k1,k2: 舵机角度, 单位度
  * @return 0 成功, -1 失败
  */
-int uart_send_arm_target(float x, float y, float z, float k1, float k2);
+int uart_send_arm_target(float x, float y, float z, float k1, float k2, uint8_t flag);
 
 /**
  * 启动后台接收线程, 循环解析下位机回传帧
@@ -92,6 +92,9 @@ extern volatile int g_arm_stable;
 
 /* 调用方在确定发送后调用, 将状态置为运动中 */
 void uart_set_move_pending(void);
+
+/* 握手延时期间禁止 UART 发送: 1=禁止, 0=允许 */
+extern volatile int g_uart_block_tx;
 
 /* 诊断日志: 带运行时长, 同时写文件和终端 */
 void diag_log(const char* fmt, ...);

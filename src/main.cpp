@@ -260,9 +260,12 @@ static void* handshake_thread(void* arg) {
     uart_send_raw(ff_frame, 10);
     printf("[Handshake] FF verification frame sent.\n");
 
-    // 3. 等待下位机归位完成（暂用 7s 延时替代阻塞等 move_complete）
+    // 3. 等待下位机归位完成（7s 延时，期间禁止UART发送）
     printf("[Handshake] Waiting 7s for homing...\n");
+    extern volatile int g_uart_block_tx;
+    g_uart_block_tx = 1;
     usleep(7000000);
+    g_uart_block_tx = 0;
     printf("[Handshake] 7s homing wait done.\n");
 
     // 4. A-init：等下一帧 IMU
@@ -273,7 +276,7 @@ static void* handshake_thread(void* arg) {
     }
     printf("[Handshake] A-init (R_init) captured.\n");
 
-    // 5. 进入 NORMAL，开始 UART-Tx
+    // 5. 进入 NORMAL，开始允许 UART-Tx
     g_host_state = 4;
     printf("[Handshake] Entering NORMAL.\n");
 

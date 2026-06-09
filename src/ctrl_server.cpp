@@ -152,7 +152,7 @@ static void handle_client(int client)
                 fclose(fp);
             }
             /* 直接发送一次测试指令 */
-            uart_send_arm_target(0.0f, 67.0f, 40.0f, k1, k2);
+            uart_send_arm_target(0.0f, 67.0f, 40.0f, k1, k2, 0x01);
             char json[256];
             snprintf(json, sizeof(json), "{\"ok\":true,\"k1\":%.1f,\"k2\":%.1f}\n", k1, k2);
             send_json(client, RESP_OK, json);

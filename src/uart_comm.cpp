@@ -46,10 +46,36 @@ volatile int g_head_stationary = 0;
 /* 机械臂到位状态: 1=头部静止持续400ms且距离上次发令>200ms */
 volatile int g_arm_stable = 0;
 
+/* 握手延时期间禁止 UART 发送: 1=禁止, 0=允许 */
+volatile int g_uart_block_tx = 0;
+
 /* ---------- 诊断日志: 带运行时长, 同时写文件和终端 ---------- */
 static FILE* g_diag_fp = NULL;
 static pthread_mutex_t g_diag_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct timespec g_prog_start;
+
+/* ---------- [UART-RX] 原始数据记录到 /tmp/cmd ---------- */
+static FILE* g_cmd_fp = NULL;
+static pthread_mutex_t g_cmd_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void cmd_log_raw(const char* line) {
+    if (!g_cmd_fp) {
+        g_cmd_fp = fopen("/tmp/cmd", "w");
+        if (g_cmd_fp) setbuf(g_cmd_fp, NULL);
+    }
+    if (!g_cmd_fp) return;
+
+    pthread_mutex_lock(&g_cmd_mutex);
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm tm_info;
+    localtime_r(&tv.tv_sec, &tm_info);
+    fprintf(g_cmd_fp, "[%02d:%02d:%02d.%03d] %s\n",
+            tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec,
+            (int)(tv.tv_usec / 1000), line);
+    fflush(g_cmd_fp);
+    pthread_mutex_unlock(&g_cmd_mutex);
+}
 
 static void print_timestamp(void)
 {
@@ -195,6 +221,10 @@ void uart_cleanup(void)
         fclose(g_diag_fp);
         g_diag_fp = NULL;
     }
+    if (g_cmd_fp) {
+        fclose(g_cmd_fp);
+        g_cmd_fp = NULL;
+    }
     if (g_uart_fd >= 0) {
         tcflush(g_uart_fd, TCIOFLUSH);
         close(g_uart_fd);
@@ -206,6 +236,12 @@ void uart_cleanup(void)
 int uart_send_raw(const uint8_t* data, size_t len)
 {
     if (g_uart_fd < 0) return -1;
+
+    // 握手延时期间禁止发送（FF验证帧已在此前发出）
+    if (g_uart_block_tx) {
+        return -1;
+    }
+
     printf("[UART-TX] (%zu bytes):", len);
     for (size_t i = 0; i < len && i < 32; ++i) {
         printf(" %02X", data[i]);
@@ -277,16 +313,26 @@ int uart_send_target_pose(const Pose6D* pose)
     return send_frame(CMD_TARGET_POSE, p, 28);
 }
 
-int uart_send_arm_target(float x, float y, float z, float k1, float k2)
+int uart_send_arm_target(float x, float y, float z, float k1, float k2, uint8_t flag)
 {
-    diag_log("[UART-TX] x=%.1f y=%.1f z=%.1f k1=%.1f k2=%.1f", x, y, z, k1, k2);
+    // 握手延时期间禁止发送
+    if (g_uart_block_tx) {
+        return -1;
+    }
+
+    diag_log("[UART-TX] x=%.1f y=%.1f z=%.1f k1=%.1f k2=%.1f flag=0x%02X", x, y, z, k1, k2, flag);
     int16_t data[5];
     data[0] = (int16_t)x;
     data[1] = (int16_t)y;
     data[2] = (int16_t)z;
     data[3] = (int16_t)k1;
     data[4] = (int16_t)k2;
-    int ret = uart_send_raw((const uint8_t*)data, sizeof(data));
+
+    uint8_t frame[11];
+    memcpy(frame, data, 10);
+    frame[10] = flag;
+
+    int ret = uart_send_raw(frame, sizeof(frame));
     if (ret == 0) uart_set_move_pending();
     return ret;
 }
@@ -314,7 +360,7 @@ static void* recv_thread_func(void* arg)
         /* --- Step 1 诊断：打印原始 RX 字节流 --- */
         char rx_line[256];
         int pos = 0;
-        print_timestamp();
+        /* print_timestamp(); */
         pos += snprintf(rx_line + pos, sizeof(rx_line) - pos, "[UART-RX] n=%d | ", n);
         for (int i = 0; i < n && i < 64; ++i) {
             if (rx_buf[i] >= 32 && rx_buf[i] <= 126)
@@ -322,15 +368,15 @@ static void* recv_thread_func(void* arg)
             else
                 pos += snprintf(rx_line + pos, sizeof(rx_line) - pos, "\\x%02X", rx_buf[i]);
         }
-        printf("%s\n", rx_line);
+        cmd_log_raw(rx_line);
 
-        print_timestamp();
+        /* print_timestamp();
         printf("[UART] RX (%d bytes):", n);
         for (int i = 0; i < n && i < 16; ++i) {
             printf(" %02X", rx_buf[i]);
         }
         if (n > 16) printf(" ...");
-        printf("\n");
+        printf("\n"); */
 
         /* 简单文本缓冲: 检测 "move complete" */
         int copy = n;

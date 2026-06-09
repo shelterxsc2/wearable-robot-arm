@@ -112,15 +112,14 @@ static GstFlowReturn new_sample_cb(GstElement *sink, gpointer data) {
     }
     
     format = gst_structure_get_string(structure, "format");
-    if (!format || strcmp(format, "YUY2") != 0) {
-        fprintf(stderr, "[GStreamer] Expected YUY2, got %s\n", format ? format : "null");
+    if (!format || strcmp(format, "NV12") != 0) {
+        fprintf(stderr, "[GStreamer] Expected NV12, got %s\n", format ? format : "null");
         gst_sample_unref(sample);
         return GST_FLOW_OK;
     }
 
     g_frames_in++;
 
-    gsize yuyv_size = (gsize)width * height * 2;
     gsize nv12_size = (gsize)width * height * 3 / 2;
 
     // mppjpegdec 输出可能是只读 dmabuf，分配可写 buffer 做绘制
@@ -150,15 +149,19 @@ static GstFlowReturn new_sample_cb(GstElement *sink, gpointer data) {
 
     uint64_t t2 = get_us();
 
-    // RGA 硬件转换: YUYV -> NV12
-    if (in_info.size < yuyv_size) {
-        fprintf(stderr, "[GStreamer] YUY2 buffer too small: %zu < %zu\n", in_info.size, yuyv_size);
-        memset(out_info.data, 0, nv12_size);
+    // MPP 解码器输出高度可能对齐到 16 的倍数（如 1080 -> 1088）
+    // 需要紧凑布局: Y(1920 x height) + UV(1920 x height/2)
+    if (in_info.size > nv12_size) {
+        int align_h = (int)(in_info.size / (width * 3 / 2));
+        memcpy(out_info.data, in_info.data, width * height);
+        memcpy(out_info.data + width * height,
+               in_info.data + width * align_h,
+               width * height / 2);
+    } else if (in_info.size == nv12_size) {
+        memcpy(out_info.data, in_info.data, nv12_size);
     } else {
-        if (convert_yuyv_to_nv12((uint8_t*)in_info.data, (uint8_t*)out_info.data, width, height) != 0) {
-            fprintf(stderr, "[GStreamer] RGA YUYV->NV12 failed, fallback to zero\n");
-            memset(out_info.data, 0, nv12_size);
-        }
+        fprintf(stderr, "[GStreamer] NV12 buffer too small: %zu < %zu\n", in_info.size, nv12_size);
+        memset(out_info.data, 0, nv12_size);
     }
 
     uint64_t t3 = get_us();
@@ -237,11 +240,13 @@ static void media_configure_cb(GstRTSPMediaFactory *factory, GstRTSPMedia *media
 int start_rtsp_server(const char *device, GMainLoop **loop_ptr) {
     gst_init(NULL, NULL);
     
-    // USB Camera3 pipeline: YUYV -> appsink, AI draws on NV12, appsrc feeds encoder
+    // USB Camera3 pipeline: MJPEG -> mppjpegdec -> NV12 -> appsink, AI draws on NV12, appsrc feeds encoder
     gchar *media_launch = g_strdup_printf(
         "( "
         "v4l2src device=%s min-buffers=2 io-mode=auto "
-        "! video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1 "
+        "! image/jpeg,width=1920,height=1080,framerate=30/1 "
+        "! mppjpegdec "
+        "! video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 "
         "! tee name=t "
         "t. ! queue max-size-buffers=1 leaky=downstream ! fakesink "
         "t. ! queue max-size-buffers=1 leaky=downstream "
@@ -255,7 +260,7 @@ int start_rtsp_server(const char *device, GMainLoop **loop_ptr) {
         device);
 
     g_print("[RTSP] Starting server...\n");
-    g_print("[RTSP] Pipeline configured for 1080p30 + AI overlay\n");
+    g_print("[RTSP] Pipeline configured for MJPEG 1080p30 + AI overlay\n");
 
     GstRTSPServer *server = gst_rtsp_server_new();
     if (!server) {
