@@ -156,7 +156,7 @@ init success → FF AA 验证帧 → 7s 延时(g_uart_block_tx=1) → A-init →
 |------|------|------|
 | `/status` | GET | 返回当前模式、推流类型、move_complete、head_stationary、arm_stable |
 | `/mode` | POST `type=face/body` | 切换 AI 模式 |
-| `/calib` | POST `mode=0/1/2` | 标定模式控制（0=关闭, 1=锁定+调舵机, 2=扫描测试） |
+| `/calib` | POST `mode=0/1/2/3` | 标定模式控制（0=关闭, 1=锁定+调舵机, 2=扫描测试, 3=PnP yaw 多点标定） |
 | `/servo` | POST `k1=50&k2=145` | 实时调整舵机角度 |
 | `/cmd` | POST `action=rebaseline/nrf24_reset` | 重新标定 baseline 或复位 NRF24 |
 

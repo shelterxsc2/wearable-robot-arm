@@ -290,6 +290,9 @@ int main(int argc, char *argv[]) {
     // 取消 stdout 缓冲，确保日志实时落盘
     setbuf(stdout, NULL);
 
+    /* 临时标定模式不跨进程保留，避免上次 mode=3 导致重启后行为异常。 */
+    remove("/tmp/calib_mode.txt");
+
     printf("============================================================\n");
     printf("ELF2 (RK3588) YOLOv8-Pose AI推流系统 (RTMP/RTSP自适应版)\n");
     printf("============================================================\n\n");

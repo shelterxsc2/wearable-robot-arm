@@ -72,6 +72,82 @@ static int g_frame_count = 0;
 static int npu_initialized = 0;
 static uint64_t g_frame_start_us = 0;
 
+static const int PNP_CALIB_TARGETS[] = {
+    0, -15, -30, -45, -60, -75
+};
+static const int PNP_CALIB_TARGET_COUNT =
+    (int)(sizeof(PNP_CALIB_TARGETS) / sizeof(PNP_CALIB_TARGETS[0]));
+static const uint64_t PNP_CALIB_PREPARE_US = 5000000;
+static const uint64_t PNP_CALIB_SAMPLE_US = 8000000;
+
+enum {
+    PNP_CALIB_INACTIVE = 0,
+    PNP_CALIB_PREPARE = 1,
+    PNP_CALIB_SAMPLE = 2,
+    PNP_CALIB_COMPLETE = 3
+};
+
+static std::atomic<int> g_pnp_calib_target_idx{-1};
+static std::atomic<int> g_pnp_calib_phase{PNP_CALIB_INACTIVE};
+static std::atomic<uint64_t> g_pnp_calib_phase_start_us{0};
+static std::atomic<float> g_arm_target_yaw_deg{0.0f};
+
+struct PnpYawCalibrationPoint {
+    float arm_yaw_deg;
+    float compensation_deg;
+};
+
+/*
+ * compensation = -measured PnP yaw while the face is aligned with the camera.
+ * Positive arm-yaw points come from the first run; negative points come from
+ * the trusted negative-side rerun. The 0-degree value comes from the first run.
+ */
+static const PnpYawCalibrationPoint PNP_YAW_CALIBRATION[] = {
+    {-75.0f, -6.5947f},
+    {-60.0f, -0.3278f},
+    {-45.0f,  3.2507f},
+    {-30.0f,  6.2222f},
+    {-15.0f,  5.0208f},
+    {  0.0f,  3.4033f},
+    { 15.0f,  6.1024f},
+    { 30.0f, 10.1275f},
+    { 45.0f, 14.6082f},
+    { 60.0f, 16.5775f},
+    { 75.0f, 24.1004f}
+};
+
+static float interpolate_pnp_yaw_compensation(float arm_yaw_deg) {
+    const int count =
+        (int)(sizeof(PNP_YAW_CALIBRATION) / sizeof(PNP_YAW_CALIBRATION[0]));
+
+    if (arm_yaw_deg <= PNP_YAW_CALIBRATION[0].arm_yaw_deg)
+        return PNP_YAW_CALIBRATION[0].compensation_deg;
+    if (arm_yaw_deg >= PNP_YAW_CALIBRATION[count - 1].arm_yaw_deg)
+        return PNP_YAW_CALIBRATION[count - 1].compensation_deg;
+
+    for (int i = 0; i < count - 1; ++i) {
+        const PnpYawCalibrationPoint& a = PNP_YAW_CALIBRATION[i];
+        const PnpYawCalibrationPoint& b = PNP_YAW_CALIBRATION[i + 1];
+        if (arm_yaw_deg <= b.arm_yaw_deg) {
+            float ratio = (arm_yaw_deg - a.arm_yaw_deg) /
+                          (b.arm_yaw_deg - a.arm_yaw_deg);
+            return a.compensation_deg +
+                   ratio * (b.compensation_deg - a.compensation_deg);
+        }
+    }
+    return 0.0f;
+}
+
+static int read_calib_mode(void) {
+    FILE *fp = fopen("/tmp/calib_mode.txt", "r");
+    if (!fp) return 0;
+
+    int mode = 0;
+    if (fscanf(fp, "%d", &mode) != 1) mode = 0;
+    fclose(fp);
+    return mode;
+}
+
 void set_frame_start_time_us(uint64_t us) {
     g_frame_start_us = us;
 }
@@ -99,34 +175,42 @@ static const std::vector<cv::Point3f> FACE_3D_POINTS = {
     {0.0f,   50.0f,  -40.0f}    // 19: chin
 };
 
-// face_landmark_468 -> 12 点 PnP（前 6 点为原始 FACE_3D_POINTS，后 6 点新增）
+// face_landmark_468 -> MediaPipe canonical face geometry 的 12 点 PnP
 static const int FACE_LM_12_IDS[12] = {
-    133,  // 0: right eye outer (原始 ID1)
-    263,  // 1: left eye outer  (原始 ID2)
-    1,    // 2: nose tip        (原始 ID0)
-    61,   // 3: right mouth     (原始 ID17)
-    291,  // 4: left mouth      (原始 ID18)
-    152,  // 5: chin            (原始 ID19)
-    33,   // 6: right eye inner (新增)
-    362,  // 7: left eye inner  (新增)
-    48,   // 8: right nose      (新增)
-    278,  // 9: left nose       (新增)
-    105,  // 10: right brow     (新增)
-    334   // 11: left brow      (新增)
+    133,  // 0: right eye inner
+    263,  // 1: left eye outer
+    1,    // 2: nose tip
+    61,   // 3: right mouth corner
+    291,  // 4: left mouth corner
+    152,  // 5: chin
+    33,   // 6: right eye outer
+    362,  // 7: left eye inner
+    48,   // 8: right nose
+    278,  // 9: left nose
+    105,  // 10: right brow
+    334   // 11: left brow
 };
+
+/*
+ * Source: MediaPipe canonical_face_model.obj, vertex indices above.
+ * Canonical coordinates are centimeters with +Y up and +Z toward the face
+ * front. This project uses +Y down and face-front toward -Z, so vertices are
+ * transformed as (x, -y, -z), scaled to millimeters, then translated to keep
+ * landmark 1 at the previous nose anchor (0, -5, -90).
+ */
 static const std::vector<cv::Point3f> FACE_LM_12_3D = {
-    {-30.0f, -25.0f, -60.0f},   // 133: right eye outer (原始坐标，不变)
-    {30.0f,  -25.0f, -60.0f},   // 263: left eye outer (原始坐标，不变)
-    {0.0f,   -5.0f,  -90.0f},   // 1: nose tip (原始坐标，不变)
-    {-25.0f, 20.0f,  -65.0f},   // 61: right mouth (原始坐标，不变)
-    {25.0f,  20.0f,  -65.0f},   // 291: left mouth (原始坐标，不变)
-    {0.0f,   50.0f,  -40.0f},   // 152: chin (原始坐标，不变)
-    {-15.0f, -25.0f, -70.0f},   // 33: right eye inner (新增)
-    {15.0f,  -25.0f, -70.0f},   // 362: left eye inner (新增)
-    {-10.0f, -5.0f,  -85.0f},   // 48: right nose (新增)
-    {10.0f,  -5.0f,  -85.0f},   // 278: left nose (新增)
-    {-35.0f, -40.0f, -55.0f},   // 105: right brow (新增)
-    {35.0f,  -40.0f, -55.0f}    // 334: left brow (新增)
+    {-18.564320f, -42.121100f, -52.823000f},  // 133
+    { 44.458590f, -42.908560f, -46.978180f},  // 263
+    {  0.000000f,  -5.000000f, -90.000000f},  // 1
+    {-24.562060f,  27.157560f, -58.082800f},  // 61
+    { 24.562060f,  27.157560f, -58.082800f},  // 291
+    {  0.000000f,  77.765130f, -57.888880f},  // 152
+    {-44.458590f, -42.908560f, -46.978180f},  // 33
+    { 18.564320f, -42.121100f, -52.823000f},  // 362
+    {-16.086350f,  -6.843490f, -73.385890f},  // 48
+    { 16.086350f,  -6.843490f, -73.385890f},  // 278
+    {-39.865620f, -67.363520f, -59.907110f},  // 105
+    { 39.865620f, -67.363520f, -59.907110f}   // 334
 };
 
 // USB Camera3 2.7mm 130° wide-angle temporary estimate
@@ -851,7 +935,7 @@ void nrf24_control_update(void)
     static float rel_roll = 0.0f, rel_pitch = 0.0f, rel_yaw = 0.0f;
 
     /* PnP 视觉零飘修正：累积修正矩阵 */
-    static const float KI_PNP = 0.25f;
+    static const float KI_PNP = 0.05f;
     static cv::Mat R_bias_total;
 
     /* A-init 触发信号由握手线程控制 (g_wait_a_init) */
@@ -931,6 +1015,94 @@ void nrf24_control_update(void)
 
     /* printf("[IMU] roll=%+.2f pitch=%+.2f yaw=%+.2f | wx=%+.2f wz=%+.2f valid=%d\n",
            current_roll_deg, current_pitch_deg, current_yaw_deg, wx, wz, imu_valid); */
+
+    /*
+     * PnP yaw 多点标定：
+     * 机械臂依次移动到固定 yaw、pitch=0 的位置并保持，用户转头正对相机。
+     * 每点准备 5 秒，然后视觉线程采样 8 秒。标定期间暂停正常 IMU 跟随。
+     */
+    static bool pnp_calib_active = false;
+    static int pnp_calib_idx = 0;
+    static int pnp_calib_phase = PNP_CALIB_INACTIVE;
+    static uint64_t pnp_calib_phase_start = 0;
+    static bool pnp_calib_command_sent = false;
+
+    if (read_calib_mode() == 3) {
+        if (!pnp_calib_active) {
+            pnp_calib_active = true;
+            pnp_calib_idx = 0;
+            pnp_calib_phase = PNP_CALIB_PREPARE;
+            pnp_calib_phase_start = 0;
+            pnp_calib_command_sent = false;
+            printf("[PnP-Calib] Moving arm through yaw targets, pitch fixed at 0 deg\n");
+        }
+
+        if (pnp_calib_idx < PNP_CALIB_TARGET_COUNT) {
+            int target_yaw = PNP_CALIB_TARGETS[pnp_calib_idx];
+
+            if (!pnp_calib_command_sent) {
+                float yaw_rad = -(float)target_yaw * (float)M_PI / 180.0f;
+                const float l1 = 8.0f;
+                const float l2 = 5.0f;
+                const float l3 = 40.0f;
+                const float l4 = 28.0f;
+                float tx = l3 * std::sin(yaw_rad);
+                float ty = l4 + l3 * std::cos(yaw_rad);
+                float tz = l2 + l1;
+
+                const float servo1 = 30.0f;
+                float servo2 = 50.0f + 0.4f * target_yaw;
+                if (servo2 > 270.0f) servo2 = 270.0f;
+                if (servo2 < 0.0f) servo2 = 0.0f;
+
+                if (uart_send_arm_target(tx, ty, tz, servo2, servo1, 0x01) == 0) {
+                    g_arm_target_yaw_deg.store((float)target_yaw);
+                    pnp_calib_command_sent = true;
+                    pnp_calib_phase_start = now_us;
+                    printf("[PnP-Calib] Arm target yaw=%+d pitch=0 -> "
+                           "x=%.1f y=%.1f z=%.1f\n",
+                           target_yaw, tx, ty, tz);
+                }
+            } else {
+                uint64_t elapsed = now_us - pnp_calib_phase_start;
+                if (pnp_calib_phase == PNP_CALIB_PREPARE &&
+                    elapsed >= PNP_CALIB_PREPARE_US) {
+                    pnp_calib_phase = PNP_CALIB_SAMPLE;
+                    pnp_calib_phase_start = now_us;
+                    printf("[PnP-Calib] Target %+d: sampling 8s, face the camera\n",
+                           target_yaw);
+                } else if (pnp_calib_phase == PNP_CALIB_SAMPLE &&
+                           elapsed >= PNP_CALIB_SAMPLE_US) {
+                    pnp_calib_idx++;
+                    pnp_calib_command_sent = false;
+                    pnp_calib_phase_start = 0;
+                    if (pnp_calib_idx < PNP_CALIB_TARGET_COUNT) {
+                        pnp_calib_phase = PNP_CALIB_PREPARE;
+                    } else {
+                        pnp_calib_phase = PNP_CALIB_COMPLETE;
+                        printf("[PnP-Calib] All targets complete\n");
+                    }
+                }
+            }
+        }
+
+        g_pnp_calib_target_idx.store(pnp_calib_idx);
+        g_pnp_calib_phase.store(pnp_calib_phase);
+        g_pnp_calib_phase_start_us.store(pnp_calib_phase_start);
+        return;
+    }
+
+    if (pnp_calib_active) {
+        pnp_calib_active = false;
+        pnp_calib_idx = 0;
+        pnp_calib_phase = PNP_CALIB_INACTIVE;
+        pnp_calib_phase_start = 0;
+        pnp_calib_command_sent = false;
+        g_pnp_calib_target_idx.store(-1);
+        g_pnp_calib_phase.store(PNP_CALIB_INACTIVE);
+        g_pnp_calib_phase_start_us.store(0);
+        printf("[PnP-Calib] Control stopped\n");
+    }
 
     /* ========== 标定模式：锁定 gx/gy/gz，只调 J4（不依赖 imu_valid）========== */
     static bool calib_active = false;
@@ -1273,8 +1445,11 @@ void nrf24_control_update(void)
         float send_servo1 = is_prediction ? actual_servo1 : curr_servo1;
         float send_servo2 = is_prediction ? actual_servo2 : curr_servo2;
 
-        uart_send_arm_target(last_tx, last_ty, last_tz,
-                             send_servo2, send_servo1, flag);
+        int send_ret = uart_send_arm_target(last_tx, last_ty, last_tz,
+                                            send_servo2, send_servo1, flag);
+        if (send_ret == 0) {
+            g_arm_target_yaw_deg.store(target_yaw_deg);
+        }
 
         if (pitch_should_cmd) {
             last_cmd_target_pitch = target_pitch_deg;
@@ -1536,13 +1711,44 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h,
     double caz = t_cam_in_alpha.at<double>(2);
     // ========== 逆解算 + α坐标系变换 结束 ==========
 
-    static const double PITCH_OFFSET = -0.10;
-    static const double YAW_OFFSET   =  0.00;
-    rvec_f.at<double>(0) += PITCH_OFFSET;
-    rvec_f.at<double>(1) += YAW_OFFSET;
+    /*
+     * Fixed camera/model mounting calibration.
+     *
+     * Do not add offsets directly to Rodrigues-vector components: rvec is an
+     * axis-angle representation, not an Euler-angle vector. Compose the fixed
+     * pitch and yaw corrections as rotations in the camera frame instead.
+     *
+     * The previous calibration was:
+     *   rvec.x += -0.10 rad
+     *   pnp_yaw_correction = head_yaw - 14 deg
+     * These are now represented by one matrix:
+     *   R_calib = Ry(-14 deg) * Rx(-0.10 rad) * R_face2cam_raw
+     */
+    static const double MOUNT_PITCH_RAD = -0.10;
+    static const double MOUNT_YAW_RAD = -14.0 * M_PI / 180.0;
+    static const cv::Mat R_mount = []() {
+        const double cp = std::cos(MOUNT_PITCH_RAD);
+        const double sp = std::sin(MOUNT_PITCH_RAD);
+        const double cy = std::cos(MOUNT_YAW_RAD);
+        const double sy = std::sin(MOUNT_YAW_RAD);
 
-    cv::Mat R_calib;
-    cv::Rodrigues(rvec_f, R_calib);
+        cv::Mat R_pitch = (cv::Mat_<double>(3,3) <<
+            1.0, 0.0, 0.0,
+            0.0,  cp, -sp,
+            0.0,  sp,  cp);
+        cv::Mat R_yaw = (cv::Mat_<double>(3,3) <<
+             cy, 0.0,  sy,
+            0.0, 1.0, 0.0,
+            -sy, 0.0,  cy);
+        return R_yaw * R_pitch;
+    }();
+
+    cv::Mat R_face2cam_raw;
+    cv::Rodrigues(rvec_f, R_face2cam_raw);
+    cv::Mat R_calib = R_mount * R_face2cam_raw;
+    cv::Mat rvec_calib;
+    cv::Rodrigues(R_calib, rvec_calib);
+
     double sy = std::sqrt(R_calib.at<double>(0,0) * R_calib.at<double>(0,0)
                           + R_calib.at<double>(1,0) * R_calib.at<double>(1,0));
     bool singular = sy < 1e-6;
@@ -1557,8 +1763,7 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h,
         head_roll  = 0;
     }
 
-    cv::Mat R_face2cam;
-    cv::Rodrigues(rvec_f, R_face2cam);
+    cv::Mat R_face2cam = R_calib;
     cv::Mat R_cam2face = R_face2cam.t();
     cv::Mat cam_pos = -R_cam2face * tvec_f;
 
@@ -1572,10 +1777,112 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h,
     double hp_deg = head_pitch * 180.0 / M_PI;
     double hy_deg = head_yaw * 180.0 / M_PI;
     double hr_deg = head_roll * 180.0 / M_PI;
+    float arm_yaw_deg = g_arm_target_yaw_deg.load();
+    float yaw_compensation_deg =
+        interpolate_pnp_yaw_compensation(arm_yaw_deg);
+    double corrected_hy_deg = hy_deg + yaw_compensation_deg;
 
-    // PnP → IMU 控制：直接用屏幕上显示的欧拉角值，由 IMU 控制线程自行缩放
+    /* PnP yaw 多点标定：控制线程移动机械臂，视觉线程只负责采样。 */
+    {
+        static bool active = false;
+        static int sample_idx = -1;
+        static int previous_phase = PNP_CALIB_INACTIVE;
+        static double yaw_sum = 0.0;
+        static int yaw_count = 0;
+
+        int calib_mode = read_calib_mode();
+        uint64_t now_us = get_us();
+        cv::Mat y_mat(img_h, img_w, CV_8UC1, nv12);
+
+        if (calib_mode == 3) {
+            if (!active) {
+                active = true;
+                sample_idx = -1;
+                previous_phase = PNP_CALIB_INACTIVE;
+                yaw_sum = 0.0;
+                yaw_count = 0;
+
+                FILE *fp = fopen("/tmp/pnp_yaw_calib_negative.csv", "w");
+                if (fp) {
+                    fprintf(fp, "target_yaw_deg,pnp_yaw_avg_deg,sample_count\n");
+                    fclose(fp);
+                }
+                printf("[PnP-Calib] Visual recorder started\n");
+            }
+
+            int target_idx = g_pnp_calib_target_idx.load();
+            int phase = g_pnp_calib_phase.load();
+            uint64_t phase_start = g_pnp_calib_phase_start_us.load();
+
+            if (previous_phase == PNP_CALIB_SAMPLE &&
+                (phase != PNP_CALIB_SAMPLE || target_idx != sample_idx) &&
+                sample_idx >= 0 && sample_idx < PNP_CALIB_TARGET_COUNT) {
+                double average = yaw_count > 0 ? yaw_sum / yaw_count : 0.0;
+                FILE *fp = fopen("/tmp/pnp_yaw_calib_negative.csv", "a");
+                if (fp) {
+                    fprintf(fp, "%d,%.4f,%d\n",
+                            PNP_CALIB_TARGETS[sample_idx], average, yaw_count);
+                    fclose(fp);
+                }
+                printf("[PnP-Calib] Target %+d deg -> PnP avg %+.4f deg (%d samples)\n",
+                       PNP_CALIB_TARGETS[sample_idx], average, yaw_count);
+                yaw_sum = 0.0;
+                yaw_count = 0;
+            }
+
+            if (target_idx >= 0 && target_idx < PNP_CALIB_TARGET_COUNT) {
+                int target = PNP_CALIB_TARGETS[target_idx];
+                uint64_t elapsed_us = phase_start > 0 ? now_us - phase_start : 0;
+                char line[128];
+
+                if (phase == PNP_CALIB_PREPARE) {
+                    double remain = (PNP_CALIB_PREPARE_US > elapsed_us)
+                        ? (PNP_CALIB_PREPARE_US - elapsed_us) / 1000000.0 : 0.0;
+                    snprintf(line, sizeof(line),
+                             "PnP CALIB: arm yaw %+d, face camera, prepare %.1fs",
+                             target, remain);
+                } else if (phase == PNP_CALIB_SAMPLE) {
+                    if (sample_idx != target_idx) {
+                        sample_idx = target_idx;
+                        yaw_sum = 0.0;
+                        yaw_count = 0;
+                    }
+                    yaw_sum += hy_deg;
+                    yaw_count++;
+                    double remain = (PNP_CALIB_SAMPLE_US > elapsed_us)
+                        ? (PNP_CALIB_SAMPLE_US - elapsed_us) / 1000000.0 : 0.0;
+                    double running_avg = yaw_count > 0 ? yaw_sum / yaw_count : 0.0;
+                    snprintf(line, sizeof(line),
+                             "PnP CALIB: arm yaw %+d, sample %.1fs, PnP avg %+.2f",
+                             target, remain, running_avg);
+                } else {
+                    snprintf(line, sizeof(line), "PnP CALIB: moving arm...");
+                }
+
+                cv::putText(y_mat, line, cv::Point(10, 100),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.9,
+                            cv::Scalar(255), 2);
+            } else if (phase == PNP_CALIB_COMPLETE) {
+                cv::putText(y_mat,
+                            "PnP CALIB COMPLETE: /tmp/pnp_yaw_calib_negative.csv",
+                            cv::Point(10, 100),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.9,
+                            cv::Scalar(255), 2);
+            }
+            previous_phase = phase;
+        } else if (active) {
+            active = false;
+            sample_idx = -1;
+            previous_phase = PNP_CALIB_INACTIVE;
+            yaw_sum = 0.0;
+            yaw_count = 0;
+            printf("[PnP-Calib] Stopped\n");
+        }
+    }
+
+    // PnP → IMU 控制：固定安装校正后，再按机械臂目标 yaw 查表补偿
     pthread_mutex_lock(&g_nrf24_state.mutex);
-    g_nrf24_state.pnp_yaw_correction   = (float)(hy_deg - 14.0);
+    g_nrf24_state.pnp_yaw_correction   = (float)corrected_hy_deg;
     g_nrf24_state.pnp_pitch_correction = (float)hp_deg;
     g_nrf24_state.pnp_valid = true;
     pthread_mutex_unlock(&g_nrf24_state.mutex);
@@ -1593,9 +1900,9 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h,
            elapsed_us / 1000.0, hp_deg, hy_deg, hr_deg, pye_deg, ppe_deg); */
 
     // 在画面左上角醒目显示 Yaw/Pitch/Roll + rvec + 四元数（黑底白字）
-    double rx = rvec_f.at<double>(0);
-    double ry = rvec_f.at<double>(1);
-    double rz = rvec_f.at<double>(2);
+    double rx = rvec_calib.at<double>(0);
+    double ry = rvec_calib.at<double>(1);
+    double rz = rvec_calib.at<double>(2);
 
     // 从旋转矩阵计算四元数
     double qw, qx, qy, qz;
@@ -1629,7 +1936,9 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h,
     }
 
     char line1[80], line2[80], line3[80], line4[80];
-    snprintf(line1, sizeof(line1), "Yaw=%.1f  Pitch=%.1f  Roll=%.1f", hy_deg, hp_deg, hr_deg);
+    snprintf(line1, sizeof(line1),
+             "Yaw=%.1f Raw=%.1f Arm=%.1f Comp=%+.1f",
+             corrected_hy_deg, hy_deg, arm_yaw_deg, yaw_compensation_deg);
     snprintf(line2, sizeof(line2), "rvec=(%.2f, %.2f, %.2f)", rx, ry, rz);
     snprintf(line3, sizeof(line3), "quat=(%.2f, %.2f, %.2f, %.2f)", qw, qx, qy, qz);
     // 重点标出 α坐标系下相机位置 (单位cm)
@@ -1674,12 +1983,12 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h,
                 cv::FONT_HERSHEY_SIMPLEX, font_scale_big, cv::Scalar(255), thick_big);
 
     std::vector<cv::Point2f> proj_origin;
-    cv::projectPoints(std::vector<cv::Point3f>{{0,0,0}}, rvec_f, tvec_f, K, DIST_COEFFS, proj_origin);
+    cv::projectPoints(std::vector<cv::Point3f>{{0,0,0}}, rvec_calib, tvec_f, K, DIST_COEFFS, proj_origin);
     cv::Point2f origin = proj_origin[0];
 
     std::vector<cv::Point3f> axis_3d = {{40,0,0}, {0,40,0}, {0,0,40}};
     std::vector<cv::Point2f> proj_axis;
-    cv::projectPoints(axis_3d, rvec_f, tvec_f, K, DIST_COEFFS, proj_axis);
+    cv::projectPoints(axis_3d, rvec_calib, tvec_f, K, DIST_COEFFS, proj_axis);
 
     uint8_t yr, ur, vr, yg, ug, vg, yb, ub, vb;
     rgb_to_yuv(255, 0, 0, yr, ur, vr);
@@ -1731,7 +2040,7 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h,
         {-40,-45,-100}, {40,-45,-100}, {40,60,-100}, {-40,60,-100}  // 4-7: 前面（靠近相机）
     };
     std::vector<cv::Point2f> proj_cube;
-    cv::projectPoints(cube_3d, rvec_f, tvec_f, K, DIST_COEFFS, proj_cube);
+    cv::projectPoints(cube_3d, rvec_calib, tvec_f, K, DIST_COEFFS, proj_cube);
 
     // 前表面（靠近相机）- 亮绿色
     uint8_t yf, uf, vf;
@@ -2797,4 +3106,3 @@ PoseMode get_pose_mode(void) {
 const char* pose_mode_name(PoseMode mode) {
     return (mode == MODE_FACE) ? "FACE" : "BODY";
 }
-

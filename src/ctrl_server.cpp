@@ -113,6 +113,12 @@ static void handle_client(int client)
         char mode_val[8] = "";
         if (get_query_param(path, "mode", mode_val, sizeof(mode_val)) == 0) {
             int mode = atoi(mode_val);
+            if (mode < 0 || mode > 3) {
+                send_json(client, RESP_BAD,
+                          "{\"ok\":false,\"error\":\"mode must be 0..3\"}\n");
+                close(client);
+                return;
+            }
             FILE *fp = fopen("/tmp/calib_mode.txt", "w");
             if (fp) {
                 fprintf(fp, "%d\n", mode);
