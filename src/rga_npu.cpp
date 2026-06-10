@@ -850,6 +850,10 @@ void nrf24_control_update(void)
     static cv::Mat R_init;
     static float rel_roll = 0.0f, rel_pitch = 0.0f, rel_yaw = 0.0f;
 
+    /* PnP 视觉零飘修正：累积修正矩阵 */
+    static const float KI_PNP = 0.25f;
+    static cv::Mat R_bias_total;
+
     /* A-init 触发信号由握手线程控制 (g_wait_a_init) */
 
     /* 发令控制状态 */
@@ -904,18 +908,22 @@ void nrf24_control_update(void)
     }
     pthread_mutex_unlock(&g_nrf24_state.mutex);
 
-    /* ========== A-inverse：消除 IMU 初始安装角 ========== */
+    /* ========== A-inverse：消除 IMU 初始安装角 ==========
+     * A-init 基准现在由 RX 线程收集 5 帧高频数据（10ms/帧）后算平均值得到。
+     * 这里只需检测 R_init 是否已构造（RX 线程已设置 g_r_init_set）。
+     */
     if (imu_valid) {
-        if (g_wait_a_init && !g_r_init_set) {
+        if (g_r_init_set && R_init.empty()) {
             cv::Mat R_current = eulerZYXToMat(current_roll_deg, current_pitch_deg, current_yaw_deg);
             R_init = R_current.clone();
-            g_r_init_set = 1;
-            g_wait_a_init = 0;
-            printf("[A-INIT] R_init captured: roll=%.2f pitch=%.2f yaw=%.2f\n",
+            printf("[A-INIT] R_init built from 5-frame avg: roll=%.2f pitch=%.2f yaw=%.2f\n",
                    current_roll_deg, current_pitch_deg, current_yaw_deg);
         }
         if (g_r_init_set) {
             cv::Mat R_current = eulerZYXToMat(current_roll_deg, current_pitch_deg, current_yaw_deg);
+            if (!R_bias_total.empty()) {
+                R_current = R_bias_total * R_current;
+            }
             cv::Mat R_rel_mat = R_current * R_init.t();
             matToEulerZYX(R_rel_mat, rel_roll, rel_pitch, rel_yaw);
         }
@@ -1075,6 +1083,58 @@ void nrf24_control_update(void)
 
     /* ========== Pitch: 预测终点驱动的发令策略 ========== */
     bool is_stop = ctx.is_stop();
+
+    /* ========== Yaw: 从 imu-main-test 恢复的完整状态机 ========== */
+    if (!yaw_baseline_set) {
+        yaw_baseline_set = true;
+        last_cmd_target_yaw = 0.0f;
+        predictor_yaw.reset();
+    }
+
+    ctx_yaw.update_from_hist(wz_hist, wz_count, 5);
+    MotionState curr_state_yaw = next_motion_state(prev_state_yaw, ctx_yaw);
+    prev_state_yaw = curr_state_yaw;
+    predictor_yaw.update(wz, curr_state_yaw);
+
+    if (curr_state_yaw != prev_print_state_yaw) {
+        /* printf("[NRF-STATE] wz=%+.2f pred=%+.1f° | %s\n",
+               wz, predictor_yaw.pred_delta_yaw, motion_state_name(curr_state_yaw)); */
+        prev_print_state_yaw = curr_state_yaw;
+    }
+
+    bool is_stop_yaw = ctx_yaw.is_stop();
+
+    /* ========== PnP 视觉零飘修正（只在完全静止态执行）==========
+     * 当 pitch/yaw 都静止且 PnP 已连续 3 帧有效时，构造旋转修正矩阵
+     * 叠加到 R_bias_total，并重新计算 rel_pitch/rel_yaw。
+     */
+    float pitch_delta = 0.0f, yaw_delta = 0.0f;
+    bool do_pnp_correct = false;
+    if (g_r_init_set && is_stop && is_stop_yaw) {
+        pthread_mutex_lock(&g_nrf24_state.mutex);
+        if (g_nrf24_state.pnp_correction_ready) {
+            pitch_delta = 0.0f;  // 先关闭 pitch 修正
+            yaw_delta   = -KI_PNP * g_nrf24_state.pnp_yaw_correction;
+            g_nrf24_state.pnp_correction_ready = false;
+            do_pnp_correct = true;
+        }
+        pthread_mutex_unlock(&g_nrf24_state.mutex);
+    }
+    if (do_pnp_correct) {
+        if (R_bias_total.empty()) {
+            R_bias_total = cv::Mat::eye(3, 3, CV_32F);
+        }
+        cv::Mat R_delta = eulerZYXToMat(0.0f, pitch_delta, yaw_delta);
+        R_bias_total = R_delta * R_bias_total;
+
+        if (imu_valid) {
+            cv::Mat R_current = eulerZYXToMat(current_roll_deg, current_pitch_deg, current_yaw_deg);
+            cv::Mat R_corrected = R_bias_total * R_current;
+            cv::Mat R_rel_mat = R_corrected * R_init.t();
+            matToEulerZYX(R_rel_mat, rel_roll, rel_pitch, rel_yaw);
+        }
+    }
+
     float target_pitch_deg = is_stop ? rel_pitch
                                      : predictor.get_target_yaw(rel_pitch);
     float delta_pitch_deg = normalize_angle_deg(target_pitch_deg - last_cmd_target_pitch);
@@ -1096,25 +1156,6 @@ void nrf24_control_update(void)
         }
     }
 
-    /* ========== Yaw: 从 imu-main-test 恢复的完整状态机 ========== */
-    if (!yaw_baseline_set) {
-        yaw_baseline_set = true;
-        last_cmd_target_yaw = 0.0f;
-        predictor_yaw.reset();
-    }
-
-    ctx_yaw.update_from_hist(wz_hist, wz_count, 5);
-    MotionState curr_state_yaw = next_motion_state(prev_state_yaw, ctx_yaw);
-    prev_state_yaw = curr_state_yaw;
-    predictor_yaw.update(wz, curr_state_yaw);
-
-    if (curr_state_yaw != prev_print_state_yaw) {
-        /* printf("[NRF-STATE] wz=%+.2f pred=%+.1f° | %s\n",
-               wz, predictor_yaw.pred_delta_yaw, motion_state_name(curr_state_yaw)); */
-        prev_print_state_yaw = curr_state_yaw;
-    }
-
-    bool is_stop_yaw = ctx_yaw.is_stop();
     float use_yaw = -rel_yaw;  // 极性修正
     float target_yaw_deg = is_stop_yaw ? use_yaw
                                        : predictor_yaw.get_target_yaw(use_yaw);
@@ -1132,8 +1173,8 @@ void nrf24_control_update(void)
         if (yaw_first_window) {
             yaw_should_cmd = true;
         } else if (is_stop_yaw) {
-            // 静止态直接掐死，不再发修正
-            yaw_should_cmd = false;
+            // 静止态也允许发令（供 PnP 零飘修正驱动机械臂微动）
+            yaw_should_cmd = true;
         } else {
             yaw_should_cmd = true;
             yaw_stop_cmd_sent = false;      // 头部重新运动，允许下次静止再发一次
@@ -1166,12 +1207,13 @@ void nrf24_control_update(void)
             cum_yaw_offset = -(float)M_PI / 2.0f;
 
         const float l1 = 8.0f;
-        const float l2 = 12.0f;
-        const float l3 = 52.0f;
-        const float l4 = 12.0f;
+        const float l2 = 5.0f;
+        const float l3 = 40.0f;
+        const float l4 = 28.0f;
+        float k = 1.6f;
         last_tx = l3 * std::sin(cum_yaw_offset) * std::cos(cum_pitch_offset);
         last_ty = l4 - l1 * std::sin(cum_pitch_offset) + l3 * std::cos(cum_pitch_offset) * std::cos(cum_yaw_offset);
-        last_tz = l2 + l1 * std::cos(cum_pitch_offset) + l3 * std::sin(cum_pitch_offset) * std::cos(cum_yaw_offset);
+        last_tz = l2 + l1 * std::cos(cum_pitch_offset * k) + l3 * std::sin(cum_pitch_offset * k) * std::cos(cum_yaw_offset);
 
         // 位置死区：坐标变化 < 2cm 不发令，抑制 Y 轴附近 atan2 敏感导致的微抖
         static float prev_sent_tx = 0.0f;
@@ -1198,34 +1240,41 @@ void nrf24_control_update(void)
             prev_sent_initialized = true;
         }
 
-        /* ========== 舵机控制 ========== */
-        // 俯仰舵机（J4）：0度=竖直向下，正度数向内(低头)，负度数向外(抬头)
+        /* ========== 舵机控制 ==========
+         * prediction（flag=0x00）时：坐标(tx,ty,tz)用预测值，但舵机保持上一次
+         * 实际停止态（flag=0x01）算出的角度，避免高频prediction导致舵机抖动。
+         */
         static const float SERVO1_BASELINE = 30.0f;
         static const float K_PITCH_SERVO = -1.2f;
 
-        float servo1 = SERVO1_BASELINE + K_PITCH_SERVO * delta_pitch_deg;
+        float curr_servo1 = SERVO1_BASELINE + K_PITCH_SERVO * delta_pitch_deg;
+        if (curr_servo1 > 90.0f)  curr_servo1 = 90.0f;
+        if (curr_servo1 < -90.0f) curr_servo1 = -90.0f;
 
-        // 限幅 -90~+90
-        if (servo1 > 90.0f)  servo1 = 90.0f;
-        if (servo1 < -90.0f) servo1 = -90.0f;
-
-        // 偏转舵机（J5）：50°正对面部，跟随偏航角
         static const float SERVO2_BASELINE = 50.0f;
-        static const float K_YAW_SERVO = 0.4f;   // 映射比例，反了改 -0.4f
+        static const float K_YAW_SERVO = 0.4f;
 
-        float servo2 = SERVO2_BASELINE + K_YAW_SERVO * delta_yaw_deg;
-
-        // 限幅 0~270°（280°舵机留余量）
-        if (servo2 > 270.0f) servo2 = 270.0f;
-        if (servo2 < 0.0f)   servo2 = 0.0f;
+        float curr_servo2 = SERVO2_BASELINE + K_YAW_SERVO * delta_yaw_deg;
+        if (curr_servo2 > 270.0f) curr_servo2 = 270.0f;
+        if (curr_servo2 < 0.0f)   curr_servo2 = 0.0f;
 
         bool is_prediction = false;
         if (pitch_should_cmd && !is_stop) is_prediction = true;
         if (yaw_should_cmd && !is_stop_yaw) is_prediction = true;
         uint8_t flag = is_prediction ? 0x00 : 0x01;
 
+        static float actual_servo1 = SERVO1_BASELINE;
+        static float actual_servo2 = SERVO2_BASELINE;
+        if (!is_prediction) {
+            actual_servo1 = curr_servo1;
+            actual_servo2 = curr_servo2;
+        }
+
+        float send_servo1 = is_prediction ? actual_servo1 : curr_servo1;
+        float send_servo2 = is_prediction ? actual_servo2 : curr_servo2;
+
         uart_send_arm_target(last_tx, last_ty, last_tz,
-                             servo2, servo1, flag);
+                             send_servo2, send_servo1, flag);
 
         if (pitch_should_cmd) {
             last_cmd_target_pitch = target_pitch_deg;
@@ -1295,7 +1344,26 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h,
     K.at<float>(0,2) *= scale_x;  // cx
     K.at<float>(1,2) *= scale_y;  // cy
 
-    if (image_points.size() < 4 || image_points.size() != object_points.size()) return;
+    // PnP 连续有效帧计数器：3 帧有效后通知 IMU 控制线程可做零飘修正
+    static int pnp_valid_cnt = 0;
+    auto pnp_fail = [&]() {
+        pnp_valid_cnt = 0;
+        pthread_mutex_lock(&g_nrf24_state.mutex);
+        g_nrf24_state.pnp_correction_ready = false;
+        pthread_mutex_unlock(&g_nrf24_state.mutex);
+    };
+    auto pnp_success = [&]() {
+        if (++pnp_valid_cnt >= 1) {
+            pthread_mutex_lock(&g_nrf24_state.mutex);
+            g_nrf24_state.pnp_correction_ready = true;
+            pthread_mutex_unlock(&g_nrf24_state.mutex);
+        }
+    };
+
+    if (image_points.size() < 4 || image_points.size() != object_points.size()) {
+        pnp_fail();
+        return;
+    }
 
     cv::Mat rvec, tvec;
     if (have_prev_pose) {
@@ -1306,7 +1374,10 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h,
                                 K, DIST_COEFFS,
                                 rvec, tvec, have_prev_pose,
                                 cv::SOLVEPNP_ITERATIVE);
-    if (!success) return;
+    if (!success) {
+        pnp_fail();
+        return;
+    }
 
     // 重投影误差检查：坏帧直接丢弃，防止 3D 框畸变
     std::vector<cv::Point2f> reproj_pts;
@@ -1334,6 +1405,7 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h,
         if (++bad_cnt % 30 == 0) {
             printf("[Pose] Bad frame skipped, reprojection error=%.1fpx\n", reproj_error);
         }
+        pnp_fail();
         return;
     }
 
@@ -1343,6 +1415,7 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h,
         if (++mirror_cnt % 30 == 0) {
             printf("[Pose] Mirror solution detected (tz=%.1f), dropped\n", tvec.at<double>(2));
         }
+        pnp_fail();
         return;
     }
 
@@ -1499,6 +1572,16 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h,
     double hp_deg = head_pitch * 180.0 / M_PI;
     double hy_deg = head_yaw * 180.0 / M_PI;
     double hr_deg = head_roll * 180.0 / M_PI;
+
+    // PnP → IMU 控制：直接用屏幕上显示的欧拉角值，由 IMU 控制线程自行缩放
+    pthread_mutex_lock(&g_nrf24_state.mutex);
+    g_nrf24_state.pnp_yaw_correction   = (float)(hy_deg - 14.0);
+    g_nrf24_state.pnp_pitch_correction = (float)hp_deg;
+    g_nrf24_state.pnp_valid = true;
+    pthread_mutex_unlock(&g_nrf24_state.mutex);
+
+    pnp_success();
+
     double pye_deg = pos_yaw_err * 180.0 / M_PI;
     double ppe_deg = pos_pitch_err * 180.0 / M_PI;
     (void)hp_deg; (void)hy_deg; (void)hr_deg; (void)pye_deg; (void)ppe_deg;

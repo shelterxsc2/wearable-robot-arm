@@ -242,12 +242,12 @@ int uart_send_raw(const uint8_t* data, size_t len)
         return -1;
     }
 
-    printf("[UART-TX] (%zu bytes):", len);
+    /* printf("[UART-TX] (%zu bytes):", len);
     for (size_t i = 0; i < len && i < 32; ++i) {
         printf(" %02X", data[i]);
     }
     if (len > 32) printf(" ...");
-    printf("\n");
+    printf("\n"); */
     ssize_t w = write(g_uart_fd, data, len);
     if ((size_t)w != len) {
         fprintf(stderr, "[UART] write failed: %zd/%zu (%s)\n", w, len, strerror(errno));

@@ -24,6 +24,7 @@
 #include "bluetooth_spp.h"
 #include "uart_comm.h"
 #include "nrf24_linux.h"
+#include "imu2_i2c.h"
 #include "gst_rtmp.h"
 #include <sys/wait.h>
 
@@ -52,6 +53,8 @@ static void stop_rule_engine(void) {
 static gboolean g_running = TRUE;
 static pthread_t g_nrf24_tid = 0;
 static int g_nrf24_enabled = 0;
+static pthread_t g_imu2_tid = 0;
+static int g_imu2_enabled = 0;
 static GMainLoop *g_loop = NULL;
 static volatile sig_atomic_t g_should_quit = 0;
 static volatile sig_atomic_t g_ws_ready = 0;
@@ -235,14 +238,14 @@ static void *ws_worker_thread(void *arg) {
     return NULL;
 }
 
-/* 握手线程信号：置1后 nrf24_control_update() 在下一帧 IMU 时捕获 R_init */
+/* 握手线程信号：置1后 RX 线程收集 5 帧 IMU 算平均，再构造 R_init */
 volatile int g_wait_a_init = 0;
 
 /* ========== 上位机-下位机握手线程（阻塞式）==========
  * 1. 阻塞等待 "init success"
  * 2. 发送 FF 验证帧
  * 3. 阻塞等待 move_complete（下位机归位完成）
- * 4. 等下一帧 IMU 做 A-init（g_wait_a_init = 1）
+ * 4. 等 5 帧 IMU 算平均做 A-init（g_wait_a_init = 1）
  * 5. 进入 NORMAL，开始 UART-Tx
  */
 static void* handshake_thread(void* arg) {
@@ -268,9 +271,9 @@ static void* handshake_thread(void* arg) {
     g_uart_block_tx = 0;
     printf("[Handshake] 7s homing wait done.\n");
 
-    // 4. A-init：等下一帧 IMU
+    // 4. A-init：等 RX 线程收集 5 帧 IMU 算平均
     g_wait_a_init = 1;
-    printf("[Handshake] Waiting for next IMU frame for A-init...\n");
+    printf("[Handshake] Waiting for 5 IMU frames avg for A-init...\n");
     while (!g_r_init_set) {
         usleep(10000);
     }
@@ -381,6 +384,19 @@ int main(int argc, char *argv[]) {
         printf("[Main] NRF24 init failed, continuing without it\n");
     }
 
+    // 8.5 启动板载IMU2 I2C采样线程 (I2C4, 100 Hz)
+    if (imu2_i2c_init() == 0) {
+        if (imu2_i2c_thread_start(&g_imu2_tid) == 0) {
+            g_imu2_enabled = 1;
+            printf("[Main] IMU2 I2C thread started (100 Hz)\n");
+        } else {
+            imu2_i2c_deinit();
+            printf("[Main] IMU2 I2C thread start failed, continuing without it\n");
+        }
+    } else {
+        printf("[Main] IMU2 I2C init failed, continuing without it\n");
+    }
+
     // 9. 探测云服务器并选择推流模式
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigint_handler);
@@ -475,6 +491,11 @@ int main(int argc, char *argv[]) {
         pthread_join(g_nrf24_tid, NULL);
         nrf24_linux_deinit();
         printf("[Main] NRF24 stopped\n");
+    }
+    if (g_imu2_enabled) {
+        imu2_i2c_thread_stop();
+        imu2_i2c_deinit();
+        printf("[Main] IMU2 I2C stopped\n");
     }
     uart_cleanup();
     bluetooth_spp_stop();

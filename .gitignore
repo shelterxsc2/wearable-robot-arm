@@ -18,6 +18,11 @@ calib_result.png
 /tmp/
 sudo
 *.log
+cmd.txt
+
+# Python
+__pycache__/
+*.pyc
 
 # IDE
 .vscode/

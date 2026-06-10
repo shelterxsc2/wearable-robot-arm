@@ -104,6 +104,11 @@ typedef struct {
     float gy_wy;
     float gy_wz;
     bool  imu_valid;                        /* checksum + header passed */
+    /* PnP 视觉修正量（度），由视觉线程写入，IMU 控制线程读取 */
+    float pnp_yaw_correction;
+    float pnp_pitch_correction;
+    bool  pnp_valid;
+    bool  pnp_correction_ready;             /* 连续 3 帧 PnP 有效，可执行零飘修正 */
     /* 角加速度循环缓冲区 (deg/s^2) */
     float gy_ast_buf[NRF24_AST_BUF_SIZE];   /* 最近 N 次角加速度 */
     int   gy_ast_idx;                       /* 下一次写入位置 */

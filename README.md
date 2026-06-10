@@ -1,13 +1,14 @@
 # 可穿戴机械臂 — `imu-victor-hat` 分支
 
 > **分支**: `imu-victor-hat`  
+> **标签**: `imu-pnp-fuse1.0` — PnP 视觉零飘修正闭环首次集成  
 > **核心路径**: NRF24 无线 IMU → A-inverse 矩阵解耦 → 8 状态运动预测/终点预测 → 11 字节 UART(flag=0x00/0x01) → STM32  
 > **视觉链路**: 两阶段 NPU 推理（Body → ROI → Face 468 landmarks）+ Python Socket RuleEngine v2  
 > **RuleEngine**: 基于 `rule_engine_v2.rknn`，输入 20 关键点 + bbox + valid_mask + 7 状态反馈  
 > **本分支重点**: 
+> - **imu-pnp-fuse1.0 新增**：PnP 视觉零飘修正闭环（静止态绝对值积分，R_bias_total 累积修正矩阵）
 > - NRF24 IMU 控制：运动学公式重构(l1~l4)、发令策略分化、舵机映射、位置死区、flag标志位
-> - 握手时序重构：`g_uart_block_tx` 延时拦截 + A-init
-> - 视觉 PnP 精调闭环规划（静止态偏差补偿）
+> - 握手时序重构：`g_uart_block_tx` 延时拦截 + A-init（5帧平均）
 > - 云端 LL-HLS 监控系统对接
 > **云端交互**: WebSocket 注册 + 心跳 + LL-HLS 低延迟直播 (~3s)  
 > **端侧控制**: HTTP API @ 8080
@@ -207,24 +208,31 @@ models/             # RKNN 模型（best.rknn / face_landmark_468_fp16.rknn / ru
 ```
 tx = l3·sin(yaw)·cos(pitch)
 ty = l4 - l1·sin(pitch) + l3·cos(pitch)·cos(yaw)
-tz = l2 + l1·cos(pitch) + l3·sin(pitch)·cos(yaw)
+tz = k·(l2 + l1·cos(pitch) + l3·sin(pitch)·cos(yaw))
 ```
-当前参数：`l1=8`, `l2=12`, `l3=52`, `l4=12`（单位 cm）
+当前参数：`l1=8`, `l2=5`, `l3=40`, `l4=28`, `k=1.6`（单位 cm）
 
 ### 4. 舵机映射（新定义）
 - J4 俯仰：`servo1 = 30 + (-1.2)·Δpitch`，限幅 [-90°, +90°]
 - J5 水平：`servo2 = 50 + 0.4·Δyaw`，限幅 [0°, 270°]
 - 0° = 竖直向下，正 = 向内（低头），负 = 向外（抬头）
 
-### 5. 发令策略分化
-- **Yaw**：只在 `STATE_ACCEL_TO_CONST` 主窗口发一次预测令；静止态掐死不发
+### 5. PnP 视觉零飘修正闭环（imu-pnp-fuse1.0 新增）
+- **PnP 解算**：Face 468 landmarks → `solvePnP` → 提取 head yaw/pitch（屏幕显示欧拉角）
+- **偏移校准**：`pnp_yaw_correction = hy_deg - 14.0`（安装偏角补偿）
+- **静止态触发**：`is_stop && is_stop_yaw` 且 PnP 连续有效时执行修正
+- **修正策略**：绝对值积分 `yaw_delta = -KI_PNP · pnp_yaw_correction`，`KI_PNP = 0.25`
+- **累积矩阵**：`R_bias_total = R_delta × R_bias_total`，左乘在 IMU 当前姿态上
+- **Pitch 修正**：当前关闭（`pitch_delta = 0`）
+- **静止态发令**：Yaw 静止态不再掐死，允许 PnP 修正驱动机械臂微动
+
+### 6. 发令策略分化
+- **Yaw**：`STATE_ACCEL_TO_CONST` 主窗口发一次预测令；静止态允许发令（供 PnP 修正微动）
 - **Pitch**：主窗口/第二窗口/静止态均发令（保持微调能力）
 
-### 6. 视觉 PnP 精调闭环（规划中）
-- 头部静止后（`g_arm_stable=1`），启动 PnP 偏差补偿
-- `|pnp_yaw - target_yaw| > 2°` 时触发微调
-- 视觉增益 0.5，限幅 ±10°
-- 仅修正，不替代 IMU 主控制链路
+### 7. A-init 改进（5帧平均）
+- RX 线程在 10ms 高频下收集 5 帧 IMU 数据算平均
+- 相比单帧捕获，显著降低初始姿态抖动
 
 ---
 
@@ -238,14 +246,26 @@ tz = l2 + l1·cos(pitch) + l3·sin(pitch)·cos(yaw)
 6. **俯仰极性偶发反转**：A-init 时头部姿态不同导致矩阵解耦符号不稳
 7. **云-端控制协议割裂**：云端离散状态(x,y,z)，端侧连续坐标(tx,ty,tz)
 8. **云端延迟**：RTMP ~3s，WebSocket 100ms
+9. **PnP 绝对值积分漂移**：当前 `yaw_delta = KI·pnp_yaw` 是对绝对角度积分，非误差积分，Pnp 绝对值非零时 R_bias_total 会持续累积（预期行为）
+10. **PnP 单帧即触发**：当前 `pnp_valid_cnt >= 1` 即置 `correction_ready`，未做连续多帧一致性过滤
 
 ---
 
+## 版本历史
+
+### `imu-pnp-fuse1.0` (当前)
+- PnP 视觉零飘修正闭环首次集成
+- A-init 改进为 5 帧平均
+- 运动学参数调整为 `l1=8, l2=5, l3=40, l4=28, k=1.6`
+- PnP 偏移链路简化（删除旋转矩阵偏移，直接用欧拉角）
+- UART 打印精简
+
 ## 下一步
 
+- PnP 修正策略优化（误差积分替代绝对值积分）
+- PnP 连续多帧一致性过滤（避免单帧噪声触发修正）
 - J4 舵机标定上机实测
 - Body 模型优化（轻量化突破帧率瓶颈）
 - 下位机回传关节角（UART 双向通信）
-- 视觉 PnP 精调闭环集成
 - 云-端协议统一（离散状态 vs 连续坐标融合）
 - 参数热加载

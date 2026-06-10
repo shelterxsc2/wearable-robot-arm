@@ -37,6 +37,10 @@ nrf24_shared_state_t g_nrf24_state = {
     .gy_wy      = 0.0f,
     .gy_wz      = 0.0f,
     .imu_valid  = false,
+    .pnp_yaw_correction   = 0.0f,
+    .pnp_pitch_correction = 0.0f,
+    .pnp_valid            = false,
+    .pnp_correction_ready = false,
     .gy_ast_idx = 0,
     .gy_ast_count = 0,
     .gy_wz_hist = {0},
@@ -48,6 +52,10 @@ nrf24_shared_state_t g_nrf24_state = {
 };
 
 volatile int g_nrf24_running = 0;
+
+/* A-init 信号与完成标志（定义在 main.cpp / rga_npu.cpp） */
+extern volatile int g_wait_a_init;
+extern volatile int g_r_init_set;
 
 /* ======================================================================== */
 /*  Sysfs GPIO helpers                                                      */
@@ -331,12 +339,12 @@ int nrf24_linux_init(void)
     uint8_t reg_setup_retr = nrf24_read_reg(NRF24_REG_SETUP_RETR);
     uint8_t reg_fifo_status = nrf24_read_reg(0x17);
 
-    /* printf("[NRF24] Init OK. SPI=%s, CE=GPIO%d, IRQ=GPIO%d\n",
-           NRF24_SPIDEV_PATH, g_ce_gpio, g_irq_gpio); */
-    /* printf("[NRF24] REG DUMP: CONFIG=0x%02X RF_CH=0x%02X RF_SETUP=0x%02X "
+    printf("[NRF24] Init OK. SPI=%s, CE=GPIO%d, IRQ=GPIO%d\n",
+           NRF24_SPIDEV_PATH, g_ce_gpio, g_irq_gpio);
+    printf("[NRF24] REG DUMP: CONFIG=0x%02X RF_CH=0x%02X RF_SETUP=0x%02X "
            "RX_PW_P0=0x%02X EN_AA=0x%02X SETUP_RETR=0x%02X FIFO=0x%02X\n",
            config, reg_rf_ch, reg_rf_setup, reg_rx_pw, reg_en_aa,
-           reg_setup_retr, reg_fifo_status); */
+           reg_setup_retr, reg_fifo_status);
     if ((config & 0x02) == 0) {
         fprintf(stderr, "[NRF24] WARNING: PWR_UP bit not set. Wiring issue?\n");
     }
@@ -442,7 +450,7 @@ static bool nrf24_parse_22b(const uint8_t* buf,
 static void* nrf24_rx_thread_func(void* arg)
 {
     (void)arg;
-    /* printf("[NRF24] RX thread started (poll mode, no IRQ)\n"); */
+    printf("[NRF24] RX thread started (poll mode, no IRQ)\n");
 
     /* Rate stats */
     uint32_t loop_frames = 0;
@@ -456,6 +464,7 @@ static void* nrf24_rx_thread_func(void* arg)
     clock_gettime(CLOCK_MONOTONIC, &ts_prev_ast);
 
     int diag_cnt = 0;
+    int print_cnt = 0;
     while (g_nrf24_running) {
         /* Poll STATUS register every 5 ms */
         uint8_t status = nrf24_read_reg(NRF24_REG_STATUS);
@@ -524,17 +533,42 @@ static void* nrf24_rx_thread_func(void* arg)
                 g_nrf24_state.data_ready = true;
                 g_nrf24_state.rx_count++;
                 if (valid) {
-                    g_nrf24_state.gy_roll  = roll;
-                    g_nrf24_state.gy_pitch = pitch;
-                    g_nrf24_state.gy_yaw   = yaw;
+                    float store_roll = roll, store_pitch = pitch, store_yaw = yaw;
+
+                    /* A-init：握手线程已发信号，收集 5 帧算平均 */
+                    if (g_wait_a_init && !g_r_init_set) {
+                        static float acc_roll = 0.0f, acc_pitch = 0.0f, acc_yaw = 0.0f;
+                        static int acc_count = 0;
+
+                        acc_roll  += roll;
+                        acc_pitch += pitch;
+                        acc_yaw   += yaw;
+                        acc_count++;
+
+                        if (acc_count >= 5) {
+                            store_roll  = acc_roll  / 5.0f;
+                            store_pitch = acc_pitch / 5.0f;
+                            store_yaw   = acc_yaw   / 5.0f;
+                            printf("[A-INIT] 5-frame avg captured: roll=%.2f pitch=%.2f yaw=%.2f\n",
+                                   store_roll, store_pitch, store_yaw);
+                            g_r_init_set = 1;
+                            g_wait_a_init = 0;
+                            acc_roll = acc_pitch = acc_yaw = 0.0f;
+                            acc_count = 0;
+                        }
+                    }
+
+                    g_nrf24_state.gy_roll  = store_roll;
+                    g_nrf24_state.gy_pitch = store_pitch;
+                    g_nrf24_state.gy_yaw   = store_yaw;
                     g_nrf24_state.gy_wx    = wx;
                     g_nrf24_state.gy_wy    = wy;
                     g_nrf24_state.gy_wz    = wz;
                     g_nrf24_state.imu_valid = true;
                     /* 记录角度历史 */
-                    g_nrf24_state.gy_roll_hist[g_nrf24_state.gy_angle_idx] = roll;
-                    g_nrf24_state.gy_pitch_hist[g_nrf24_state.gy_angle_idx] = pitch;
-                    g_nrf24_state.gy_yaw_hist[g_nrf24_state.gy_angle_idx] = yaw;
+                    g_nrf24_state.gy_roll_hist[g_nrf24_state.gy_angle_idx] = store_roll;
+                    g_nrf24_state.gy_pitch_hist[g_nrf24_state.gy_angle_idx] = store_pitch;
+                    g_nrf24_state.gy_yaw_hist[g_nrf24_state.gy_angle_idx] = store_yaw;
                     g_nrf24_state.gy_angle_idx = (g_nrf24_state.gy_angle_idx + 1) % NRF24_ANGLE_HIST_SIZE;
                     if (g_nrf24_state.gy_angle_count < NRF24_ANGLE_HIST_SIZE)
                         g_nrf24_state.gy_angle_count++;
@@ -553,6 +587,18 @@ static void* nrf24_rx_thread_func(void* arg)
                     g_nrf24_state.gy_wx_idx = (g_nrf24_state.gy_wx_idx + 1) % NRF24_WX_HIST_SIZE;
                     if (g_nrf24_state.gy_wx_count < NRF24_WX_HIST_SIZE)
                         g_nrf24_state.gy_wx_count++;
+
+                    static int first_frame = 1;
+                    if (first_frame) {
+                        first_frame = 0;
+                        printf("[NRF24] First valid frame received!\n");
+                    }
+                    print_cnt++;
+                    if (print_cnt >= 10) {
+                        print_cnt = 0;
+                        printf("[NRF24] GYRO(%.2f,%.2f,%.2f) ANGLE(%.2f,%.2f,%.2f)\n",
+                               wx, wy, wz, roll, pitch, yaw);
+                    }
                 } else {
                     g_nrf24_state.error_count++;
                     g_nrf24_state.imu_valid = false;

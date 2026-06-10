@@ -6,6 +6,8 @@
 
 本分支是在 `imu-newbi-hat` 基础上，针对 **NRF24 IMU 控制机械臂**进行协议升级和代码精简的版本。重点看 NRF24 IMU 控制链路的改动（g_uart_block_tx 延时拦截、11字节 UART 协议 flag=0x00/0x01、运动学参数化 l1~l4、舵机基线30°、打印精简、视觉 PnP 精调规划、云端系统对接），视觉链路和 RuleEngine v2 基本继承前序分支。
 
+> **短期改动方向集中提示**：用户当前的迭代重心集中在 **IMU 数据获取 → 处理 → 最终通过 UART 发送给下位机的完整链路**。后续对话中，应优先精读该链路的源码（`nrf24_linux.c`、`rga_npu.cpp` 中的 `nrf24_control_update()`、`uart_comm.cpp`），对视觉链路、RuleEngine、云端系统只需了解接口和状态，不必深入展开。下位机(STM32)代码仓库 `wearable-robot-arm` / `imu-main-test` 已同步拉取至本地最新版。
+
 # 需要读取的文件
 
 ## 1. docs/project-summary-for-chatgpt.md
@@ -222,18 +224,34 @@ Bluetooth SPP stub。重点看：
 11. **最新进度**：相比 `imu-newbi-hat`，`imu-victor-hat` 改动了什么关键逻辑？
     - UART 协议升级：10字节 → 11字节（新增 flag=0x00/0x01）
     - `g_uart_block_tx` 替代 `g_host_state`：简化延时拦截逻辑
-    - 运动学公式参数化：l1=8, l2=12, l3=52, l4=12
+    - 运动学公式参数化：l1=8, l2=5, l3=40, l4=28, k=1.6
     - 舵机基线改为 30°，限幅 [-90°, +90°]
-    - 打印精简：`[UART-RX]` 只存 `/tmp/cmd`，`[NRF-STATE]` 全部注释
-    - 视觉 PnP 精调闭环规划（静止态偏差补偿，增益0.5，阈值2°）
+    - 打印精简：`[UART-RX]` 只存 `/tmp/cmd`，`[NRF-STATE]` 全部注释，`[UART-TX]` 打印关闭
+    - **imu-pnp-fuse1.0**：PnP 视觉零飘修正闭环集成
+      - PnP 解算人脸姿态 → 提取 yaw/pitch → 写入共享状态
+      - 静止态（`is_stop && is_stop_yaw`）触发修正
+      - 绝对值积分策略：`yaw_delta = -KI_PNP · pnp_yaw_correction`，`KI_PNP = 0.25`
+      - `R_bias_total` 累积修正矩阵，左乘在 IMU 当前姿态上
+      - 静止态 yaw 发令放开，允许 PnP 驱动机械臂微动
+      - PnP 偏移简化：删除旋转矩阵偏移，直接用屏幕显示欧拉角 `hy_deg - 14.0`
+      - pitch 修正当前关闭
+    - A-init 改进：RX 线程 5 帧平均替代单帧捕获
     - 云端监控系统对接（LL-HLS、WebSocket、HTTP API）
 12. **下一步**：
+    - PnP 修正策略优化（误差积分替代绝对值积分）
+    - PnP 连续多帧一致性过滤
     - J4 舵机标定上机实测
-    - 视觉 PnP 精调闭环集成与精度验证
+    - Body 模型优化（轻量化突破帧率瓶颈）
     - 云-端协议统一（离散状态 vs 连续坐标融合）
     - 下位机回传关节角（UART 双向通信）
 
 要求：简明扼要，不要大段粘贴代码，用工程师能理解的语言总结。重点突出 `imu-victor-hat` 相比 `imu-newbi-hat` 的核心变化（11字节协议、flag标志位、g_uart_block_tx、参数化运动学、舵机基线30°、打印精简、视觉PnP规划、云端对接）。
 
-重要注意事项：每次修改完代码后执行以下命令进行编译，但是不要运行：
+---
+
+## 对话纪律（Agent 行为约束）
+
+1. **IMU 链路优先原则**：用户当前迭代重心明确在 **IMU 数据获取 → 处理 → UART 发送给下位机** 的完整链路。后续对话中，除非用户主动要求，否则**不要无差别精读视觉链路、RuleEngine、云端系统的源码**。对非 IMU 模块只需了解接口状态，不做深入展开。
+2. **全量读取必须用 Agent**：如果确实需要同时阅读大量文件（>3 个）做全局摸底，应启动 `subagent_type="explore"` 并行读取并返回摘要，**主对话只聚焦 IMU 控制链路源码**（`nrf24_linux.c`、`rga_npu.cpp` 中的 `nrf24_control_update()`、`uart_comm.cpp`），不浪费上下文在无关模块的细节上。
+3. **编译验证**：每次修改完代码后执行以下命令进行编译，但是不要运行：
 cd /home/elf/work/twice && g++ -std=c++17 -O2 src/main.cpp src/rga_npu.cpp src/gst_rtsp.cpp src/gst_rtmp.cpp src/stream_manager.cpp src/ctrl_server.cpp src/ws_client.cpp src/uart_comm.cpp src/wifi.cpp src/nrf24_linux.c src/bt_stub.c -o build/cc $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtsp-server-1.0) -I/usr/include/opencv4 -lopencv_core -lopencv_imgproc -lopencv_calib3d -lrknnrt -lrga -lwpa_client -lpthread 2>&1 | grep -E 'error:|build/cc' || echo "编译完成"
