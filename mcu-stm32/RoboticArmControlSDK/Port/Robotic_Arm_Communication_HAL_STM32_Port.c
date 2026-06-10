@@ -137,12 +137,6 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
             LK4005_Motor_Handle[1].Motor_Position_Target = -4.0f * (upper_joint + 0.17f);     //大臂：电机轴 = -4×关节角
             LK4005_Motor_Handle[2].Motor_Position_Target =  2.0f * (fore_joint + 0.17f);      //小臂：电机轴 =  2×关节角
 
-            /* 解析第11字节指令类型: 0x00=预测, 0x01=最终确认 */
-            uint8_t cmd_type = Usart_Used0_Rx_Buff[10];
-            LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.cmd_type = cmd_type;
-            LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.cmd_type = cmd_type;
-            LK4005_Motor_Handle[2].Motor_Speed_Plan_Handle.cmd_type = cmd_type;
-
             LK4005_Motor_Handle[1].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
             LK4005_Motor_Handle[2].Motor_Speed_Plan_Handle.Speed_Plan_State = init;
             LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.Speed_Plan_State = init;

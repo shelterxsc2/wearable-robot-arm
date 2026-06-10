@@ -122,13 +122,16 @@ int main(void)
       {
         vofa_last_tick = vofa_now;
 
-        float vofa_buf[4];
+        float vofa_buf[7];
         Speed_Plan_Handle_t *sp = &LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle;
 
         vofa_buf[0] = sp->s;        /* planned displacement */
         vofa_buf[1] = sp->v;        /* planned velocity */
         vofa_buf[2] = sp->a;        /* planned acceleration */
-        vofa_buf[3] = INFINITY;     /* tail: 0x00 0x00 0x80 0x7F */
+        vofa_buf[3] = LK4005_Motor_Handle[0].Motor_Position_Target;
+        vofa_buf[4] = LK4005_Motor_Handle[0].Motor_Position_PID_Control_Handle.Motor_Position_Actual;
+        vofa_buf[5] = LK4005_Motor_Handle[0].Motor_Speed_Plan_Handle.error_s;
+        vofa_buf[6] = INFINITY;     /* tail: 0x00 0x00 0x80 0x7F */
 
         HAL_UART_Transmit(&huart1, (uint8_t *)vofa_buf, sizeof(vofa_buf), 5);
       }

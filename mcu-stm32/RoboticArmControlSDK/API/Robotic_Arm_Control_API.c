@@ -295,7 +295,7 @@ void Robotic_Arm_Control(void)
             }
             break;
         case RETRACT_SEQ_UPPER_FIRST:
-            if (Is_Motor_Arrived(1, 0.1f))
+            if (Is_Motor_Arrived(1, 0.25f))
             {
                 /* 大臂电机到达6.28 rad后，小臂电机转动到12 rad */
                 LK4005_Motor_Handle[2].Motor_Position_Target = 12.0f;
