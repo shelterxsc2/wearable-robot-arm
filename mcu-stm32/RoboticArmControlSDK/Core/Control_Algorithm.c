@@ -218,6 +218,10 @@ void Speed_Plan_Update(Speed_Plan_Handle_t *sp, float position_actual, float pos
                 sp->position_initial = position_actual;
             }
         }
+        else
+        {
+            sp->position_initial = position_actual;
+        }
 
         sp->s = 0.0f;
         sp->a = 0.0f;
