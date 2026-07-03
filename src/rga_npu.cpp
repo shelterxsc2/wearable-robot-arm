@@ -173,11 +173,11 @@ static const PnpYawCalibrationPoint PNP_YAW_CALIBRATION_L3_55[] = {
 };
 
 static const PnpPitchCalibrationPoint PNP_PITCH_CALIBRATION_L3_55[] = {
-    {-30.0f, -8.9463f},
-    {-15.0f, -2.9546f},
-    {  0.0f, -6.3915f},
-    { 15.0f, -6.1471f},
-    { 30.0f, -9.5954f}
+    {-30.0f, -4.9463f},
+    {-15.0f,  1.0454f},
+    {  0.0f, -2.3915f},
+    { 15.0f, -2.1471f},
+    { 30.0f, -5.5954f}
 };
 
 struct ArmKinematicsProfile {
@@ -219,9 +219,9 @@ static const ArmKinematicsProfile ARM_PROFILES[] = {
     {
         "far_l3_55",
         11.08f, 6.92f, 55.0f, 28.0f, 1.6f,
-        65.0f, 0.5f, 1.65f,
+        65.0f, -0.5f, -1.65f,
         50.0f, 0.2f,
-        -1,
+        1,
         PNP_YAW_CALIBRATION_L3_55,
         (int)(sizeof(PNP_YAW_CALIBRATION_L3_55) / sizeof(PNP_YAW_CALIBRATION_L3_55[0])),
         PNP_PITCH_CALIBRATION_L3_55,
@@ -229,7 +229,7 @@ static const ArmKinematicsProfile ARM_PROFILES[] = {
     }
 };
 
-static std::atomic<int> g_arm_profile{ARM_PROFILE_MID_L3_40};
+static std::atomic<int> g_arm_profile{ARM_PROFILE_FAR_L3_55};
 
 static const ArmKinematicsProfile& current_arm_profile(void) {
     int id = g_arm_profile.load();
@@ -1996,8 +1996,8 @@ void nrf24_control_update(void)
         std::min(1.0f, std::fabs(yaw_control_deg) / PITCH_BIAS_FULL_YAW_DEG);
     pitch_bias_yaw_weight = 0.5f + 0.5f * pitch_bias_yaw_weight;
     effective_pitch_visual_bias_deg = pitch_visual_bias_deg * pitch_bias_yaw_weight;
-    const float PITCH_POS_FADE_START_YAW_DEG = 60.0f;
-    const float PITCH_POS_FADE_END_YAW_DEG = 80.0f;
+    const float PITCH_POS_FADE_START_YAW_DEG = 45.0f;
+    const float PITCH_POS_FADE_END_YAW_DEG = 60.0f;
     float pitch_position_weight = 1.0f;
     float pitch_route_yaw_abs = std::fabs(yaw_control_deg);
     if (pitch_route_yaw_abs > PITCH_POS_FADE_START_YAW_DEG) {
