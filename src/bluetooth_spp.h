@@ -14,8 +14,8 @@ extern "C" {
 int bluetooth_spp_init(void);
 
 /**
- * 启动蓝牙 BLE GATT 连接线程（阻塞直到首次连接成功）
- * 线程内循环: 连接 BT24 -> 轮询 ReadValue -> 解析指令 -> 调用 set_pose_mode()
+ * 启动蓝牙 BLE GATT 后台连接线程
+ * 线程内循环: 连接 HC-08 -> 接收 FFE1 通知/轮询 ReadValue -> 解析三字节遥控协议
  * 返回 0 成功，-1 失败
  */
 int bluetooth_spp_start(void);

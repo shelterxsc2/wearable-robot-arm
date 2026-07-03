@@ -184,10 +184,11 @@ UART 回环测试工具。重点看：
 - 发送/接收比对逻辑
 - 多组测试数据 + 1KB 压力测试
 
-## 19. src/bt_stub.c
-Bluetooth SPP stub。重点看：
-- 为何替换 `bluetooth_spp.c`（避免 dbus 依赖）
-- 提供的空实现接口
+## 19. src/bluetooth_spp.c
+BLE HC-08 遥控器客户端。重点看：
+- 目标设备 `HC-08 / F8:2E:0C:E3:99:C8`
+- FFE0/FFE1 透传 characteristic 连接和后台重连逻辑
+- 三字节遥控协议：`55 01` 切 L3 profile，`55 02` 情景预留，`55 03` 反转 IMU pitch 极性
 
 # 输出要求
 
@@ -260,4 +261,4 @@ Bluetooth SPP stub。重点看：
 1. **IMU 链路优先原则**：用户当前迭代重心明确在 **IMU 数据获取 → 处理 → UART 发送给下位机** 的完整链路。后续对话中，除非用户主动要求，否则**不要无差别精读视觉链路、RuleEngine、云端系统的源码**。对非 IMU 模块只需了解接口状态，不做深入展开。
 2. **全量读取必须用 Agent**：如果确实需要同时阅读大量文件（>3 个）做全局摸底，应启动 `subagent_type="explore"` 并行读取并返回摘要，**主对话只聚焦 IMU 控制链路源码**（`nrf24_linux.c`、`rga_npu.cpp` 中的 `nrf24_control_update()`、`uart_comm.cpp`），不浪费上下文在无关模块的细节上。
 3. **编译验证**：每次修改完代码后执行以下命令进行编译，但是不要运行：
-cd /home/elf/work/twice && g++ -std=c++17 -O2 src/main.cpp src/rga_npu.cpp src/gst_rtsp.cpp src/gst_rtmp.cpp src/stream_manager.cpp src/ctrl_server.cpp src/ws_client.cpp src/uart_comm.cpp src/wifi.cpp src/nrf24_linux.c src/imu2_i2c.c src/bt_stub.c -o build/cc $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtsp-server-1.0) -I/usr/include/opencv4 -lopencv_core -lopencv_imgproc -lopencv_calib3d -lrknnrt -lrga -lwpa_client -lpthread 2>&1 | grep -E 'error:|build/cc' || echo "编译完成"
+cd /home/elf/work/twice && g++ -std=c++17 -O2 src/main.cpp src/rga_npu.cpp src/gst_rtsp.cpp src/gst_rtmp.cpp src/stream_manager.cpp src/ctrl_server.cpp src/ws_client.cpp src/uart_comm.cpp src/wifi.cpp src/nrf24_linux.c src/imu2_i2c.c src/bluetooth_spp.c -o build/cc $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtsp-server-1.0 dbus-1) -I/usr/include/opencv4 -lopencv_core -lopencv_imgproc -lopencv_calib3d -lrknnrt -lrga -lwpa_client -lpthread 2>&1 | grep -E 'error:|build/cc' || echo "编译完成"

@@ -193,6 +193,8 @@ struct ArmKinematicsProfile {
     float servo2_baseline;
     float servo2_yaw_gain;
     int position_pitch_sign;
+    float pitch_pos_fade_start_yaw_deg;
+    float pitch_pos_fade_end_yaw_deg;
     const PnpYawCalibrationPoint *yaw_calib;
     int yaw_calib_count;
     const PnpPitchCalibrationPoint *pitch_calib;
@@ -210,7 +212,7 @@ static const ArmKinematicsProfile ARM_PROFILES[] = {
         8.0f, 5.0f, 40.0f, 28.0f, 1.6f,
         55.0f, -0.8f, -1.65f,
         50.0f, 0.2f,
-        1,
+        1, 60.0f, 80.0f,
         PNP_YAW_CALIBRATION_L3_40,
         (int)(sizeof(PNP_YAW_CALIBRATION_L3_40) / sizeof(PNP_YAW_CALIBRATION_L3_40[0])),
         PNP_PITCH_CALIBRATION_L3_40,
@@ -221,7 +223,7 @@ static const ArmKinematicsProfile ARM_PROFILES[] = {
         11.08f, 6.92f, 55.0f, 28.0f, 1.6f,
         65.0f, -0.5f, -1.65f,
         50.0f, 0.2f,
-        1,
+        1, 45.0f, 60.0f,
         PNP_YAW_CALIBRATION_L3_55,
         (int)(sizeof(PNP_YAW_CALIBRATION_L3_55) / sizeof(PNP_YAW_CALIBRATION_L3_55[0])),
         PNP_PITCH_CALIBRATION_L3_55,
@@ -230,6 +232,7 @@ static const ArmKinematicsProfile ARM_PROFILES[] = {
 };
 
 static std::atomic<int> g_arm_profile{ARM_PROFILE_FAR_L3_55};
+static std::atomic<int> g_head_pitch_control_sign{1};
 
 static const ArmKinematicsProfile& current_arm_profile(void) {
     int id = g_arm_profile.load();
@@ -297,6 +300,12 @@ static float interpolate_pnp_pitch_compensation(float arm_pitch_deg) {
     return interpolate_pnp_pitch_table(profile.pitch_calib,
                                        profile.pitch_calib_count,
                                        arm_pitch_deg);
+}
+
+static inline float clamp01(float v) {
+    if (v < 0.0f) return 0.0f;
+    if (v > 1.0f) return 1.0f;
+    return v;
 }
 
 static int read_calib_mode(void) {
@@ -1885,7 +1894,7 @@ void nrf24_control_update(void)
                rel_roll, rel_pitch, rel_yaw);
     }
 
-    float pitch_control_deg = vec_pitch;
+    float pitch_control_deg = (float)g_head_pitch_control_sign.load() * vec_pitch;
     float yaw_control_deg = vec_yaw;
 
     /* 基准标定（A-inverse 后初始姿态已归零，标量 baseline 不再需要） */
@@ -1996,16 +2005,18 @@ void nrf24_control_update(void)
         std::min(1.0f, std::fabs(yaw_control_deg) / PITCH_BIAS_FULL_YAW_DEG);
     pitch_bias_yaw_weight = 0.5f + 0.5f * pitch_bias_yaw_weight;
     effective_pitch_visual_bias_deg = pitch_visual_bias_deg * pitch_bias_yaw_weight;
-    const float PITCH_POS_FADE_START_YAW_DEG = 45.0f;
-    const float PITCH_POS_FADE_END_YAW_DEG = 60.0f;
+    const ArmKinematicsProfile& pitch_route_profile = current_arm_profile();
+    const float PITCH_POS_FADE_START_YAW_DEG =
+        pitch_route_profile.pitch_pos_fade_start_yaw_deg;
+    const float PITCH_POS_FADE_END_YAW_DEG =
+        pitch_route_profile.pitch_pos_fade_end_yaw_deg;
     float pitch_position_weight = 1.0f;
     float pitch_route_yaw_abs = std::fabs(yaw_control_deg);
     if (pitch_route_yaw_abs > PITCH_POS_FADE_START_YAW_DEG) {
         pitch_position_weight =
             (PITCH_POS_FADE_END_YAW_DEG - pitch_route_yaw_abs) /
             (PITCH_POS_FADE_END_YAW_DEG - PITCH_POS_FADE_START_YAW_DEG);
-        if (pitch_position_weight < 0.0f) pitch_position_weight = 0.0f;
-        if (pitch_position_weight > 1.0f) pitch_position_weight = 1.0f;
+        pitch_position_weight = clamp01(pitch_position_weight);
     }
     float position_pitch_visual_bias_deg =
         effective_pitch_visual_bias_deg * pitch_position_weight;
@@ -3939,7 +3950,10 @@ void set_arm_profile(int profile) {
         profile = ARM_PROFILE_MID_L3_40;
     }
     g_arm_profile.store(profile);
-    printf("[ArmProfile] Switched to %s\n", ARM_PROFILES[profile].name);
+    printf("[ArmProfile] Switched to %s (pitch_pos_fade=%.0f..%.0f deg)\n",
+           ARM_PROFILES[profile].name,
+           ARM_PROFILES[profile].pitch_pos_fade_start_yaw_deg,
+           ARM_PROFILES[profile].pitch_pos_fade_end_yaw_deg);
 }
 
 int get_arm_profile(void) {
@@ -3953,4 +3967,16 @@ const char* arm_profile_name(int profile) {
     const int count = (int)(sizeof(ARM_PROFILES) / sizeof(ARM_PROFILES[0]));
     if (profile < 0 || profile >= count) return "mid_l3_40";
     return ARM_PROFILES[profile].name;
+}
+
+int toggle_head_pitch_sign(void) {
+    int old_sign = g_head_pitch_control_sign.load();
+    int new_sign = (old_sign >= 0) ? -1 : 1;
+    g_head_pitch_control_sign.store(new_sign);
+    printf("[HeadPitch] IMU pitch control sign toggled to %+d\n", new_sign);
+    return new_sign;
+}
+
+int get_head_pitch_sign(void) {
+    return g_head_pitch_control_sign.load();
 }

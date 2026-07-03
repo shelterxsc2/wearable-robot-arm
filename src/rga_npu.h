@@ -22,6 +22,8 @@ const char* pose_mode_name(PoseMode mode);
 void set_arm_profile(int profile);
 int get_arm_profile(void);
 const char* arm_profile_name(int profile);
+int toggle_head_pitch_sign(void);
+int get_head_pitch_sign(void);
 
 /* USB YUYV -> NV12 (via RGA hardware) */
 int convert_yuyv_to_nv12(uint8_t *src, uint8_t *dst, int width, int height);

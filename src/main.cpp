@@ -355,8 +355,17 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // 5. 蓝牙 SPP（临时禁用）
-    // bluetooth_spp_init / bluetooth_spp_start 已注释
+    // 5. 蓝牙 BLE 遥控器
+    printf("\n[Main] Initializing Bluetooth remote...\n");
+    if (bluetooth_spp_init() == 0) {
+        if (bluetooth_spp_start() == 0) {
+            printf("[Main] Bluetooth remote client started\n");
+        } else {
+            fprintf(stderr, "[Main] Bluetooth remote start failed, continuing without it\n");
+        }
+    } else {
+        fprintf(stderr, "[Main] Bluetooth remote init failed, continuing without it\n");
+    }
 
     // 6. 初始化 UART
     printf("\n[Main] Initializing UART...\n");

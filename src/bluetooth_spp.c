@@ -1,11 +1,11 @@
 /**
- * bluetooth_spp.c - BLE GATT 客户端：连接 BT24 (ffe0/ffe1)
+ * bluetooth_spp.c - BLE GATT 客户端：连接 HC-08 (ffe0/ffe1)
  *
- * BT24 是 BLE UART 透传模块，通信方式：
+ * HC-08 是 BLE UART 透传模块，通信方式：
  *   Service UUID:    0000ffe0-0000-1000-8000-00805f9b34fb
  *   Characteristic:  0000ffe1-0000-1000-8000-00805f9b34fb (read/write)
  *
- * 程序作为 BLE Central 主动连接 BT24，通过 GATT ReadValue 轮询
+ * 程序作为 BLE Central 主动连接 HC-08，通过 GATT ReadValue 轮询
  * 接收数据，WriteValue 发送数据。
  */
 #include "bluetooth_spp.h"
@@ -16,10 +16,12 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <ctype.h>
+#include <stdint.h>
+#include <sys/wait.h>
 #include <dbus/dbus.h>
 
-#define BT24_NAME       "BT24"
-#define BT24_MAC        "48:87:2D:C4:31:3B"
+#define BT24_NAME       "HC-08"
+#define BT24_MAC        "F8:2E:0C:E3:99:C8"
 #define BT24_CHR_UUID   "0000ffe1-0000-1000-8000-00805f9b34fb"
 #define BT_BUF_SIZE     256
 
@@ -32,7 +34,7 @@ static volatile int     g_bt_connected = 0;
 static pthread_mutex_t  g_conn_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t   g_conn_cond = PTHREAD_COND_INITIALIZER;
 
-/* BT24 设备路径和 characteristic 路径 */
+/* HC-08 设备路径和 characteristic 路径 */
 static char             g_device_path[128] = "";
 static char             g_char_path[256] = "";
 static volatile int     g_notify_enabled = 0;
@@ -73,39 +75,85 @@ static int str_ieq(const char *a, const char *b)
 }
 
 /* ============================================================
- * 指令解析（完全保留）
+ * 三字节遥控协议:
+ *   55 00 00       idle
+ *   55 01 00/01    arm profile: 00=L3-40, 01=L3-55
+ *   55 02 00/01/02 scene reserved, log only
+ *   55 03 xx       toggle IMU pitch sign
  * ============================================================ */
+static void handle_remote_frame(uint8_t cmd, uint8_t value)
+{
+    static int active_non_idle = 0;
+    static uint8_t last_cmd = 0;
+    static uint8_t last_value = 0;
+
+    if (cmd == 0x00) {
+        active_non_idle = 0;
+        last_cmd = 0;
+        last_value = 0;
+        return;
+    }
+
+    if (active_non_idle && cmd == last_cmd &&
+        (cmd == 0x03 || value == last_value)) {
+        return;
+    }
+    active_non_idle = 1;
+    last_cmd = cmd;
+    last_value = value;
+
+    switch (cmd) {
+        case 0x01:
+            if (value == 0x00) {
+                set_arm_profile(0);
+                printf("[BT] Remote profile -> near L3=40\n");
+            } else if (value == 0x01) {
+                set_arm_profile(1);
+                printf("[BT] Remote profile -> mid L3=55\n");
+            } else {
+                printf("[BT] Remote profile value 0x%02X ignored\n", value);
+            }
+            break;
+
+        case 0x02:
+            printf("[BT] Remote scene value 0x%02X received (reserved)\n", value);
+            break;
+
+        case 0x03: {
+            int sign = toggle_head_pitch_sign();
+            printf("[BT] Remote toggled IMU pitch sign -> %+d\n", sign);
+            break;
+        }
+
+        default:
+            printf("[BT] Unknown remote command cmd=0x%02X value=0x%02X\n",
+                   cmd, value);
+            break;
+    }
+}
+
 static void handle_raw_data(const char *data, int len)
 {
     if (len <= 0) return;
+    static uint8_t frame[3];
+    static int frame_pos = 0;
+
     for (int i = 0; i < len; i++) {
         unsigned char c = (unsigned char)data[i];
-        if (c == 0x12) {
-            set_pose_mode(MODE_FACE);
-            printf("[BT] => 0x12 -> FACE mode\n");
-            return;
+
+        if (frame_pos == 0) {
+            if (c != 0x55) {
+                continue;
+            }
+            frame[frame_pos++] = c;
+            continue;
         }
-        if (c == 0x11) {
-            set_pose_mode(MODE_BODY);
-            printf("[BT] => 0x11 -> BODY mode\n");
-            return;
+
+        frame[frame_pos++] = c;
+        if (frame_pos == 3) {
+            handle_remote_frame(frame[1], frame[2]);
+            frame_pos = 0;
         }
-    }
-    char buf[BT_BUF_SIZE];
-    strncpy(buf, data, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
-    str_trim(buf);
-    if (strlen(buf) == 0) return;
-    printf("[BT] Text: '%s'\n", buf);
-    if (str_ieq(buf, "FACE") || str_ieq(buf, "MODE:FACE") || strcmp(buf, "0") == 0) {
-        set_pose_mode(MODE_FACE);
-        printf("[BT] => FACE mode\n");
-    } else if (str_ieq(buf, "BODY") || str_ieq(buf, "MODE:BODY") || strcmp(buf, "1") == 0) {
-        set_pose_mode(MODE_BODY);
-        printf("[BT] => BODY mode\n");
-    } else if (str_ieq(buf, "STATUS") || str_ieq(buf, "?")) {
-        PoseMode m = get_pose_mode();
-        printf("[BT] => STATUS: %s\n", (m == MODE_FACE) ? "FACE" : "BODY");
     }
 }
 
@@ -806,21 +854,7 @@ int bluetooth_spp_start(void)
         return -1;
     }
 
-    printf("[BT] Waiting for first connection to %s...\n", BT24_NAME);
-
-    /* 阻塞直到第一次连接成功 */
-    pthread_mutex_lock(&g_conn_mutex);
-    while (!g_bt_connected && g_bt_running) {
-        pthread_cond_wait(&g_conn_cond, &g_conn_mutex);
-    }
-    pthread_mutex_unlock(&g_conn_mutex);
-
-    if (!g_bt_running) {
-        fprintf(stderr, "[BT] Stopped before connection\n");
-        return -1;
-    }
-
-    printf("[BT] Ready. %s connected.\n", BT24_NAME);
+    printf("[BT] Client thread started; connecting to %s in background\n", BT24_NAME);
     return 0;
 }
 

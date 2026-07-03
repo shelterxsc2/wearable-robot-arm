@@ -89,9 +89,9 @@ g++ -std=c++17 -O2 \
   src/main.cpp src/rga_npu.cpp src/gst_rtsp.cpp src/gst_rtmp.cpp \
   src/stream_manager.cpp src/ctrl_server.cpp src/ws_client.cpp \
   src/uart_comm.cpp src/wifi.cpp \
-  src/nrf24_linux.c src/imu2_i2c.c src/bt_stub.c \
+  src/nrf24_linux.c src/imu2_i2c.c src/bluetooth_spp.c \
   -o build/cc \
-  $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtsp-server-1.0) \
+  $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtsp-server-1.0 dbus-1) \
   -I/usr/include/opencv4 -lopencv_core -lopencv_imgproc -lopencv_calib3d \
   -lrknnrt -lrga -lwpa_client -lpthread
 ```
@@ -176,7 +176,7 @@ src/
   ctrl_server.cpp/h   # 端侧 HTTP 控制服务器（零依赖 socket 实现）
   ws_client.cpp/h     # WebSocket 客户端（注册帧 + 100ms 心跳）
   wifi.cpp/h          # WiFi 连接（wpa_supplicant）
-  bluetooth_spp.c/h   # BLE（已禁用，bt_stub.c 空实现）
+  bluetooth_spp.c/h   # BLE HC-08 遥控器（FFE0/FFE1 透传，三字节协议）
 scripts/
   rule_engine_server.py  # Python Unix Socket 推理服务（rknn-toolkit-lite2 v2）
   calibrate.py           # 标定脚本
