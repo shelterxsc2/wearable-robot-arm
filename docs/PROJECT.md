@@ -1,189 +1,108 @@
 # ELF2 (RK3588) 可穿戴机械臂上位机系统
 
-## 一、项目概述
+## 一、当前快照
 
-本项目是一个运行在 **RK3588 (ELF2 开发板)** 上的可穿戴机械臂控制系统。机械臂背在人体背部，末端搭载摄像头。当前**活跃控制路径为 NRF24 无线 IMU**（头戴/颈挂陀螺仪），视觉链路仅用于 RTSP 推流和画面显示。
-
-### 硬件组成
-- **上位机**: RK3588 (ELF2)，负责 NRF24 IMU 接收、运动预测、目标位置生成、UART 通信、RTSP 推流
-- **无线 IMU**: NRF24 + 陀螺仪，~100Hz 发送 roll/pitch/yaw + wx/wy/wz
-- **摄像头**: Realtek USB Camera3 (`/dev/video21`)，MJPG 1920×1080@30fps
-- **机械臂**: 可穿戴三轴 + 末端双舵机云台
-  - J1: 腰部 Pan（360°）
-  - J2: 大臂俯仰
-  - J3: 小臂俯仰
-  - J4: 俯仰舵机（与摄像头直连）
-  - J5: 水平舵机
-- **通信**: UART TTL `/dev/ttyS9` @ 115200（10 字节 raw int16）
-
-### 下位机职责
-- 逆运动学（`Coordinate_Inverse_Settlement`）
-- S-curve 7 相速度规划
-- 电机驱动 + 舵机 PWM 控制
-- **Servo1 参与逆运动学**：改变前臂有效长度
-
----
-
-## 二、当前已完成的工作
-
-### 1. NRF24 IMU 控制链路（活跃）
-- **NRF24 SPI 驱动**: `nrf24_linux.c`，spidev + sysfs GPIO，4MHz，22B 帧解析
-- **IMU 数据解析**: 角度帧（0x55 0x53）+ 陀螺仪帧（0x55 0x52）
-- **历史环形缓冲**: `wx_hist` / `wz_hist`，10ms 分辨率，供 50ms 控制周期分析
-- **8 状态运动状态机**: `MotionContext` + `next_motion_state()`，完整实现
-- **终点预测器**: 自适应 `dt`（250~500ms）+ 状态调制 `k`（0.00~0.70）
-- **Roll → Z 轴**: `tz = 40 + 15 * sin(delta_roll * π/180)`，限幅 ±45°
-- **Yaw → XY 平面**: `tx = 57*sin(cum_yaw)`, `ty = 10 + 57*cos(cum_yaw)`
-- **双轴并存**: Roll 和 Yaw 各跑独立状态机，发令逻辑为"或"合并
-
-### 2. 视觉链路（仅显示）
-- **视频采集**: GStreamer `v4l2src` MJPG 1920×1080@30fps
-- **格式转换**: `mppjpegdec` 硬件解码 → NV12
-- **RTSP 推流**: 1080p30 H.264 硬件编码
-- **AI 推理**: RKNN `face_best.rknn`，6 点关键点
-- **PnP + 3D 绘制**: `solvePnP` + 立方体框 + 坐标轴（仅显示，不发令）
-- **OneEuroFilter**: 已禁用（`PNP_USE_FILTER 0`）
-
-### 3. 通信与控制
-- **UART 串口**: `/dev/ttyS9` @ 115200，10 字节 raw int16 (x,y,z,k1,k2)
-- **蓝牙 BLE SPP**: 已禁用，`bt_stub.c` 空实现链接通过
-- **WiFi 连接**: 自动连接预设 WiFi，DHCP + 静态 IP fallback
-
----
-
-## 三、文件结构
+当前分支为 `imu-victor-hat`，标签语义为 `imu-pnp-fuse1.0`。活跃主控路径是：
 
 ```
-twice/
-├── src/
-│   ├── main.cpp              # 主程序：初始化 + NRF24 定时器 + RTSP 主循环
-│   ├── rga_npu.cpp/h         # 视觉链路(deprecated) + NRF24 控制核心
-│   ├── nrf24_linux.c/h       # NRF24 SPI 驱动 + IMU 解析 + 历史缓冲
-│   ├── uart_comm.cpp/h       # UART 驱动，10 字节 raw int16
-│   ├── gst_rtsp.cpp/h        # GStreamer RTSP 服务器
-│   ├── gst_rtmp.cpp/h        # GStreamer RTMP 推流（备用）
-│   ├── wifi.cpp/h            # WiFi 连接
-│   ├── bluetooth_spp.c/h     # BLE（已禁用）
-│   ├── ws_client.cpp/h       # WebSocket 客户端
-│   └── uart_loopback_test.cpp
-├── models/
-│   ├── best.rknn             # 人体姿态模型
-│   └── face_best.rknn        # 人脸模型（6 点 PnP）
-├── calib/
-│   ├── camera_matrix.npy/txt # 相机内参
-│   └── dist_coeffs.npy/txt   # 畸变系数
-├── docs/
-│   ├── PROJECT.md            # 本文件
-│   ├── project-summary-for-chatgpt.md
-│   ├── motion-control-framework.md
-│   ├── servo-control-design.md      # 舵机控制方案 A/B
-│   └── servo-calibration-guide.md   # J4 标定手册
-└── wearable-robot-arm/       # Git 仓库：上下位机完整项目
-    └── imu-main-test-roll+yaw/      # 当前版本存档
+NRF24 无线 IMU → A-inverse 姿态解耦 → 8 状态运动预测
+    → 球坐标目标 + J4/J5 舵机映射
+    → UART 11 字节帧(flag=0x00/0x01) → STM32
 ```
 
----
+视觉链路仍在运行：Body YOLO-Pose + Face Landmark 468 + 12 点 PnP + OSD/推流。与旧记录不同，PnP 结果现在已经接入 IMU 控制线程，用于静止态 yaw 零飘修正；但该修正仍是实验态。
 
-## 四、编译命令（当前版本）
+## 二、硬件与通信
+
+- **上位机**：RK3588 (ELF2)，负责 NRF24 接收、运动预测、NPU/RGA 推理、RTMP/RTSP 推流、WebSocket 心跳、端侧 HTTP API、UART 下发。
+- **下位机**：STM32H723，负责逆运动学、S-curve 轨迹规划、电机和舵机驱动。
+- **摄像头**：Realtek USB Camera (`/dev/video21`)，当前管线按 YUY2 1920x1080@30fps 处理。
+- **无线 IMU**：NRF24L01+ + 陀螺仪，22B payload，包含角度帧和角速度帧。
+- **UART**：`/dev/ttyS9` @ 115200，主控下发 11 字节裸帧：`x,y,z,k1,k2` 五个 int16 小端 + 1 字节 flag。
+- **flag**：`0x00` 表示预测坐标，`0x01` 表示确定/静止态坐标。
+
+## 三、已完成模块
+
+### NRF24 IMU 控制链路
+
+- `nrf24_linux.c/h`：spidev + sysfs GPIO 驱动，4MHz SPI，5ms 轮询 RX 状态，解析角度帧 `0x55 0x53` 和角速度帧 `0x55 0x52`。
+- RX 线程维护 `wy/wz/wx` 历史、角度历史和 A-init 所需的 5 帧平均。
+- `nrf24_control_update()` 由 GLib 50ms 定时器驱动，独立于视觉帧率。
+- A-inverse 使用 `R_rel = R_current * R_init.t()`，避免简单欧拉角相减带来的初始安装姿态耦合。
+- Pitch/Yaw 双轴各自运行状态机和终点预测器。
+- 运动学已改为参数化球坐标：
+  - 当前默认 profile `far_l3_55`：`l1=11.08`, `l2=6.92`, `l3=55`, `l4=28`, `k=1.6`
+  - 保留旧 profile `mid_l3_40`：`l1=8`, `l2=5`, `l3=40`, `l4=28`, `k=1.6`，J4=55、抬头 -0.8、低头 -1.65、J5 yaw 0.4、position pitch sign=+1，用于后续远/中/近距离切换
+  - `tx = l3*sin(yaw)*cos(pitch)`
+  - `ty = l4 - l1*sin(pitch) + l3*cos(pitch)*cos(yaw)`
+  - `tz = l2 + l1*cos(k*pitch) + l3*sin(k*pitch)*cos(yaw)`
+- 舵机映射：
+  - J4：`servo1 = 65 + K*delta_pitch`，抬头侧 `K=+0.5`，低头侧 `K=+1.65`，限幅 `[-90, 90]`
+  - J5：`servo2 = 50 + 0.2*delta_yaw`，限幅 `[0, 270]`
+
+### 握手和 UART
+
+- 主程序等待 UART RX 文本 `init success`。
+- 发送 `FF AA ...` 验证帧。
+- `g_uart_block_tx=1` 屏蔽普通 UART 发送 7 秒，等待下位机归位。
+- 7 秒后清除屏蔽，触发 A-init。
+- NRF24 RX 线程收集 5 帧 IMU 平均值并置 `g_r_init_set=1`。
+- 正常发令进入 `NORMAL`。
+- 退出时发送 `AA FF ...` 结束帧。
+
+### 视觉与 RuleEngine
+
+- `best.rknn`：Body YOLO-Pose，640x640，输出 17 个 COCO keypoints。
+- `face_landmark_468_fp16.rknn`：Face Landmark，192x192 ROI，输出 468 点。
+- PnP 使用 12 个 FaceMesh 稳定点，带重投影误差、镜像解和旋转跳变过滤。
+- 固定安装偏角通过 `R_mount = Ry(-14°) * Rx(-0.10rad)` 组合到 PnP 姿态。
+- 根据机械臂目标 yaw 查 `PNP_YAW_CALIBRATION` 表并插值补偿。
+- C++ 通过 Unix socket 调 Python `rule_engine_server.py`，协议为 312B 输入、56B 输出。
+
+### 推流、云端和端侧控制
+
+- 启动时探测 RTMP 服务器，连通则推 RTMP 并启动 WebSocket 心跳；不可达则回退本地 RTSP。
+- WebSocket 注册帧为 `{"type":"frame_ts"}`，心跳周期 100ms，上报 timestamp、elapsed、frame_count、device。
+- 端侧 HTTP API 监听 8080：
+  - `/status`
+  - `/mode?type=face/body`
+  - `/calib?mode=0/1/2/3/4`
+  - `/servo?k1=...&k2=...`
+  - `/cmd?action=rebaseline/nrf24_reset`
+
+## 四、编译命令
 
 ```bash
 cd /home/elf/work/twice
-g++ -std=c++17 -O2 -Isrc \
+g++ -std=c++17 -O2 \
   src/main.cpp src/rga_npu.cpp src/gst_rtsp.cpp src/gst_rtmp.cpp \
   src/stream_manager.cpp src/ctrl_server.cpp src/ws_client.cpp \
-  src/uart_comm.cpp src/wifi.cpp src/nrf24_linux.c /tmp/bt_stub.c \
+  src/uart_comm.cpp src/wifi.cpp \
+  src/nrf24_linux.c src/imu2_i2c.c src/bt_stub.c \
   -o build/cc \
-  $(pkg-config --cflags --libs opencv4 gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtsp-server-1.0) \
-  /usr/lib/aarch64-linux-gnu/libwpa_client.a \
-  -lrknnrt -lrga -lpthread -lm -ldl
+  $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtsp-server-1.0) \
+  -I/usr/include/opencv4 -lopencv_core -lopencv_imgproc -lopencv_calib3d \
+  -lrknnrt -lrga -lwpa_client -lpthread
 ```
 
-> `/tmp/bt_stub.c` 为蓝牙空实现，用于解决蓝牙禁用后的链接错误。
+## 五、当前问题
 
----
+1. Body 模型仍是视觉链路主要瓶颈。
+2. `wx` 静止噪声仍会影响状态判断。
+3. 5° 发令阈值会让小角度动作延迟触发。
+4. 下位机短距减速使小位移响应偏慢。
+5. 上位机仍没有关节角/末端位姿反馈，本质上不是完整闭环。
+6. A-init 随机姿态下俯仰极性仍需继续上机验证。
+7. PnP 零飘修正当前是绝对值积分，`KI_PNP=0.05`，非误差积分。
+8. PnP 当前 `pnp_valid_cnt >= 1` 即触发修正，未做连续多帧一致性过滤。
+9. `/servo` 会直接发一次测试指令并写 `/tmp/servo_calib.txt`，但 mode=1/2 的周期标定发令仍使用固定舵机值，标定循环尚未完全闭合。
+10. 云端离散状态控制与端侧连续坐标控制语义仍未统一。
 
-## 五、关键坐标系定义
+## 六、下一步
 
-### 人脸坐标系（PnP 3D 模板）
-- **原点**: 鼻尖附近
-- **+X**: 人脸左侧
-- **+Y**: 人脸下方
-- **+Z**: 人脸后方（远离相机）
-
-### IMU 坐标系（重要）
-- `gy_roll/yaw/pitch` 仅代表 **IMU 自身欧拉角**
-- 与视觉坐标系/机械臂坐标系**无直接对应**
-- 当前代码中 `roll` 对应头部俯仰效果，`yaw` 对应水平转动效果
-
-### 机械臂基座坐标系
-- **原点**: 机械臂 J1 关节中心
-- **+Z**: 竖直向上
-
----
-
-## 六、改动记录
-
-### 2026-05-28 当前版本
-
-**状态**: Roll + Yaw 双轴控制，J4 舵机标定准备中
-
-| 改动 | 说明 |
-|------|------|
-| Yaw 控制恢复 | 从 `imu-main-test` 恢复完整 yaw 状态机，与 roll 并存 |
-| 发令逻辑改"或" | `should_cmd = roll_should_cmd \|\| yaw_should_cmd` |
-| ty 固定为 67 | `10 + 57`，几何正对值 |
-| roll 极性修正 | `cum_pitch_offset = delta_roll * π/180`（去掉负号） |
-| 预测器 k 值调低 | `STATE_ACCEL` / `STATE_STOP_TO_ACCEL` 从 0.70 → **0.35** |
-| 蓝牙编译修复 | `/tmp/bt_stub.c` 空实现 |
-| GitHub 存档 | `wearable-robot-arm/imu-main-test-roll+yaw/` |
-| 舵机设计方案 | `docs/servo-control-design.md`（方案 A/B） |
-| 标定手册 | `docs/servo-calibration-guide.md` |
-
-### 2026-05-20~21（历史记录：视觉 PID 调试，已废弃）
-
-> 视觉闭环控制已 deprecated，以下记录保留供参考：
-
-- 偏航 PID 调参（KP=0.9, KI=0.04, 死区 6°）
-- 纯积分 + 速度前馈 + 冻结机制
-- 俯仰控制完全禁用
-- UART 发送周期 3Hz
-
----
-
-## 七、关键问题与待办
-
-### P0：J4 舵机标定（当前）
-- [ ] 上机实测 `baseline_roll`、`baseline_servo1`、`K_SERVO`
-- [ ] 验证低头/抬头双向补偿效果
-- [ ] 确认 J4 机械限位
-
-### P1：通信升级
-- [ ] 下位机回传 `complete` 信号（文本或二进制帧）
-- [ ] 可选：下位机回传 J1/J2/J3 目标值，为上位机正运动学做准备
-- [ ] UART 协议升级：帧头+长度+CMD+payload+CRC8
-
-### P2：下位机配合
-- [ ] 提供 6 个几何常数（L1, L2, L_connect, L_end, Offset_Upper, Offset_Fore）
-- [ ] 讨论"小变化不重置 S 曲线"的可行性
-
-### P3：长期
-- [ ] 上位机闭环（有反馈后做正运动学校正）
-- [ ] 参数热加载
-- [ ] CSV 记录与离线回放
-- [ ] ROS2 化 / 仿真
-
----
-
-## 八、外部建议摘要
-
-### ChatGPT 技术评审核心观点
-
-1. **当前架构最不合适的地方**：上位机在做"看起来像闭环、实际像开环"的控制，没有关节角/末端位姿反馈
-2. **控制频率分层不对**：NRF24 采样 100Hz → 状态机 20Hz → UART 5~7Hz → 下位机 1ms S 曲线
-3. **缺少离线调试闭环**：应先录数据 → 离线 replay → 改参数不编译 → 再上机
-4. **运动生硬**：上位机限速 + 下位机轨迹规划，两者都要做
-5. **如果末端有双舵机云台**：云台负责快速跟脸，机械臂负责慢速把云台带回中位
-
----
-
-> **最重要的一句话**：当前最该追求的不是"更复杂的控制算法"，而是**把系统改成可观测、可回放、分频率、分职责、安全限幅的结构**。在那之前，控制算法再精妙也会像在雾里开车。
+- PnP 修正策略改为误差积分或带限幅的稳定校正。
+- PnP 有效帧改为连续多帧一致性过滤。
+- 补齐 `/servo` 与 mode=1/2 标定循环的实际联动。
+- J4/J5 上机标定，确认极性、基线和机械限位。
+- 下位机回传关节角或末端位姿，形成可观测闭环。
+- 参数热加载和日志回放，减少反复编译调参。

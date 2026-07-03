@@ -1,6 +1,6 @@
 # 人脸跟踪机械臂运动与控制框架
 
-> **状态**: 本文档为理论框架，当前已**部分实现**。8 状态机、终点预测器、自适应发令策略已代码化。概率预测模型（5.1~5.4）尚未实现。舵机控制章节为新增。
+> **状态**: 本文档为理论框架，当前已**部分实现**。8 状态机、终点预测器、自适应发令策略已代码化。概率预测模型（5.1~5.4）尚未实现。当前源码已使用 11 字节 UART flag 协议、球坐标运动学和 J4/J5 动态舵机映射；本文中的旧常数和示例代码仅作方案背景。
 
 ## 一、背景与核心矛盾
 
@@ -397,7 +397,7 @@ void nrf24_control_update(void)
         float target_y = ...;
         float target_z = 40.0f;
         
-        uart_send_arm_target(target_x, target_y, target_z, 50.0f, 145.0f);
+        uart_send_arm_target(target_x, target_y, target_z, 50.0f, 145.0f, 0x00);
         
         last_cmd_center = pred.center;
         last_cmd_us = now_us;
@@ -506,7 +506,7 @@ Coordinate_Inverse_Settlement(X, Y, Z, Servo_Angle, &J1, &J2, &J3);
 
 | 方案 | 做法 | 需要数据 |
 |------|------|---------|
-| **A. 简单标定** | `servo1 = 90° + K × delta_roll` | 不需要常数，不需要反馈 |
+| **A. 简单标定** | 当前源码近似为 `servo1 = 55° + K × delta_pitch`，抬头/低头分段增益 | 不需要常数，不需要反馈 |
 | **B. 正运动学校正** | 反馈 J1/J2/J3 → 正运动学 → 偏差计算 | 6 个几何常数 + J1/J2/J3 反馈 |
 
 **推荐**：先 A 后 B。标定手册见 `docs/servo-calibration-guide.md`。

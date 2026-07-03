@@ -5,6 +5,8 @@
 > **时间**: 约 5~10 分钟  
 > **风险**: 低（舵机范围小，不会撞机械结构）
 
+> **当前代码同步（2026-07-01）**：正常控制已改为 Pitch/Yaw 动态舵机映射，J4 当前公式为 `servo1 = 55 + K * delta_pitch`，抬头侧 `K=-0.8`，低头侧 `K=-1.65`，J5 为 `servo2 = 50 + 0.4 * delta_yaw`。本文仍可作为 J4 基线、极性和比例系数的上机标定流程参考。注意 `/servo` 端点会直接发一次测试指令并写 `/tmp/servo_calib.txt`，但 mode=1/2 的周期标定循环当前仍发送固定舵机值，尚未完全使用该文件中的 `calib_servo1`。
+
 ---
 
 ## 一、标定原理
@@ -28,11 +30,12 @@ J4_target = baseline_servo1 + K_SERVO × (current_roll − baseline_roll)
 3. **人站在机械臂正前方**（跟踪距离约 57cm，即一臂距离）
 4. **打开串口日志**（观察 `[NRF-DEBUG]` 输出）
 5. **准备一个可以手动发 UART 指令的方式**（用于调 J4）：
-   - 方法 A：临时写一个 `uart_send_arm_target(0, 67, 40, servo1, 145)` 的调试按钮
-   - 方法 B：直接用现有程序，改源码里的 `NRF_SERVO1_DEG` 重新编译运行
-   - 方法 C：通过 RTSP 画面观察，先不动 J4，只记录 roll
+   - 方法 A：使用 HTTP `POST /servo?k1=<J5>&k2=<J4>` 直接发一次测试指令
+   - 方法 B：临时写一个 `uart_send_arm_target(tx, ty, tz, k1, k2, 0x01)` 的调试按钮
+   - 方法 C：直接改 `SERVO1_BASELINE` / `K_PITCH_SERVO` / `SERVO2_BASELINE` / `K_YAW_SERVO` 后重新编译运行
+   - 方法 D：通过 RTSP/RTMP 画面观察，先不动 J4，只记录 pitch/yaw
 
-> **推荐方法 B**：在 `nrf24_control_update()` 里临时加一个手动输入逻辑，或者直接用 `uart_send_arm_target()` 发固定值。
+> 当前最直接的方法是 `/servo` 单次测试；若要连续扫描，需要先补齐 mode=1/2 标定循环对 `/tmp/servo_calib.txt` 的实际使用。
 
 ---
 
@@ -50,9 +53,9 @@ J4_target = baseline_servo1 + K_SERVO × (current_roll − baseline_roll)
 **记录数据**：
 
 ```
-执行: 读取当前 [NRF-DEBUG] 输出
-记录: baseline_roll = ____°      （例：+2.3°）
-记录: baseline_servo1 = ____°    （当前发下去的 J4 值，例：90°）
+执行: 读取当前 [CMD]/[UART-TX]/RTSP OSD 输出
+记录: baseline_pitch = ____°     （当前代码主要用 rel_pitch 驱动 J4）
+记录: baseline_servo1 = ____°    （当前正常控制基线默认 30°，需实测确认）
 ```
 
 > 如果当前画面人脸偏下，说明 J4 需要往上抬（减小角度或增大角度，取决于极性）。先记下来，步骤 2 再调。
@@ -167,27 +170,19 @@ K_SERVO = delta_servo / delta_roll = ____              （例：20 / 16.2 ≈ 1.
 
 ## 五、快速写入代码
 
-标定完成后，修改 `src/rga_npu.cpp`：
+标定完成后，优先修改 `src/rga_npu.cpp` 当前正常控制参数：
 
 ```cpp
-/* ========== J4 标定参数（方案 A） ========== */
-static const float SERVO1_BASELINE = ____;     // 填入 baseline_servo1
-static const float ROLL_BASELINE   = ____;     // 填入 baseline_roll
-static const float K_SERVO         = ____;     // 填入 K_SERVO
+static const float SERVO1_BASELINE = ____;     // 当前默认 55.0f
+static const float K_PITCH_SERVO   = ____;     // 当前使用抬头/低头分段增益
 ```
 
-并在发令逻辑中加入 J4 补偿：
+当前发令逻辑已内置 J4 补偿：
 
 ```cpp
-// 在 roll 发令之后、yaw 发令之后，或单独判断
-delta_roll = normalize_angle_deg(current_roll_deg - ROLL_BASELINE);
-servo1 = SERVO1_BASELINE + K_SERVO * delta_roll;
-
-// 限幅
-if (servo1 > 180.0f) servo1 = 180.0f;
-if (servo1 < 0.0f)   servo1 = 0.0f;
-
-uart_send_arm_target(tx, ty, tz, servo1, NRF_SERVO2_DEG);
+curr_servo1 = SERVO1_BASELINE + K_PITCH_SERVO * delta_pitch_deg;
+curr_servo1 = clamp(curr_servo1, -90.0f, 90.0f);
+uart_send_arm_target(tx, ty, tz, send_servo2, send_servo1, flag);
 ```
 
 ---

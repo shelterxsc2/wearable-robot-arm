@@ -7,7 +7,7 @@
 ## 一、项目概述
 
 **项目名称**：ELF2 (RK3588) 可穿戴机械臂上位机控制系统
-**当前分支**：`imu-newbi-hat`
+**当前分支**：`imu-victor-hat`
 **核心目标**：通过头戴/颈挂 NRF24 无线 IMU 实时控制背负式机械臂，实现"头部转动 → 机械臂跟随"的穿戴式人机协同。
 
 ### 1.1 硬件组成
@@ -47,7 +47,7 @@ USB Camera → YOLO-Pose(best.rknn, 640×640) → 17 COCO关键点
             3状态手势状态机 → UART → STM32
 ```
 
-**链路C — 视觉精调闭环（本阶段假设/规划中的优化方向）：**
+**链路C — 视觉 PnP 零飘修正闭环（当前已集成，实验态）：**
 ```
 USB Camera → 两阶段NPU推理 → Face Landmark 468点
                     ↓
@@ -55,11 +55,11 @@ USB Camera → 两阶段NPU推理 → Face Landmark 468点
                     ↓
             头部姿态欧拉角提取 (pnp_yaw, pnp_pitch)
                     ↓
-            与IMU目标姿态比对 → 偏差计算 (Δyaw, Δpitch)
+            固定安装校正 + 机械臂目标 yaw 查表补偿
                     ↓
-            仅在 g_arm_stable=1 时触发 → 生成微调坐标
+            静止态(is_stop && is_stop_yaw)触发 R_bias_total 累积修正
                     ↓
-            UART flag=0x01 → STM32 精调到位
+            允许静止态 yaw 发令 → UART flag=0x01 → STM32 微调
 ```
 
 **链路D — 云端交互（Cloud Streaming Monitor）：**
@@ -176,8 +176,8 @@ STATE_ACCEL_TO_CONST → STATE_CONST_SPEED → STATE_CONST_TO_DECEL → STATE_DE
 
 **Yaw（偏航）**：
 - ✅ 主窗口 `STATE_ACCEL_TO_CONST`：发一次预测令
-- ❌ 静止态：掐死不发（防微抖）
-- ❌ 其他运动态：不发（防S曲线尾部打断）
+- ✅ 静止态：允许发令，供 PnP 零飘修正驱动机械臂微动
+- ✅ 其他运动态：按当前代码条件放行，但仍受 5° 阈值、150/200ms 间隔和 1cm 位置死区约束
 
 **Pitch（俯仰）**：
 - ✅ 主窗口/第二窗口：发预测令
@@ -189,10 +189,11 @@ STATE_ACCEL_TO_CONST → STATE_CONST_SPEED → STATE_CONST_TO_DECEL → STATE_DE
 ### 2.5 球坐标运动学
 
 ```cpp
-const float l1 = 8.0f, l2 = 12.0f, l3 = 52.0f, l4 = 12.0f;
+const float l1 = 8.0f, l2 = 5.0f, l3 = 40.0f, l4 = 28.0f;
+const float k = 1.6f;
 last_tx = l3 * sin(cum_yaw) * cos(cum_pitch);
 last_ty = l4 - l1 * sin(cum_pitch) + l3 * cos(cum_pitch) * cos(cum_yaw);
-last_tz = l2 + l1 * cos(cum_pitch) + l3 * sin(cum_pitch) * cos(cum_yaw);
+last_tz = l2 + l1 * cos(cum_pitch * k) + l3 * sin(cum_pitch * k) * cos(cum_yaw);
 ```
 
 **角度限幅**：`cum_pitch_offset`, `cum_yaw_offset` 均 clamp 在 ±π/2
@@ -204,9 +205,9 @@ last_tz = l2 + l1 * cos(cum_pitch) + l3 * sin(cum_pitch) * cos(cum_yaw);
 | J4 (servo1, 俯仰) | 30° | K=-1.2 | [-90°, +90°] | 抬头→负(向外), 低头→正(向内) |
 | J5 (servo2, 水平) | 50° | K=+0.4 | [0°, 270°] | 左偏→负(左), 右偏→正(右) |
 
-### 2.7 视觉PnP精调方案（假设性优化）
+### 2.7 视觉 PnP 零飘修正闭环（当前实现）
 
-**背景**：IMU开环控制存在5°发令阈值和短距减速陷阱，机械臂到位后可能存在±5°的残余偏差。视觉PnP可提供独立的头部姿态观测，用于静止态的闭环微调。
+**背景**：IMU开环控制存在5°发令阈值、短距减速陷阱和长期零飘。视觉PnP提供独立头部姿态观测，当前已接入静止态 yaw 零飘修正。
 
 **PnP解算流程**：
 1. 从468个面部landmarks中选取12个稳定点（眼角、鼻尖、嘴角、眉心）
@@ -220,37 +221,35 @@ last_tz = l2 + l1 * cos(cum_pitch) + l3 * sin(cum_pitch) * cos(cum_yaw);
 - 旋转跳变 > 60° → 丢弃该帧
 - 镜像解（翻转）→ 丢弃该帧
 
-**视觉微调触发条件**：
+**当前触发条件**：
 ```
-g_arm_stable == 1  (头部静止持续800ms且机械臂到位)
-&& |pnp_yaw - target_yaw| > 2°  (偏航偏差超过视觉微调阈值)
-&& |pnp_pitch - target_pitch| > 2°  (俯仰偏差超过视觉微调阈值)
+g_r_init_set == 1
+&& is_stop && is_stop_yaw
+&& pnp_correction_ready == true
 ```
 
-**微调坐标计算**：
+**当前修正方式**：
 ```cpp
-// 视觉偏差
-float vis_delta_yaw   = pnp_yaw   - last_cmd_target_yaw;
-float vis_delta_pitch = pnp_pitch - last_cmd_target_pitch;
-
-// 仅当偏差在 [-10°, +10°] 范围内才微调（防跳变）
-if (fabs(vis_delta_yaw) < 10.0f && fabs(vis_delta_pitch) < 10.0f) {
-    // 在原目标上叠加视觉偏差
-    float fine_yaw   = last_cmd_target_yaw   + 0.5f * vis_delta_yaw;   // 0.5 = 视觉增益
-    float fine_pitch = last_cmd_target_pitch + 0.5f * vis_delta_pitch;
-    // 重新计算球坐标和舵机
-    // flag = 0x01 (确定坐标)
-    uart_send_arm_target(tx, ty, tz, servo2, servo1, 0x01);
-}
+pitch_delta = 0.0f;  // 当前关闭 pitch 修正
+yaw_delta = -0.05f * pnp_yaw_correction;
+R_bias_total = R_delta * R_bias_total;
+R_corrected = R_bias_total * R_current;
+R_rel = R_corrected * R_init.t();
 ```
 
-**视觉微调与IMU控制的切换逻辑**：
+**PnP 校正与 IMU 控制的关系**：
 
 | 阶段 | 主导传感器 | flag | 策略 |
 |:---|:---|:---:|:---|
 | 头部运动中 | IMU (NRF24) | 0x00 | 预测终点，快速响应 |
 | 头部刚静止 | IMU (实际角度) | 0x01 | 最终到位 |
-| 静止后>800ms | 视觉PnP + IMU | 0x01 | PnP偏差微调，补偿IMU漂移 |
+| 静止态 | 视觉PnP + IMU | 0x01 | PnP yaw 修正 R_bias_total，补偿 IMU 零飘 |
+
+**当前限制**：
+- `pnp_valid_cnt >= 1` 即置 `pnp_correction_ready`，尚未做连续多帧一致性过滤
+- 修正是绝对值积分，不是误差积分，PnP 绝对值非零时会持续累积
+- pitch 修正入口已预留，当前 `KI_PNP_PITCH=0.0`，待 `POST /calib?mode=4` 生成 `/tmp/pnp_pitch_calib.csv` 并填入补偿表后开启
+- 固定安装校正为 `R_mount = Ry(-14°) * Rx(-0.10rad)`，并按 `PNP_YAW_CALIBRATION` 表对目标 yaw 插值补偿
 
 ### 2.8 新增协议标志位
 
@@ -293,7 +292,7 @@ UART帧从10字节扩展为11字节：
 |:---|:---|:---:|:---:|:---|
 | Stage 1 | best.rknn (YOLO-Pose) | 640×640 | **~85%** | 主要瓶颈 |
 | Stage 2 | face_landmark_468_fp16.rknn | 192×192 | ~10% | RGA硬件裁剪后推理 |
-| PnP + Draw | solvePnP + OSD | 1080p | ~5% | 当前仅显示，不发令 |
+| PnP + Draw | solvePnP + OSD | 1080p | ~5% | 已接入静止态 yaw 零飘修正 |
 
 ### 3.4 视觉PnP精度指标（目标/规划值）
 
@@ -302,9 +301,9 @@ UART帧从10字节扩展为11字节：
 | PnP重投影误差 | ~15px | <10px | 12点稳定点集的标定精度 |
 | 偏航角精度 | ±3° | ±1° | solvePnP解算偏航的均方根误差 |
 | 俯仰角精度 | ±2° | ±1° | solvePnP解算俯仰的均方根误差 |
-| 视觉微调阈值 | — | 2° | 触发PnP微调的最小偏差 |
-| 视觉增益 | — | 0.5 | PnP偏差到目标修正的映射系数 |
-| 视觉微调范围 | — | ±10° | 超出此范围丢弃该帧（防跳变） |
+| PnP 修正增益 | 0.05 | 待优化 | `KI_PNP`，绝对值积分 |
+| 有效帧门槛 | 1帧 | 连续多帧 | 当前单帧即触发 |
+| Pitch 修正 | 关闭 | 待验证 | 当前只修 yaw |
 
 ### 3.4 通信协议
 
@@ -348,10 +347,10 @@ UART帧从10字节扩展为11字节：
 - init_success → FF_AA → 7s延时(g_uart_block_tx=1) → A-init → NORMAL
 - 标出每个阶段的UART发送权限
 
-### 4.5 视觉精调闭环框图（假设性方案）
-- 从Camera输入到PnP解算到偏差计算到微调发令的完整闭环
-- 与IMU开环的切换逻辑（g_arm_stable触发）
-- 标注：视觉仅在静止态激活，运动态由IMU独占
+### 4.5 视觉 PnP 零飘修正闭环框图
+- 从 Camera 输入到 PnP 解算、固定安装校正、查表补偿、写入 `g_nrf24_state`
+- IMU 控制线程在 `is_stop && is_stop_yaw` 时更新 `R_bias_total`
+- 标注：视觉仅在静止态参与 yaw 零飘修正，运动态由 IMU 预测主导
 
 ### 4.6 软件模块依赖图
 - main.cpp / rga_npu.cpp / nrf24_linux.c / uart_comm.cpp / ctrl_server.cpp 之间的调用关系
@@ -394,7 +393,7 @@ UART帧从10字节扩展为11字节：
 - 位置死区(1cm) + 静止检测滞后带
 - 端侧HTTP控制服务器
 - RTMP/RTSP自适应推流
-- 两阶段NPU推理 + PnP头部姿态解算（基础设施就绪）
+- 两阶段NPU推理 + PnP头部姿态解算 + 静止态 yaw 零飘修正闭环（实验态）
 - 云端LL-HLS低延迟直播系统（约3s延迟）
 - WebSocket注册+心跳（100ms周期）
 - 离散状态远程控制协议(x,y,z ∈ {0,1,2})
@@ -407,7 +406,8 @@ UART帧从10字节扩展为11字节：
 ### 待完成 ⏳
 - Body模型优化（轻量化突破帧率瓶颈）
 - 下位机回传关节角（UART双向协议统一）
-- **视觉PnP精调闭环集成（静止态偏差补偿）**
+- PnP 修正策略优化（误差积分替代绝对值积分）
+- PnP 连续多帧一致性过滤
 - PnP精度验证与OneEuroFilter重新评估
 - 参数热加载（不编译调参）
 - CSV记录与离线回放
@@ -425,9 +425,9 @@ UART帧从10字节扩展为11字节：
 4. **STM32短距减速陷阱**：<3cm位移速度限制15%，到位时间~1.5s+
 5. **纯开环**：上位机无关节角/末端位姿反馈
 6. **俯仰极性偶发反转**：A-init时头部姿态不同导致矩阵解耦符号不稳
-7. **视觉算力浪费**：PnP和3D绘制当前仅用于OSD显示，控制链路已废弃 → **规划中的解决方案：静止态视觉PnP精调闭环**
+7. **PnP修正仍为实验态**：已接入静止态 yaw 零飘修正，但当前为绝对值积分且单帧触发
 8. **PnP精度不足**：重投影误差~15px，OneEuroFilter已禁用，硬丢弃策略可能漏掉有效帧
-9. **视觉-IMU融合未实现**：两套传感器独立运行，没有互补滤波或卡尔曼融合
+9. **视觉-IMU融合较弱**：当前只用 PnP 在静止态修正 yaw 零飘，没有互补滤波或卡尔曼融合
 10. **云-端控制协议割裂**：云端用离散状态(x,y,z)，端侧用连续坐标(tx,ty,tz)，两套控制语义不互通
 11. **云端延迟瓶颈**：RTMP推流延迟~3s，WebSocket心跳100ms，无法满足实时遥控需求
 12. **设备指纹安全限制**：root用户首次登录绑定设备后，无法临时授权新设备应急

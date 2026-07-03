@@ -19,6 +19,10 @@ void set_pose_mode(PoseMode mode);
 PoseMode get_pose_mode(void);
 const char* pose_mode_name(PoseMode mode);
 
+void set_arm_profile(int profile);
+int get_arm_profile(void);
+const char* arm_profile_name(int profile);
+
 /* USB YUYV -> NV12 (via RGA hardware) */
 int convert_yuyv_to_nv12(uint8_t *src, uint8_t *dst, int width, int height);
 
@@ -34,6 +38,9 @@ void nrf24_control_update(void);
 
 /* A-inverse R_init 捕获标志: 1=已捕获 */
 extern volatile int g_r_init_set;
+
+/* 请求把当前头部相对姿态作为控制中心 */
+extern volatile int g_head_center_request;
 
 /* 握手线程信号: 置1后 nrf24_control_update() 在下一帧 IMU 时捕获 R_init */
 extern volatile int g_wait_a_init;

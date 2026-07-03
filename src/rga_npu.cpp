@@ -4,6 +4,7 @@
 #include "rga_npu.h"
 #include "uart_comm.h"
 #include "nrf24_linux.h"
+#include "imu2_i2c.h"
 #include <rknn_api.h>
 #include <cstddef>
 #include <im2d.h>
@@ -73,10 +74,33 @@ static int npu_initialized = 0;
 static uint64_t g_frame_start_us = 0;
 
 static const int PNP_CALIB_TARGETS[] = {
-    0, -15, -30, -45, -60, -75
+    0, -15, -30, -45, -60, -75, 15, 30, 45, 60, 75
 };
 static const int PNP_CALIB_TARGET_COUNT =
     (int)(sizeof(PNP_CALIB_TARGETS) / sizeof(PNP_CALIB_TARGETS[0]));
+static const int PNP_PITCH_CALIB_TARGETS[] = {
+    0, -15, -30, 15, 30
+};
+static const int PNP_PITCH_CALIB_TARGET_COUNT =
+    (int)(sizeof(PNP_PITCH_CALIB_TARGETS) / sizeof(PNP_PITCH_CALIB_TARGETS[0]));
+struct HeadImuGridTarget {
+    const char *name;
+    float yaw_deg;
+    float pitch_deg;
+};
+static const HeadImuGridTarget HEAD_IMU_GRID_TARGETS[] = {
+    {"left_up",    -30.0f,  20.0f},
+    {"up",          0.0f,  20.0f},
+    {"right_up",   30.0f,  20.0f},
+    {"left",      -30.0f,   0.0f},
+    {"center",      0.0f,   0.0f},
+    {"right",      30.0f,   0.0f},
+    {"left_down", -30.0f, -20.0f},
+    {"down",        0.0f, -20.0f},
+    {"right_down", 30.0f, -20.0f}
+};
+static const int HEAD_IMU_GRID_TARGET_COUNT =
+    (int)(sizeof(HEAD_IMU_GRID_TARGETS) / sizeof(HEAD_IMU_GRID_TARGETS[0]));
 static const uint64_t PNP_CALIB_PREPARE_US = 5000000;
 static const uint64_t PNP_CALIB_SAMPLE_US = 8000000;
 
@@ -91,9 +115,15 @@ static std::atomic<int> g_pnp_calib_target_idx{-1};
 static std::atomic<int> g_pnp_calib_phase{PNP_CALIB_INACTIVE};
 static std::atomic<uint64_t> g_pnp_calib_phase_start_us{0};
 static std::atomic<float> g_arm_target_yaw_deg{0.0f};
+static std::atomic<float> g_arm_target_pitch_deg{0.0f};
 
 struct PnpYawCalibrationPoint {
     float arm_yaw_deg;
+    float compensation_deg;
+};
+
+struct PnpPitchCalibrationPoint {
+    float arm_pitch_deg;
     float compensation_deg;
 };
 
@@ -102,32 +132,126 @@ struct PnpYawCalibrationPoint {
  * Positive arm-yaw points come from the first run; negative points come from
  * the trusted negative-side rerun. The 0-degree value comes from the first run.
  */
-static const PnpYawCalibrationPoint PNP_YAW_CALIBRATION[] = {
-    {-75.0f, -6.5947f},
-    {-60.0f, -0.3278f},
-    {-45.0f,  3.2507f},
-    {-30.0f,  6.2222f},
-    {-15.0f,  5.0208f},
-    {  0.0f,  3.4033f},
-    { 15.0f,  6.1024f},
-    { 30.0f, 10.1275f},
-    { 45.0f, 14.6082f},
-    { 60.0f, 16.5775f},
-    { 75.0f, 24.1004f}
+static const PnpYawCalibrationPoint PNP_YAW_CALIBRATION_L3_40[] = {
+    {-75.0f,  8.1134f},
+    {-60.0f, 10.0633f},
+    {-45.0f,  8.1285f},
+    {-30.0f,  7.3703f},
+    {-15.0f,  5.3609f},
+    {  0.0f,  6.8933f},
+    { 15.0f,  5.8331f},
+    { 30.0f,  6.7012f},
+    { 45.0f,  5.7065f},
+    { 60.0f,  6.8654f},
+    { 75.0f,  9.7055f}
 };
 
-static float interpolate_pnp_yaw_compensation(float arm_yaw_deg) {
-    const int count =
-        (int)(sizeof(PNP_YAW_CALIBRATION) / sizeof(PNP_YAW_CALIBRATION[0]));
+/*
+ * compensation = -measured PnP pitch while the face is aligned with the camera.
+ * Fill this table from /tmp/pnp_pitch_calib.csv after running calib mode 4.
+ */
+static const PnpPitchCalibrationPoint PNP_PITCH_CALIBRATION_L3_40[] = {
+    {-30.0f, -2.3324f},
+    {-15.0f,  8.4560f},
+    {  0.0f, -0.4869f},
+    { 15.0f, -7.4892f},
+    { 30.0f, -5.7054f}
+};
 
-    if (arm_yaw_deg <= PNP_YAW_CALIBRATION[0].arm_yaw_deg)
-        return PNP_YAW_CALIBRATION[0].compensation_deg;
-    if (arm_yaw_deg >= PNP_YAW_CALIBRATION[count - 1].arm_yaw_deg)
-        return PNP_YAW_CALIBRATION[count - 1].compensation_deg;
+/* L3=55 calibration from 2026-07-02. Yaw +75 was rejected as unreliable. */
+static const PnpYawCalibrationPoint PNP_YAW_CALIBRATION_L3_55[] = {
+    {-75.0f, 5.2863f},
+    {-60.0f, 4.1826f},
+    {-45.0f, 6.4065f},
+    {-30.0f, 8.4788f},
+    {-15.0f, 5.8080f},
+    {  0.0f, 7.2326f},
+    { 15.0f, 7.1712f},
+    { 30.0f, 8.1047f},
+    { 45.0f, 5.6603f},
+    { 60.0f, 7.9074f}
+};
+
+static const PnpPitchCalibrationPoint PNP_PITCH_CALIBRATION_L3_55[] = {
+    {-30.0f, -8.9463f},
+    {-15.0f, -2.9546f},
+    {  0.0f, -6.3915f},
+    { 15.0f, -6.1471f},
+    { 30.0f, -9.5954f}
+};
+
+struct ArmKinematicsProfile {
+    const char *name;
+    float l1;
+    float l2;
+    float l3;
+    float l4;
+    float pitch_z_gain;
+    float servo1_baseline;
+    float servo1_gain_up;
+    float servo1_gain_down;
+    float servo2_baseline;
+    float servo2_yaw_gain;
+    int position_pitch_sign;
+    const PnpYawCalibrationPoint *yaw_calib;
+    int yaw_calib_count;
+    const PnpPitchCalibrationPoint *pitch_calib;
+    int pitch_calib_count;
+};
+
+enum {
+    ARM_PROFILE_MID_L3_40 = 0,
+    ARM_PROFILE_FAR_L3_55 = 1
+};
+
+static const ArmKinematicsProfile ARM_PROFILES[] = {
+    {
+        "mid_l3_40",
+        8.0f, 5.0f, 40.0f, 28.0f, 1.6f,
+        55.0f, -0.8f, -1.65f,
+        50.0f, 0.2f,
+        1,
+        PNP_YAW_CALIBRATION_L3_40,
+        (int)(sizeof(PNP_YAW_CALIBRATION_L3_40) / sizeof(PNP_YAW_CALIBRATION_L3_40[0])),
+        PNP_PITCH_CALIBRATION_L3_40,
+        (int)(sizeof(PNP_PITCH_CALIBRATION_L3_40) / sizeof(PNP_PITCH_CALIBRATION_L3_40[0]))
+    },
+    {
+        "far_l3_55",
+        11.08f, 6.92f, 55.0f, 28.0f, 1.6f,
+        65.0f, 0.5f, 1.65f,
+        50.0f, 0.2f,
+        -1,
+        PNP_YAW_CALIBRATION_L3_55,
+        (int)(sizeof(PNP_YAW_CALIBRATION_L3_55) / sizeof(PNP_YAW_CALIBRATION_L3_55[0])),
+        PNP_PITCH_CALIBRATION_L3_55,
+        (int)(sizeof(PNP_PITCH_CALIBRATION_L3_55) / sizeof(PNP_PITCH_CALIBRATION_L3_55[0]))
+    }
+};
+
+static std::atomic<int> g_arm_profile{ARM_PROFILE_MID_L3_40};
+
+static const ArmKinematicsProfile& current_arm_profile(void) {
+    int id = g_arm_profile.load();
+    if (id < 0 || id >= (int)(sizeof(ARM_PROFILES) / sizeof(ARM_PROFILES[0]))) {
+        id = ARM_PROFILE_MID_L3_40;
+    }
+    return ARM_PROFILES[id];
+}
+
+static float interpolate_pnp_yaw_table(const PnpYawCalibrationPoint *table,
+                                       int count,
+                                       float arm_yaw_deg) {
+    if (!table || count <= 0) return 0.0f;
+
+    if (arm_yaw_deg <= table[0].arm_yaw_deg)
+        return table[0].compensation_deg;
+    if (arm_yaw_deg >= table[count - 1].arm_yaw_deg)
+        return table[count - 1].compensation_deg;
 
     for (int i = 0; i < count - 1; ++i) {
-        const PnpYawCalibrationPoint& a = PNP_YAW_CALIBRATION[i];
-        const PnpYawCalibrationPoint& b = PNP_YAW_CALIBRATION[i + 1];
+        const PnpYawCalibrationPoint& a = table[i];
+        const PnpYawCalibrationPoint& b = table[i + 1];
         if (arm_yaw_deg <= b.arm_yaw_deg) {
             float ratio = (arm_yaw_deg - a.arm_yaw_deg) /
                           (b.arm_yaw_deg - a.arm_yaw_deg);
@@ -136,6 +260,43 @@ static float interpolate_pnp_yaw_compensation(float arm_yaw_deg) {
         }
     }
     return 0.0f;
+}
+
+static float interpolate_pnp_pitch_table(const PnpPitchCalibrationPoint *table,
+                                         int count,
+                                         float arm_pitch_deg) {
+    if (!table || count <= 0) return 0.0f;
+
+    if (arm_pitch_deg <= table[0].arm_pitch_deg)
+        return table[0].compensation_deg;
+    if (arm_pitch_deg >= table[count - 1].arm_pitch_deg)
+        return table[count - 1].compensation_deg;
+
+    for (int i = 0; i < count - 1; ++i) {
+        const PnpPitchCalibrationPoint& a = table[i];
+        const PnpPitchCalibrationPoint& b = table[i + 1];
+        if (arm_pitch_deg <= b.arm_pitch_deg) {
+            float ratio = (arm_pitch_deg - a.arm_pitch_deg) /
+                          (b.arm_pitch_deg - a.arm_pitch_deg);
+            return a.compensation_deg +
+                   ratio * (b.compensation_deg - a.compensation_deg);
+        }
+    }
+    return 0.0f;
+}
+
+static float interpolate_pnp_yaw_compensation(float arm_yaw_deg) {
+    const ArmKinematicsProfile& profile = current_arm_profile();
+    return interpolate_pnp_yaw_table(profile.yaw_calib,
+                                     profile.yaw_calib_count,
+                                     arm_yaw_deg);
+}
+
+static float interpolate_pnp_pitch_compensation(float arm_pitch_deg) {
+    const ArmKinematicsProfile& profile = current_arm_profile();
+    return interpolate_pnp_pitch_table(profile.pitch_calib,
+                                       profile.pitch_calib_count,
+                                       arm_pitch_deg);
 }
 
 static int read_calib_mode(void) {
@@ -872,7 +1033,28 @@ static inline cv::Mat eulerZYXToMat(float roll_deg, float pitch_deg, float yaw_d
     return (cv::Mat_<float>(3,3) <<
         cy*cp,  cy*sp*sr - sy*cr,  cy*sp*cr + sy*sr,
         sy*cp,  sy*sp*sr + cy*cr,  sy*sp*cr - cy*sr,
-        -sp,    cp*sr,             cp*cr);
+	        -sp,    cp*sr,             cp*cr);
+}
+
+static inline cv::Mat quatToMat(float qw, float qx, float qy, float qz)
+{
+    float n = sqrtf(qw * qw + qx * qx + qy * qy + qz * qz);
+    if (n < 1e-6f) {
+        return cv::Mat::eye(3, 3, CV_32F);
+    }
+    qw /= n; qx /= n; qy /= n; qz /= n;
+
+    return (cv::Mat_<float>(3,3) <<
+        1.0f - 2.0f * (qy * qy + qz * qz),
+        2.0f * (qx * qy - qz * qw),
+        2.0f * (qx * qz + qy * qw),
+        2.0f * (qx * qy + qz * qw),
+        1.0f - 2.0f * (qx * qx + qz * qz),
+        2.0f * (qy * qz - qx * qw),
+        2.0f * (qx * qz - qy * qw),
+        2.0f * (qy * qz + qx * qw),
+        1.0f - 2.0f * (qx * qx + qy * qy)
+    );
 }
 
 static inline void matToEulerZYX(const cv::Mat& R, float& roll_deg, float& pitch_deg, float& yaw_deg)
@@ -894,8 +1076,55 @@ static inline void matToEulerZYX(const cv::Mat& R, float& roll_deg, float& pitch
     yaw_deg   = yy * 180.0f / (float)M_PI;
 }
 
+static inline cv::Vec3f normalizeVec3(const cv::Vec3f& v)
+{
+    float n = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (n < 1e-6f) return cv::Vec3f(0.0f, 0.0f, 0.0f);
+    return v * (1.0f / n);
+}
+
+static inline cv::Vec3f matToRotVecDeg(const cv::Mat& R)
+{
+    float trace = R.at<float>(0,0) + R.at<float>(1,1) + R.at<float>(2,2);
+    float c = (trace - 1.0f) * 0.5f;
+    if (c > 1.0f) c = 1.0f;
+    if (c < -1.0f) c = -1.0f;
+    float angle = acosf(c);
+    if (angle < 1e-5f) {
+        return cv::Vec3f(
+            (R.at<float>(2,1) - R.at<float>(1,2)) * 0.5f * 180.0f / (float)M_PI,
+            (R.at<float>(0,2) - R.at<float>(2,0)) * 0.5f * 180.0f / (float)M_PI,
+            (R.at<float>(1,0) - R.at<float>(0,1)) * 0.5f * 180.0f / (float)M_PI
+        );
+    }
+
+    float s = 2.0f * sinf(angle);
+    if (fabsf(s) < 1e-6f) return cv::Vec3f(0.0f, 0.0f, 0.0f);
+    cv::Vec3f axis(
+        (R.at<float>(2,1) - R.at<float>(1,2)) / s,
+        (R.at<float>(0,2) - R.at<float>(2,0)) / s,
+        (R.at<float>(1,0) - R.at<float>(0,1)) / s
+    );
+    return axis * (angle * 180.0f / (float)M_PI);
+}
+
+static inline void axisProjectionYawPitch(const cv::Mat& R,
+                                          float& yaw_deg,
+                                          float& pitch_deg)
+{
+    static const cv::Vec3f YAW_AXIS =
+        normalizeVec3(cv::Vec3f(+0.007f, +0.017f, -1.000f));
+    static const cv::Vec3f PITCH_AXIS =
+        normalizeVec3(cv::Vec3f(-0.256f, -0.967f, +0.016f));
+
+    cv::Vec3f rv = matToRotVecDeg(R);
+    yaw_deg = rv.dot(YAW_AXIS);
+    pitch_deg = rv.dot(PITCH_AXIS);
+}
+
 /* A-inverse R_init 捕获标志 */
 volatile int g_r_init_set = 0;
+volatile int g_head_center_request = 1;
 
 /* 独立的 NRF24 IMU 控制链路：俯仰控制（仿照偏航控制架构） */
 void nrf24_control_update(void)
@@ -932,10 +1161,19 @@ void nrf24_control_update(void)
 
     /* A-inverse 初始姿态矩阵 */
     static cv::Mat R_init;
+    static cv::Mat R_imu2_init;
+    static cv::Mat R_head_center_rel;
+    static cv::Mat R_rel_latest;
     static float rel_roll = 0.0f, rel_pitch = 0.0f, rel_yaw = 0.0f;
+    static float vec_pitch = 0.0f, vec_yaw = 0.0f;
+    static bool head_center_set = false;
+    static float pitch_visual_bias_deg = 0.0f;
+    static float effective_pitch_visual_bias_deg = 0.0f;
+    static bool last_is_stop_yaw_for_pitch_bias = true;
+    static float last_pitch_visual_bias_step = 0.0f;
 
     /* PnP 视觉零飘修正：累积修正矩阵 */
-    static const float KI_PNP = 0.05f;
+    static const float KI_PNP = 0.12f;
     static cv::Mat R_bias_total;
 
     /* A-init 触发信号由握手线程控制 (g_wait_a_init) */
@@ -953,10 +1191,19 @@ void nrf24_control_update(void)
     float current_roll_deg = 0.0f;
     float current_yaw_deg = 0.0f;
     float current_pitch_deg = 0.0f;
+    float current_qw = 1.0f;
+    float current_qx = 0.0f;
+    float current_qy = 0.0f;
+    float current_qz = 0.0f;
+    bool quat_valid = false;
     float wx = 0.0f;
     float wy = 0.0f;
     float wz = 0.0f;
     bool imu_valid = false;
+    float imu2_roll_deg = 0.0f;
+    float imu2_yaw_deg = 0.0f;
+    float imu2_pitch_deg = 0.0f;
+    bool imu2_valid = false;
     float wy_hist[NRF24_WY_HIST_SIZE];
     float wz_hist[NRF24_WZ_HIST_SIZE];
     int wy_count = 0;
@@ -968,6 +1215,11 @@ void nrf24_control_update(void)
     current_roll_deg = g_nrf24_state.gy_roll;
     current_yaw_deg = g_nrf24_state.gy_yaw;
     current_pitch_deg = g_nrf24_state.gy_pitch;
+    current_qw = g_nrf24_state.gy_qw;
+    current_qx = g_nrf24_state.gy_qx;
+    current_qy = g_nrf24_state.gy_qy;
+    current_qz = g_nrf24_state.gy_qz;
+    quat_valid = g_nrf24_state.quat_valid;
     wx = g_nrf24_state.gy_wx;
     wy = g_nrf24_state.gy_wy;
     wz = g_nrf24_state.gy_wz;
@@ -991,26 +1243,118 @@ void nrf24_control_update(void)
         }
     }
     pthread_mutex_unlock(&g_nrf24_state.mutex);
+    const float raw_wx = wx;
+    const float raw_wy = wy;
+    const float raw_wz = wz;
 
-    /* ========== A-inverse：消除 IMU 初始安装角 ==========
+    pthread_mutex_lock(&g_imu2_state.mutex);
+    imu2_roll_deg = g_imu2_state.roll;
+    imu2_pitch_deg = g_imu2_state.pitch;
+    imu2_yaw_deg = g_imu2_state.yaw;
+    imu2_valid = g_imu2_state.valid && g_imu2_state.sample_count > 0;
+    pthread_mutex_unlock(&g_imu2_state.mutex);
+
+    /* ========== 双 IMU A-inverse：消除头部 IMU 初始安装角和身体/机械臂转动 ==========
      * A-init 基准现在由 RX 线程收集 5 帧高频数据（10ms/帧）后算平均值得到。
-     * 这里只需检测 R_init 是否已构造（RX 线程已设置 g_r_init_set）。
+     * 头部相对机械臂姿态:
+     *   R_head_delta = R_head_current * R_head_init^T
+     *   R_arm_delta  = R_arm_current  * R_arm_init^T
+     *   R_rel        = R_arm_delta^T * R_head_delta
+     * IMU2 无效时自动退回单头部 IMU 的 A-inverse。
      */
     if (imu_valid) {
         if (g_r_init_set && R_init.empty()) {
-            cv::Mat R_current = eulerZYXToMat(current_roll_deg, current_pitch_deg, current_yaw_deg);
-            R_init = R_current.clone();
-            printf("[A-INIT] R_init built from 5-frame avg: roll=%.2f pitch=%.2f yaw=%.2f\n",
-                   current_roll_deg, current_pitch_deg, current_yaw_deg);
+            R_init = quat_valid ? quatToMat(current_qw, current_qx, current_qy, current_qz)
+                                : eulerZYXToMat(current_roll_deg, current_pitch_deg, current_yaw_deg);
+            if (imu2_valid) {
+                R_imu2_init = eulerZYXToMat(imu2_roll_deg, imu2_pitch_deg, imu2_yaw_deg);
+            }
+            printf("[A-INIT] R_init built: head(roll=%.2f pitch=%.2f yaw=%.2f) "
+                   "imu2_valid=%d imu2(roll=%.2f pitch=%.2f yaw=%.2f)\n",
+                   current_roll_deg, current_pitch_deg, current_yaw_deg,
+                   (int)imu2_valid, imu2_roll_deg, imu2_pitch_deg, imu2_yaw_deg);
         }
         if (g_r_init_set) {
-            cv::Mat R_current = eulerZYXToMat(current_roll_deg, current_pitch_deg, current_yaw_deg);
-            if (!R_bias_total.empty()) {
-                R_current = R_bias_total * R_current;
+            if (imu2_valid && R_imu2_init.empty()) {
+                R_imu2_init = eulerZYXToMat(imu2_roll_deg, imu2_pitch_deg, imu2_yaw_deg);
+                printf("[IMU2] Late R_init captured: roll=%.2f pitch=%.2f yaw=%.2f\n",
+                       imu2_roll_deg, imu2_pitch_deg, imu2_yaw_deg);
             }
-            cv::Mat R_rel_mat = R_current * R_init.t();
+
+            cv::Mat R_head_current = quat_valid ?
+                quatToMat(current_qw, current_qx, current_qy, current_qz) :
+                eulerZYXToMat(current_roll_deg, current_pitch_deg, current_yaw_deg);
+            if (!R_bias_total.empty()) {
+                R_head_current = R_bias_total * R_head_current;
+            }
+            cv::Mat R_head_delta = R_head_current * R_init.t();
+            cv::Mat R_rel_mat = R_head_delta;
+
+            if (imu2_valid && !R_imu2_init.empty()) {
+                cv::Mat R_imu2_current = eulerZYXToMat(imu2_roll_deg, imu2_pitch_deg, imu2_yaw_deg);
+                cv::Mat R_imu2_delta = R_imu2_current * R_imu2_init.t();
+                R_rel_mat = R_imu2_delta.t() * R_head_delta;
+            }
+            R_rel_latest = R_rel_mat.clone();
             matToEulerZYX(R_rel_mat, rel_roll, rel_pitch, rel_yaw);
+            if (head_center_set && !R_head_center_rel.empty()) {
+                cv::Mat R_centered = R_head_center_rel.t() * R_rel_mat;
+                axisProjectionYawPitch(R_centered, vec_yaw, vec_pitch);
+            } else {
+                axisProjectionYawPitch(R_rel_mat, vec_yaw, vec_pitch);
+            }
         }
+    }
+
+    /* 用相对姿态差分得到状态机速度，避免身体转动时沿用头部 IMU 原始 gyro 误触发。 */
+    static float rel_wy_hist[NRF24_WY_HIST_SIZE] = {0.0f};
+    static float rel_wz_hist[NRF24_WZ_HIST_SIZE] = {0.0f};
+    static int rel_wy_idx = 0, rel_wy_count = 0;
+    static int rel_wz_idx = 0, rel_wz_count = 0;
+    static bool rel_rate_init = false;
+    static float prev_vec_pitch = 0.0f;
+    static float prev_vec_yaw = 0.0f;
+    static uint64_t prev_rel_rate_us = 0;
+
+    float rel_pitch_rate = wy;
+    float rel_yaw_rate = wz;
+    if (imu_valid && g_r_init_set) {
+        if (rel_rate_init && prev_rel_rate_us > 0 && now_us > prev_rel_rate_us) {
+            float dt = (now_us - prev_rel_rate_us) / 1000000.0f;
+            if (dt > 0.001f && dt < 0.5f) {
+                rel_pitch_rate = normalize_angle_deg(vec_pitch - prev_vec_pitch) / dt;
+                rel_yaw_rate = normalize_angle_deg(vec_yaw - prev_vec_yaw) / dt;
+            }
+        } else {
+            rel_pitch_rate = 0.0f;
+            rel_yaw_rate = 0.0f;
+            rel_rate_init = true;
+        }
+        prev_vec_pitch = vec_pitch;
+        prev_vec_yaw = vec_yaw;
+        prev_rel_rate_us = now_us;
+
+        rel_wy_hist[rel_wy_idx] = rel_pitch_rate;
+        rel_wy_idx = (rel_wy_idx + 1) % NRF24_WY_HIST_SIZE;
+        if (rel_wy_count < NRF24_WY_HIST_SIZE) rel_wy_count++;
+
+        rel_wz_hist[rel_wz_idx] = rel_yaw_rate;
+        rel_wz_idx = (rel_wz_idx + 1) % NRF24_WZ_HIST_SIZE;
+        if (rel_wz_count < NRF24_WZ_HIST_SIZE) rel_wz_count++;
+
+        wy_count = rel_wy_count;
+        for (int i = 0; i < wy_count; i++) {
+            int pos = (rel_wy_idx - wy_count + i + NRF24_WY_HIST_SIZE) % NRF24_WY_HIST_SIZE;
+            wy_hist[i] = rel_wy_hist[pos];
+        }
+        wz_count = rel_wz_count;
+        for (int i = 0; i < wz_count; i++) {
+            int pos = (rel_wz_idx - wz_count + i + NRF24_WZ_HIST_SIZE) % NRF24_WZ_HIST_SIZE;
+            wz_hist[i] = rel_wz_hist[pos];
+        }
+
+        wy = rel_pitch_rate;
+        wz = rel_yaw_rate;
     }
 
     /* printf("[IMU] roll=%+.2f pitch=%+.2f yaw=%+.2f | wx=%+.2f wz=%+.2f valid=%d\n",
@@ -1041,22 +1385,21 @@ void nrf24_control_update(void)
             int target_yaw = PNP_CALIB_TARGETS[pnp_calib_idx];
 
             if (!pnp_calib_command_sent) {
+                const ArmKinematicsProfile& profile = current_arm_profile();
                 float yaw_rad = -(float)target_yaw * (float)M_PI / 180.0f;
-                const float l1 = 8.0f;
-                const float l2 = 5.0f;
-                const float l3 = 40.0f;
-                const float l4 = 28.0f;
-                float tx = l3 * std::sin(yaw_rad);
-                float ty = l4 + l3 * std::cos(yaw_rad);
-                float tz = l2 + l1;
+                float tx = profile.l3 * std::sin(yaw_rad);
+                float ty = profile.l4 + profile.l3 * std::cos(yaw_rad);
+                float tz = profile.l2 + profile.l1;
 
-                const float servo1 = 30.0f;
-                float servo2 = 50.0f + 0.4f * target_yaw;
+                const float servo1 = profile.servo1_baseline;
+                float servo2 = profile.servo2_baseline +
+                               profile.servo2_yaw_gain * target_yaw;
                 if (servo2 > 270.0f) servo2 = 270.0f;
                 if (servo2 < 0.0f) servo2 = 0.0f;
 
                 if (uart_send_arm_target(tx, ty, tz, servo2, servo1, 0x01) == 0) {
                     g_arm_target_yaw_deg.store((float)target_yaw);
+                    g_arm_target_pitch_deg.store(0.0f);
                     pnp_calib_command_sent = true;
                     pnp_calib_phase_start = now_us;
                     printf("[PnP-Calib] Arm target yaw=%+d pitch=0 -> "
@@ -1102,6 +1445,285 @@ void nrf24_control_update(void)
         g_pnp_calib_phase.store(PNP_CALIB_INACTIVE);
         g_pnp_calib_phase_start_us.store(0);
         printf("[PnP-Calib] Control stopped\n");
+    }
+
+    /*
+     * PnP pitch 多点标定：
+     * 机械臂依次移动到固定 pitch、yaw=0 的位置并保持，用户转头正对相机。
+     * 视觉线程采样 raw PnP pitch，输出 /tmp/pnp_pitch_calib.csv。
+     */
+    static bool pnp_pitch_calib_active = false;
+    static int pnp_pitch_calib_idx = 0;
+    static int pnp_pitch_calib_phase = PNP_CALIB_INACTIVE;
+    static uint64_t pnp_pitch_calib_phase_start = 0;
+    static bool pnp_pitch_calib_command_sent = false;
+
+    if (read_calib_mode() == 4) {
+        if (!pnp_pitch_calib_active) {
+            pnp_pitch_calib_active = true;
+            pnp_pitch_calib_idx = 0;
+            pnp_pitch_calib_phase = PNP_CALIB_PREPARE;
+            pnp_pitch_calib_phase_start = 0;
+            pnp_pitch_calib_command_sent = false;
+            printf("[PnP-Pitch-Calib] Moving arm through pitch targets, yaw fixed at 0 deg\n");
+        }
+
+        if (pnp_pitch_calib_idx < PNP_PITCH_CALIB_TARGET_COUNT) {
+            int target_pitch = PNP_PITCH_CALIB_TARGETS[pnp_pitch_calib_idx];
+
+            if (!pnp_pitch_calib_command_sent) {
+                const ArmKinematicsProfile& profile = current_arm_profile();
+                float pitch_rad = (float)target_pitch * (float)M_PI / 180.0f;
+                float tx = 0.0f;
+                float ty = profile.l4 - profile.l1 * std::sin(pitch_rad) +
+                           profile.l3 * std::cos(pitch_rad);
+                float tz = profile.l2 +
+                           profile.l1 * std::cos(pitch_rad * profile.pitch_z_gain) +
+                           profile.l3 * std::sin(pitch_rad * profile.pitch_z_gain);
+
+                const float pitch_servo_k = (target_pitch >= 0) ?
+                                            profile.servo1_gain_up :
+                                            profile.servo1_gain_down;
+                float servo1 = profile.servo1_baseline + pitch_servo_k * target_pitch;
+                if (servo1 > 90.0f)  servo1 = 90.0f;
+                if (servo1 < -90.0f) servo1 = -90.0f;
+                const float servo2 = profile.servo2_baseline;
+
+                if (uart_send_arm_target(tx, ty, tz, servo2, servo1, 0x01) == 0) {
+                    g_arm_target_pitch_deg.store((float)target_pitch);
+                    g_arm_target_yaw_deg.store(0.0f);
+                    pnp_pitch_calib_command_sent = true;
+                    pnp_pitch_calib_phase_start = now_us;
+                    printf("[PnP-Pitch-Calib] Arm target pitch=%+d yaw=0 -> "
+                           "x=%.1f y=%.1f z=%.1f\n",
+                           target_pitch, tx, ty, tz);
+                }
+            } else {
+                uint64_t elapsed = now_us - pnp_pitch_calib_phase_start;
+                if (pnp_pitch_calib_phase == PNP_CALIB_PREPARE &&
+                    elapsed >= PNP_CALIB_PREPARE_US) {
+                    pnp_pitch_calib_phase = PNP_CALIB_SAMPLE;
+                    pnp_pitch_calib_phase_start = now_us;
+                    printf("[PnP-Pitch-Calib] Target %+d: sampling 8s, face the camera\n",
+                           target_pitch);
+                } else if (pnp_pitch_calib_phase == PNP_CALIB_SAMPLE &&
+                           elapsed >= PNP_CALIB_SAMPLE_US) {
+                    pnp_pitch_calib_idx++;
+                    pnp_pitch_calib_command_sent = false;
+                    pnp_pitch_calib_phase_start = 0;
+                    if (pnp_pitch_calib_idx < PNP_PITCH_CALIB_TARGET_COUNT) {
+                        pnp_pitch_calib_phase = PNP_CALIB_PREPARE;
+                    } else {
+                        pnp_pitch_calib_phase = PNP_CALIB_COMPLETE;
+                        printf("[PnP-Pitch-Calib] All targets complete\n");
+                    }
+                }
+            }
+        }
+
+        g_pnp_calib_target_idx.store(pnp_pitch_calib_idx);
+        g_pnp_calib_phase.store(pnp_pitch_calib_phase);
+        g_pnp_calib_phase_start_us.store(pnp_pitch_calib_phase_start);
+        return;
+    }
+
+    if (pnp_pitch_calib_active) {
+        pnp_pitch_calib_active = false;
+        pnp_pitch_calib_idx = 0;
+        pnp_pitch_calib_phase = PNP_CALIB_INACTIVE;
+        pnp_pitch_calib_phase_start = 0;
+        pnp_pitch_calib_command_sent = false;
+        g_pnp_calib_target_idx.store(-1);
+        g_pnp_calib_phase.store(PNP_CALIB_INACTIVE);
+        g_pnp_calib_phase_start_us.store(0);
+        printf("[PnP-Pitch-Calib] Control stopped\n");
+    }
+
+    /*
+     * Head IMU raw grid calibration:
+     * Move the camera through a 3x3 yaw/pitch grid. The operator watches the
+     * video and points the head at the camera; this records head IMU, waist IMU,
+     * and A-inverse relative pose averages for each known camera direction.
+     */
+    static bool head_imu_grid_active = false;
+    static int head_imu_grid_idx = 0;
+    static int head_imu_grid_phase = PNP_CALIB_INACTIVE;
+    static uint64_t head_imu_grid_phase_start = 0;
+    static bool head_imu_grid_command_sent = false;
+    static bool head_imu_grid_complete_printed = false;
+    static double grid_head_roll_sum = 0.0;
+    static double grid_head_pitch_sum = 0.0;
+    static double grid_head_yaw_sum = 0.0;
+    static double grid_head_wx_sum = 0.0;
+    static double grid_head_wy_sum = 0.0;
+    static double grid_head_wz_sum = 0.0;
+    static double grid_waist_roll_sum = 0.0;
+    static double grid_waist_pitch_sum = 0.0;
+    static double grid_waist_yaw_sum = 0.0;
+    static double grid_rel_roll_sum = 0.0;
+    static double grid_rel_pitch_sum = 0.0;
+    static double grid_rel_yaw_sum = 0.0;
+    static int grid_sample_count = 0;
+
+    auto reset_head_imu_grid_accum = [&]() {
+        grid_head_roll_sum = grid_head_pitch_sum = grid_head_yaw_sum = 0.0;
+        grid_head_wx_sum = grid_head_wy_sum = grid_head_wz_sum = 0.0;
+        grid_waist_roll_sum = grid_waist_pitch_sum = grid_waist_yaw_sum = 0.0;
+        grid_rel_roll_sum = grid_rel_pitch_sum = grid_rel_yaw_sum = 0.0;
+        grid_sample_count = 0;
+    };
+
+    if (read_calib_mode() == 5) {
+        if (!head_imu_grid_active) {
+            head_imu_grid_active = true;
+            head_imu_grid_idx = 0;
+            head_imu_grid_phase = PNP_CALIB_PREPARE;
+            head_imu_grid_phase_start = 0;
+            head_imu_grid_command_sent = false;
+            head_imu_grid_complete_printed = false;
+            reset_head_imu_grid_accum();
+
+            FILE *fp = fopen("/tmp/head_imu_grid_calib.csv", "w");
+            if (fp) {
+                fprintf(fp,
+                        "target_name,target_yaw_deg,target_pitch_deg,sample_count,"
+                        "head_roll_avg,head_pitch_avg,head_yaw_avg,"
+                        "head_wx_avg,head_wy_avg,head_wz_avg,"
+                        "waist_valid,waist_roll_avg,waist_pitch_avg,waist_yaw_avg,"
+                        "rel_roll_avg,rel_pitch_avg,rel_yaw_avg\n");
+                fclose(fp);
+            }
+            printf("[Head-IMU-Calib] 3x3 grid started, output=/tmp/head_imu_grid_calib.csv\n");
+        }
+
+        if (head_imu_grid_idx < HEAD_IMU_GRID_TARGET_COUNT) {
+            const HeadImuGridTarget& target = HEAD_IMU_GRID_TARGETS[head_imu_grid_idx];
+
+            if (!head_imu_grid_command_sent) {
+                const ArmKinematicsProfile& profile = current_arm_profile();
+                float pitch_rad = target.pitch_deg * (float)M_PI / 180.0f;
+                float yaw_rad = -target.yaw_deg * (float)M_PI / 180.0f;
+                float tx = profile.l3 * std::sin(yaw_rad) * std::cos(pitch_rad);
+                float ty = profile.l4 - profile.l1 * std::sin(pitch_rad) +
+                           profile.l3 * std::cos(pitch_rad) * std::cos(yaw_rad);
+                float tz = profile.l2 +
+                           profile.l1 * std::cos(pitch_rad * profile.pitch_z_gain) +
+                           profile.l3 * std::sin(pitch_rad * profile.pitch_z_gain) *
+                           std::cos(yaw_rad);
+
+                const float pitch_servo_k = (target.pitch_deg >= 0.0f) ?
+                                            profile.servo1_gain_up :
+                                            profile.servo1_gain_down;
+                float servo1 = profile.servo1_baseline + pitch_servo_k * target.pitch_deg;
+                if (servo1 > 90.0f)  servo1 = 90.0f;
+                if (servo1 < -90.0f) servo1 = -90.0f;
+                float servo2 = profile.servo2_baseline +
+                               profile.servo2_yaw_gain * target.yaw_deg;
+                if (servo2 > 270.0f) servo2 = 270.0f;
+                if (servo2 < 0.0f) servo2 = 0.0f;
+
+                if (uart_send_arm_target(tx, ty, tz, servo2, servo1, 0x01) == 0) {
+                    g_arm_target_yaw_deg.store(target.yaw_deg);
+                    g_arm_target_pitch_deg.store(target.pitch_deg);
+                    head_imu_grid_command_sent = true;
+                    head_imu_grid_phase_start = now_us;
+                    head_imu_grid_phase = PNP_CALIB_PREPARE;
+                    reset_head_imu_grid_accum();
+                    printf("[Head-IMU-Calib] Target %d/%d %s yaw=%+.1f pitch=%+.1f -> "
+                           "x=%.1f y=%.1f z=%.1f; face the camera\n",
+                           head_imu_grid_idx + 1, HEAD_IMU_GRID_TARGET_COUNT,
+                           target.name, target.yaw_deg, target.pitch_deg,
+                           tx, ty, tz);
+                }
+            } else {
+                uint64_t elapsed = now_us - head_imu_grid_phase_start;
+                if (head_imu_grid_phase == PNP_CALIB_PREPARE &&
+                    elapsed >= PNP_CALIB_PREPARE_US) {
+                    head_imu_grid_phase = PNP_CALIB_SAMPLE;
+                    head_imu_grid_phase_start = now_us;
+                    reset_head_imu_grid_accum();
+                    printf("[Head-IMU-Calib] Sampling %s for 8s\n", target.name);
+                } else if (head_imu_grid_phase == PNP_CALIB_SAMPLE) {
+                    grid_head_roll_sum += current_roll_deg;
+                    grid_head_pitch_sum += current_pitch_deg;
+                    grid_head_yaw_sum += current_yaw_deg;
+                    grid_head_wx_sum += raw_wx;
+                    grid_head_wy_sum += raw_wy;
+                    grid_head_wz_sum += raw_wz;
+                    grid_waist_roll_sum += imu2_roll_deg;
+                    grid_waist_pitch_sum += imu2_pitch_deg;
+                    grid_waist_yaw_sum += imu2_yaw_deg;
+                    grid_rel_roll_sum += rel_roll;
+                    grid_rel_pitch_sum += rel_pitch;
+                    grid_rel_yaw_sum += rel_yaw;
+                    grid_sample_count++;
+
+                    if (elapsed >= PNP_CALIB_SAMPLE_US) {
+                        int n = grid_sample_count > 0 ? grid_sample_count : 1;
+                        FILE *fp = fopen("/tmp/head_imu_grid_calib.csv", "a");
+                        if (fp) {
+                            fprintf(fp,
+                                    "%s,%.2f,%.2f,%d,"
+                                    "%.4f,%.4f,%.4f,"
+                                    "%.4f,%.4f,%.4f,"
+                                    "%d,%.4f,%.4f,%.4f,"
+                                    "%.4f,%.4f,%.4f\n",
+                                    target.name, target.yaw_deg, target.pitch_deg,
+                                    grid_sample_count,
+                                    grid_head_roll_sum / n,
+                                    grid_head_pitch_sum / n,
+                                    grid_head_yaw_sum / n,
+                                    grid_head_wx_sum / n,
+                                    grid_head_wy_sum / n,
+                                    grid_head_wz_sum / n,
+                                    imu2_valid ? 1 : 0,
+                                    grid_waist_roll_sum / n,
+                                    grid_waist_pitch_sum / n,
+                                    grid_waist_yaw_sum / n,
+                                    grid_rel_roll_sum / n,
+                                    grid_rel_pitch_sum / n,
+                                    grid_rel_yaw_sum / n);
+                            fclose(fp);
+                        }
+                        printf("[Head-IMU-Calib] Saved %s (%d samples): "
+                               "head r/p/y=%.2f/%.2f/%.2f rel r/p/y=%.2f/%.2f/%.2f\n",
+                               target.name, grid_sample_count,
+                               grid_head_roll_sum / n,
+                               grid_head_pitch_sum / n,
+                               grid_head_yaw_sum / n,
+                               grid_rel_roll_sum / n,
+                               grid_rel_pitch_sum / n,
+                               grid_rel_yaw_sum / n);
+                        head_imu_grid_idx++;
+                        head_imu_grid_command_sent = false;
+                        head_imu_grid_phase_start = 0;
+                        reset_head_imu_grid_accum();
+                        head_imu_grid_phase = (head_imu_grid_idx < HEAD_IMU_GRID_TARGET_COUNT) ?
+                                              PNP_CALIB_PREPARE : PNP_CALIB_COMPLETE;
+                    }
+                }
+            }
+        }
+
+        if (head_imu_grid_idx >= HEAD_IMU_GRID_TARGET_COUNT) {
+            head_imu_grid_phase = PNP_CALIB_COMPLETE;
+            if (!head_imu_grid_complete_printed) {
+                printf("[Head-IMU-Calib] Complete: /tmp/head_imu_grid_calib.csv\n");
+                head_imu_grid_complete_printed = true;
+            }
+        }
+        return;
+    }
+
+    if (head_imu_grid_active) {
+        head_imu_grid_active = false;
+        head_imu_grid_idx = 0;
+        head_imu_grid_phase = PNP_CALIB_INACTIVE;
+        head_imu_grid_phase_start = 0;
+        head_imu_grid_command_sent = false;
+        head_imu_grid_complete_printed = false;
+        reset_head_imu_grid_accum();
+        printf("[Head-IMU-Calib] Stopped\n");
     }
 
     /* ========== 标定模式：锁定 gx/gy/gz，只调 J4（不依赖 imu_valid）========== */
@@ -1231,6 +1853,41 @@ void nrf24_control_update(void)
 
     /* A-init 完成前不发坐标指令（由 !g_r_init_set 在上文拦截） */
 
+    if (!head_center_set || g_head_center_request) {
+        cv::Mat R_head_current = quat_valid ?
+            quatToMat(current_qw, current_qx, current_qy, current_qz) :
+            eulerZYXToMat(current_roll_deg, current_pitch_deg, current_yaw_deg);
+        if (!R_bias_total.empty()) {
+            R_head_current = R_bias_total * R_head_current;
+        }
+        cv::Mat R_head_delta = R_head_current * R_init.t();
+        R_head_center_rel = R_head_delta;
+        if (imu2_valid && !R_imu2_init.empty()) {
+            cv::Mat R_imu2_current = eulerZYXToMat(imu2_roll_deg, imu2_pitch_deg, imu2_yaw_deg);
+            cv::Mat R_imu2_delta = R_imu2_current * R_imu2_init.t();
+            R_head_center_rel = R_imu2_delta.t() * R_head_delta;
+        }
+        vec_pitch = 0.0f;
+        vec_yaw = 0.0f;
+        head_center_set = true;
+        g_head_center_request = 0;
+        pitch_visual_bias_deg = 0.0f;
+        effective_pitch_visual_bias_deg = 0.0f;
+        last_is_stop_yaw_for_pitch_bias = true;
+        last_pitch_visual_bias_step = 0.0f;
+        last_cmd_target_pitch = 0.0f;
+        last_cmd_target_yaw = 0.0f;
+        predictor.reset();
+        predictor_yaw.reset();
+        printf("[HeadCenter] vector center captured "
+               "(rel_roll=%+.2f rel_pitch=%+.2f rel_yaw=%+.2f) "
+               "axis_yaw=(+0.007,+0.017,-1.000) axis_pitch=(-0.256,-0.967,+0.016)\n",
+               rel_roll, rel_pitch, rel_yaw);
+    }
+
+    float pitch_control_deg = vec_pitch;
+    float yaw_control_deg = vec_yaw;
+
     /* 基准标定（A-inverse 后初始姿态已归零，标量 baseline 不再需要） */
     if (!pitch_baseline_set) {
         pitch_baseline_set = true;
@@ -1276,16 +1933,29 @@ void nrf24_control_update(void)
 
     bool is_stop_yaw = ctx_yaw.is_stop();
 
+    if (last_is_stop_yaw_for_pitch_bias && !is_stop_yaw) {
+        pitch_visual_bias_deg *= 0.5f;
+        last_pitch_visual_bias_step = 0.0f;
+    }
+    last_is_stop_yaw_for_pitch_bias = is_stop_yaw;
+
     /* ========== PnP 视觉零飘修正（只在完全静止态执行）==========
      * 当 pitch/yaw 都静止且 PnP 已连续 3 帧有效时，构造旋转修正矩阵
      * 叠加到 R_bias_total，并重新计算 rel_pitch/rel_yaw。
-     */
+    */
     float pitch_delta = 0.0f, yaw_delta = 0.0f;
+    static const float KI_PNP_PITCH_BIAS = 0.15f;
+    static const float K_PNP_PITCH_Z_CM = 0.0f;
     bool do_pnp_correct = false;
-    if (g_r_init_set && is_stop && is_stop_yaw) {
+    if (g_r_init_set && is_stop && is_stop_yaw && g_arm_stable) {
         pthread_mutex_lock(&g_nrf24_state.mutex);
         if (g_nrf24_state.pnp_correction_ready) {
-            pitch_delta = 0.0f;  // 先关闭 pitch 修正
+            const ArmKinematicsProfile& profile = current_arm_profile();
+            float pitch_bias_step =
+                KI_PNP_PITCH_BIAS * g_nrf24_state.pnp_pitch_correction;
+            pitch_visual_bias_deg += pitch_bias_step;
+            last_pitch_visual_bias_step = pitch_bias_step;
+            pitch_delta = 0.0f;
             yaw_delta   = -KI_PNP * g_nrf24_state.pnp_yaw_correction;
             g_nrf24_state.pnp_correction_ready = false;
             do_pnp_correct = true;
@@ -1300,15 +1970,52 @@ void nrf24_control_update(void)
         R_bias_total = R_delta * R_bias_total;
 
         if (imu_valid) {
-            cv::Mat R_current = eulerZYXToMat(current_roll_deg, current_pitch_deg, current_yaw_deg);
-            cv::Mat R_corrected = R_bias_total * R_current;
-            cv::Mat R_rel_mat = R_corrected * R_init.t();
+            cv::Mat R_head_current = quat_valid ?
+                quatToMat(current_qw, current_qx, current_qy, current_qz) :
+                eulerZYXToMat(current_roll_deg, current_pitch_deg, current_yaw_deg);
+            cv::Mat R_corrected = R_bias_total * R_head_current;
+            cv::Mat R_head_delta = R_corrected * R_init.t();
+            cv::Mat R_rel_mat = R_head_delta;
+            if (imu2_valid && !R_imu2_init.empty()) {
+                cv::Mat R_imu2_current = eulerZYXToMat(imu2_roll_deg, imu2_pitch_deg, imu2_yaw_deg);
+                cv::Mat R_imu2_delta = R_imu2_current * R_imu2_init.t();
+                R_rel_mat = R_imu2_delta.t() * R_head_delta;
+            }
             matToEulerZYX(R_rel_mat, rel_roll, rel_pitch, rel_yaw);
+            if (head_center_set && !R_head_center_rel.empty()) {
+                cv::Mat R_centered = R_head_center_rel.t() * R_rel_mat;
+                axisProjectionYawPitch(R_centered, vec_yaw, vec_pitch);
+            } else {
+                axisProjectionYawPitch(R_rel_mat, vec_yaw, vec_pitch);
+            }
         }
     }
 
-    float target_pitch_deg = is_stop ? rel_pitch
-                                     : predictor.get_target_yaw(rel_pitch);
+    const float PITCH_BIAS_FULL_YAW_DEG = 35.0f;
+    float pitch_bias_yaw_weight =
+        std::min(1.0f, std::fabs(yaw_control_deg) / PITCH_BIAS_FULL_YAW_DEG);
+    pitch_bias_yaw_weight = 0.5f + 0.5f * pitch_bias_yaw_weight;
+    effective_pitch_visual_bias_deg = pitch_visual_bias_deg * pitch_bias_yaw_weight;
+    const float PITCH_POS_FADE_START_YAW_DEG = 60.0f;
+    const float PITCH_POS_FADE_END_YAW_DEG = 80.0f;
+    float pitch_position_weight = 1.0f;
+    float pitch_route_yaw_abs = std::fabs(yaw_control_deg);
+    if (pitch_route_yaw_abs > PITCH_POS_FADE_START_YAW_DEG) {
+        pitch_position_weight =
+            (PITCH_POS_FADE_END_YAW_DEG - pitch_route_yaw_abs) /
+            (PITCH_POS_FADE_END_YAW_DEG - PITCH_POS_FADE_START_YAW_DEG);
+        if (pitch_position_weight < 0.0f) pitch_position_weight = 0.0f;
+        if (pitch_position_weight > 1.0f) pitch_position_weight = 1.0f;
+    }
+    float position_pitch_visual_bias_deg =
+        effective_pitch_visual_bias_deg * pitch_position_weight;
+    float pitch_input_deg = normalize_angle_deg(pitch_control_deg - effective_pitch_visual_bias_deg);
+    float position_pitch_input_deg =
+        normalize_angle_deg(pitch_control_deg - position_pitch_visual_bias_deg);
+    float target_pitch_deg = is_stop ? pitch_input_deg
+                                     : predictor.get_target_yaw(pitch_input_deg);
+    float target_position_pitch_deg = is_stop ? position_pitch_input_deg
+                                             : predictor.get_target_yaw(position_pitch_input_deg);
     float delta_pitch_deg = normalize_angle_deg(target_pitch_deg - last_cmd_target_pitch);
     bool pitch_moved_enough = std::fabs(delta_pitch_deg) > CMD_PITCH_THRESHOLD_DEG;
 
@@ -1328,9 +2035,8 @@ void nrf24_control_update(void)
         }
     }
 
-    float use_yaw = -rel_yaw;  // 极性修正
-    float target_yaw_deg = is_stop_yaw ? use_yaw
-                                       : predictor_yaw.get_target_yaw(use_yaw);
+    float target_yaw_deg = is_stop_yaw ? yaw_control_deg
+                                       : predictor_yaw.get_target_yaw(yaw_control_deg);
     float delta_yaw_deg = normalize_angle_deg(target_yaw_deg - last_cmd_target_yaw);
     bool yaw_moved_enough = std::fabs(delta_yaw_deg) > CMD_YAW_THRESHOLD_DEG;
 
@@ -1359,13 +2065,27 @@ void nrf24_control_update(void)
     static float last_tz = NRF_FACE_Z_CM;
 
     bool should_cmd = pitch_should_cmd || yaw_should_cmd;
-    printf("[CMD] pitch=%+.2f->%+.2f(d=%+.2f%s) yaw=%+.2f->%+.2f(d=%+.2f%s) | p_cmd=%d y_cmd=%d | tx=%.1f ty=%.1f tz=%.1f\n",
+    /* printf("[CMD] pitch=%+.2f->%+.2f(d=%+.2f%s) yaw=%+.2f->%+.2f(d=%+.2f%s) | p_cmd=%d y_cmd=%d | tx=%.1f ty=%.1f tz=%.1f\n",
            rel_pitch, target_pitch_deg, delta_pitch_deg, pitch_moved_enough ? "" : "_thr",
            rel_yaw, target_yaw_deg, delta_yaw_deg, yaw_moved_enough ? "" : "_thr",
-           pitch_should_cmd, yaw_should_cmd, last_tx, last_ty, last_tz);
+           pitch_should_cmd, yaw_should_cmd, last_tx, last_ty, last_tz); */
     if (should_cmd) {
-        float delta_pitch_deg = normalize_angle_deg(target_pitch_deg - nrf_baseline_roll_deg);
-        float cum_pitch_offset = delta_pitch_deg * (float)M_PI / 180.0f;
+        const ArmKinematicsProfile& profile = current_arm_profile();
+        bool pnp_valid_snapshot = false;
+        float pnp_pitch_corr_snapshot = 0.0f;
+        float pnp_yaw_corr_snapshot = 0.0f;
+        pthread_mutex_lock(&g_nrf24_state.mutex);
+        pnp_valid_snapshot = g_nrf24_state.pnp_valid;
+        pnp_pitch_corr_snapshot = g_nrf24_state.pnp_pitch_correction;
+        pnp_yaw_corr_snapshot = g_nrf24_state.pnp_yaw_correction;
+        pthread_mutex_unlock(&g_nrf24_state.mutex);
+
+        float delta_pitch_servo_deg =
+            normalize_angle_deg(target_pitch_deg - nrf_baseline_roll_deg);
+        float delta_pitch_position_deg =
+            normalize_angle_deg(target_position_pitch_deg - nrf_baseline_roll_deg);
+        float position_pitch_deg = (float)profile.position_pitch_sign * delta_pitch_position_deg;
+        float cum_pitch_offset = position_pitch_deg * (float)M_PI / 180.0f;
         if (cum_pitch_offset > (float)M_PI / 2.0f)
             cum_pitch_offset = (float)M_PI / 2.0f;
         if (cum_pitch_offset < -(float)M_PI / 2.0f)
@@ -1378,14 +2098,16 @@ void nrf24_control_update(void)
         if (cum_yaw_offset < -(float)M_PI / 2.0f)
             cum_yaw_offset = -(float)M_PI / 2.0f;
 
-        const float l1 = 8.0f;
-        const float l2 = 5.0f;
-        const float l3 = 40.0f;
-        const float l4 = 28.0f;
-        float k = 1.6f;
-        last_tx = l3 * std::sin(cum_yaw_offset) * std::cos(cum_pitch_offset);
-        last_ty = l4 - l1 * std::sin(cum_pitch_offset) + l3 * std::cos(cum_pitch_offset) * std::cos(cum_yaw_offset);
-        last_tz = l2 + l1 * std::cos(cum_pitch_offset * k) + l3 * std::sin(cum_pitch_offset * k) * std::cos(cum_yaw_offset);
+        last_tx = profile.l3 * std::sin(cum_yaw_offset) * std::cos(cum_pitch_offset);
+        last_ty = profile.l4 - profile.l1 * std::sin(cum_pitch_offset) +
+                  profile.l3 * std::cos(cum_pitch_offset) * std::cos(cum_yaw_offset);
+        last_tz = profile.l2 +
+                  profile.l1 * std::cos(cum_pitch_offset * profile.pitch_z_gain) +
+                  profile.l3 * std::sin(cum_pitch_offset * profile.pitch_z_gain) *
+                  std::cos(cum_yaw_offset);
+        float pnp_pitch_z_corr = pnp_valid_snapshot ?
+                                 K_PNP_PITCH_Z_CM * pnp_pitch_corr_snapshot : 0.0f;
+        last_tz += pnp_pitch_z_corr;
 
         // 位置死区：坐标变化 < 2cm 不发令，抑制 Y 轴附近 atan2 敏感导致的微抖
         static float prev_sent_tx = 0.0f;
@@ -1413,20 +2135,16 @@ void nrf24_control_update(void)
         }
 
         /* ========== 舵机控制 ==========
-         * prediction（flag=0x00）时：坐标(tx,ty,tz)用预测值，但舵机保持上一次
-         * 实际停止态（flag=0x01）算出的角度，避免高频prediction导致舵机抖动。
+         * prediction（flag=0x00）也发送当前算出的舵机角，便于现场调试俯仰/偏航跟随。
          */
-        static const float SERVO1_BASELINE = 30.0f;
-        static const float K_PITCH_SERVO = -1.2f;
-
-        float curr_servo1 = SERVO1_BASELINE + K_PITCH_SERVO * delta_pitch_deg;
+        float pitch_servo_k = (delta_pitch_servo_deg >= 0.0f) ?
+                              profile.servo1_gain_up : profile.servo1_gain_down;
+        float curr_servo1 = profile.servo1_baseline + pitch_servo_k * delta_pitch_servo_deg;
         if (curr_servo1 > 90.0f)  curr_servo1 = 90.0f;
         if (curr_servo1 < -90.0f) curr_servo1 = -90.0f;
 
-        static const float SERVO2_BASELINE = 50.0f;
-        static const float K_YAW_SERVO = 0.4f;
-
-        float curr_servo2 = SERVO2_BASELINE + K_YAW_SERVO * delta_yaw_deg;
+        float curr_servo2 = profile.servo2_baseline +
+                            profile.servo2_yaw_gain * delta_yaw_deg;
         if (curr_servo2 > 270.0f) curr_servo2 = 270.0f;
         if (curr_servo2 < 0.0f)   curr_servo2 = 0.0f;
 
@@ -1435,20 +2153,26 @@ void nrf24_control_update(void)
         if (yaw_should_cmd && !is_stop_yaw) is_prediction = true;
         uint8_t flag = is_prediction ? 0x00 : 0x01;
 
-        static float actual_servo1 = SERVO1_BASELINE;
-        static float actual_servo2 = SERVO2_BASELINE;
-        if (!is_prediction) {
-            actual_servo1 = curr_servo1;
-            actual_servo2 = curr_servo2;
-        }
-
-        float send_servo1 = is_prediction ? actual_servo1 : curr_servo1;
-        float send_servo2 = is_prediction ? actual_servo2 : curr_servo2;
-
         int send_ret = uart_send_arm_target(last_tx, last_ty, last_tz,
-                                            send_servo2, send_servo1, flag);
+                                            curr_servo2, curr_servo1, flag);
         if (send_ret == 0) {
             g_arm_target_yaw_deg.store(target_yaw_deg);
+            g_arm_target_pitch_deg.store(target_pitch_deg);
+            printf("[ARM-CMD] tx=%.2f ty=%.2f tz=%.2f j5=%.2f j4=%.2f flag=0x%02X "
+                   "| vec_pitch=%+.2f vec_yaw=%+.2f qmode=%d pitch_bias=%+.2f eff_bias=%+.2f pos_w=%.2f target_pitch=%+.2f pos_pitch=%+.2f d_pitch=%+.2f pos_sign=%+d "
+                   "| rel_rpy=%+.2f/%+.2f/%+.2f target_yaw=%+.2f d_yaw=%+.2f "
+                   "| pnp=%d pitch_corr=%+.2f z_corr=%+.2f bias_step=%+.2f yaw_corr=%+.2f\n",
+                   last_tx, last_ty, last_tz, curr_servo2, curr_servo1, flag,
+                   vec_pitch, vec_yaw, quat_valid ? 1 : 0,
+                   pitch_visual_bias_deg, effective_pitch_visual_bias_deg,
+                   pitch_position_weight, target_pitch_deg, target_position_pitch_deg,
+                   delta_pitch_servo_deg, profile.position_pitch_sign,
+                   rel_roll, rel_pitch, rel_yaw, target_yaw_deg, delta_yaw_deg,
+                   pnp_valid_snapshot ? 1 : 0,
+                   pnp_pitch_corr_snapshot,
+                   pnp_pitch_z_corr,
+                   last_pitch_visual_bias_step,
+                   pnp_yaw_corr_snapshot);
         }
 
         if (pitch_should_cmd) {
@@ -1575,21 +2299,21 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h,
                tvec.at<double>(0), tvec.at<double>(1), tvec.at<double>(2));
     } */
 
-    if (reproj_error > 25.0) {
-        static int bad_cnt = 0;
-        if (++bad_cnt % 30 == 0) {
-            printf("[Pose] Bad frame skipped, reprojection error=%.1fpx\n", reproj_error);
-        }
+	    if (reproj_error > 25.0) {
+	        static int bad_cnt = 0;
+	        if (++bad_cnt % 30 == 0) {
+	            /* printf("[Pose] Bad frame skipped, reprojection error=%.1fpx\n", reproj_error); */
+	        }
         pnp_fail();
         return;
     }
 
     // 硬丢弃：OpenCV 相机坐标系 Z 正方向远离相机，tvec_z < 0 表示人脸在相机后方，是镜像解
-    if (tvec.at<double>(2) < 0) {
-        static int mirror_cnt = 0;
-        if (++mirror_cnt % 30 == 0) {
-            printf("[Pose] Mirror solution detected (tz=%.1f), dropped\n", tvec.at<double>(2));
-        }
+	    if (tvec.at<double>(2) < 0) {
+	        static int mirror_cnt = 0;
+	        if (++mirror_cnt % 30 == 0) {
+	            /* printf("[Pose] Mirror solution detected (tz=%.1f), dropped\n", tvec.at<double>(2)); */
+	        }
         pnp_fail();
         return;
     }
@@ -1604,10 +2328,10 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h,
         double cos_half = std::min(1.0, std::max(-1.0, (trace - 1.0) / 2.0));
         double angle_diff = std::acos(cos_half);
         if (angle_diff > M_PI / 3) {
-            static int jump_cnt = 0;
-            if (++jump_cnt % 30 == 0) {
-                printf("[Pose] Jump detected (%.0f deg), fallback to prev pose & reset filter\n", angle_diff * 180.0 / M_PI);
-            }
+	            static int jump_cnt = 0;
+	            if (++jump_cnt % 30 == 0) {
+	                /* printf("[Pose] Jump detected (%.0f deg), fallback to prev pose & reset filter\n", angle_diff * 180.0 / M_PI); */
+	            }
             rvec = prev_rvec.clone();
             tvec = prev_tvec.clone();
             pose_filter_init = false;  // 重置滤波器，防止正确解和镜像解被稀释
@@ -1781,6 +2505,10 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h,
     float yaw_compensation_deg =
         interpolate_pnp_yaw_compensation(arm_yaw_deg);
     double corrected_hy_deg = hy_deg + yaw_compensation_deg;
+    float arm_pitch_deg = g_arm_target_pitch_deg.load();
+    float pitch_compensation_deg =
+        interpolate_pnp_pitch_compensation(arm_pitch_deg);
+    double corrected_hp_deg = hp_deg + pitch_compensation_deg;
 
     /* PnP yaw 多点标定：控制线程移动机械臂，视觉线程只负责采样。 */
     {
@@ -1802,7 +2530,7 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h,
                 yaw_sum = 0.0;
                 yaw_count = 0;
 
-                FILE *fp = fopen("/tmp/pnp_yaw_calib_negative.csv", "w");
+                FILE *fp = fopen("/tmp/pnp_yaw_calib.csv", "w");
                 if (fp) {
                     fprintf(fp, "target_yaw_deg,pnp_yaw_avg_deg,sample_count\n");
                     fclose(fp);
@@ -1818,7 +2546,7 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h,
                 (phase != PNP_CALIB_SAMPLE || target_idx != sample_idx) &&
                 sample_idx >= 0 && sample_idx < PNP_CALIB_TARGET_COUNT) {
                 double average = yaw_count > 0 ? yaw_sum / yaw_count : 0.0;
-                FILE *fp = fopen("/tmp/pnp_yaw_calib_negative.csv", "a");
+                FILE *fp = fopen("/tmp/pnp_yaw_calib.csv", "a");
                 if (fp) {
                     fprintf(fp, "%d,%.4f,%d\n",
                             PNP_CALIB_TARGETS[sample_idx], average, yaw_count);
@@ -1864,7 +2592,7 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h,
                             cv::Scalar(255), 2);
             } else if (phase == PNP_CALIB_COMPLETE) {
                 cv::putText(y_mat,
-                            "PnP CALIB COMPLETE: /tmp/pnp_yaw_calib_negative.csv",
+                            "PnP CALIB COMPLETE: /tmp/pnp_yaw_calib.csv",
                             cv::Point(10, 100),
                             cv::FONT_HERSHEY_SIMPLEX, 0.9,
                             cv::Scalar(255), 2);
@@ -1880,10 +2608,108 @@ static void estimate_and_draw_pose(uint8_t* nv12, int img_w, int img_h,
         }
     }
 
-    // PnP → IMU 控制：固定安装校正后，再按机械臂目标 yaw 查表补偿
+    /* PnP pitch 多点标定：控制线程移动机械臂，视觉线程只负责采样。 */
+    {
+        static bool active = false;
+        static int sample_idx = -1;
+        static int previous_phase = PNP_CALIB_INACTIVE;
+        static double pitch_sum = 0.0;
+        static int pitch_count = 0;
+
+        int calib_mode = read_calib_mode();
+        uint64_t now_us = get_us();
+        cv::Mat y_mat(img_h, img_w, CV_8UC1, nv12);
+
+        if (calib_mode == 4) {
+            if (!active) {
+                active = true;
+                sample_idx = -1;
+                previous_phase = PNP_CALIB_INACTIVE;
+                pitch_sum = 0.0;
+                pitch_count = 0;
+
+                FILE *fp = fopen("/tmp/pnp_pitch_calib.csv", "w");
+                if (fp) {
+                    fprintf(fp, "target_pitch_deg,pnp_pitch_avg_deg,sample_count\n");
+                    fclose(fp);
+                }
+                printf("[PnP-Pitch-Calib] Visual recorder started\n");
+            }
+
+            int target_idx = g_pnp_calib_target_idx.load();
+            int phase = g_pnp_calib_phase.load();
+            uint64_t phase_start = g_pnp_calib_phase_start_us.load();
+
+            if (previous_phase == PNP_CALIB_SAMPLE &&
+                (phase != PNP_CALIB_SAMPLE || target_idx != sample_idx) &&
+                sample_idx >= 0 && sample_idx < PNP_PITCH_CALIB_TARGET_COUNT) {
+                double average = pitch_count > 0 ? pitch_sum / pitch_count : 0.0;
+                FILE *fp = fopen("/tmp/pnp_pitch_calib.csv", "a");
+                if (fp) {
+                    fprintf(fp, "%d,%.4f,%d\n",
+                            PNP_PITCH_CALIB_TARGETS[sample_idx], average, pitch_count);
+                    fclose(fp);
+                }
+                printf("[PnP-Pitch-Calib] Target %+d deg -> PnP pitch avg %+.4f deg (%d samples)\n",
+                       PNP_PITCH_CALIB_TARGETS[sample_idx], average, pitch_count);
+                pitch_sum = 0.0;
+                pitch_count = 0;
+            }
+
+            if (target_idx >= 0 && target_idx < PNP_PITCH_CALIB_TARGET_COUNT) {
+                int target = PNP_PITCH_CALIB_TARGETS[target_idx];
+                uint64_t elapsed_us = phase_start > 0 ? now_us - phase_start : 0;
+                char line[128];
+
+                if (phase == PNP_CALIB_PREPARE) {
+                    double remain = (PNP_CALIB_PREPARE_US > elapsed_us)
+                        ? (PNP_CALIB_PREPARE_US - elapsed_us) / 1000000.0 : 0.0;
+                    snprintf(line, sizeof(line),
+                             "PnP PITCH CALIB: arm pitch %+d, face camera, prepare %.1fs",
+                             target, remain);
+                } else if (phase == PNP_CALIB_SAMPLE) {
+                    if (sample_idx != target_idx) {
+                        sample_idx = target_idx;
+                        pitch_sum = 0.0;
+                        pitch_count = 0;
+                    }
+                    pitch_sum += hp_deg;
+                    pitch_count++;
+                    double remain = (PNP_CALIB_SAMPLE_US > elapsed_us)
+                        ? (PNP_CALIB_SAMPLE_US - elapsed_us) / 1000000.0 : 0.0;
+                    double running_avg = pitch_count > 0 ? pitch_sum / pitch_count : 0.0;
+                    snprintf(line, sizeof(line),
+                             "PnP PITCH CALIB: arm pitch %+d, sample %.1fs, PnP avg %+.2f",
+                             target, remain, running_avg);
+                } else {
+                    snprintf(line, sizeof(line), "PnP PITCH CALIB: moving arm...");
+                }
+
+                cv::putText(y_mat, line, cv::Point(10, 135),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.9,
+                            cv::Scalar(255), 2);
+            } else if (phase == PNP_CALIB_COMPLETE) {
+                cv::putText(y_mat,
+                            "PnP PITCH CALIB COMPLETE: /tmp/pnp_pitch_calib.csv",
+                            cv::Point(10, 135),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.9,
+                            cv::Scalar(255), 2);
+            }
+            previous_phase = phase;
+        } else if (active) {
+            active = false;
+            sample_idx = -1;
+            previous_phase = PNP_CALIB_INACTIVE;
+            pitch_sum = 0.0;
+            pitch_count = 0;
+            printf("[PnP-Pitch-Calib] Stopped\n");
+        }
+    }
+
+    // PnP → IMU 控制：固定安装校正后，再按机械臂目标 yaw/pitch 查表补偿
     pthread_mutex_lock(&g_nrf24_state.mutex);
     g_nrf24_state.pnp_yaw_correction   = (float)corrected_hy_deg;
-    g_nrf24_state.pnp_pitch_correction = (float)hp_deg;
+    g_nrf24_state.pnp_pitch_correction = (float)corrected_hp_deg;
     g_nrf24_state.pnp_valid = true;
     pthread_mutex_unlock(&g_nrf24_state.mutex);
 
@@ -2589,7 +3415,7 @@ static void process_frame_face(uint8_t *nv12, int width, int height) {
         g_stat[idx].encode_push_us    = g_next_encode_push_us; g_next_encode_push_us = 0;
         g_stat[idx].total_us          = t4 - t0;
         g_stat_idx = (g_stat_idx + 1) % STAT_WINDOW;
-        if (++g_stat_count % STAT_WINDOW == 0) print_pipeline_stats();
+        /* if (++g_stat_count % STAT_WINDOW == 0) print_pipeline_stats(); */
         return;
     }
 
@@ -2625,10 +3451,10 @@ static void process_frame_face(uint8_t *nv12, int width, int height) {
     }
     bool skip_face_lm = !face_valid;
 
-    if (skip_face_lm) {
-        printf("[Face] Skip Face LM: %s (nose=%.2f eye_l=%.2f eye_r=%.2f sh_l=%.2f sh_r=%.2f)\n",
-               skip_reason, v_nose, v_l_eye, v_r_eye, v_l_shoulder, v_r_shoulder);
-        if (tracker.face_size_life > 0) tracker.face_size_life--;
+	if (skip_face_lm) {
+	    /* printf("[Face] Skip Face LM: %s (nose=%.2f eye_l=%.2f r_eye=%.2f sh_l=%.2f sh_r=%.2f)\n",
+	           skip_reason, v_nose, v_l_eye, v_r_eye, v_l_shoulder, v_r_shoulder); */
+	    if (tracker.face_size_life > 0) tracker.face_size_life--;
     } else {
         if (v_nose > 0.5f) {
             roi_cx = best_det->kps[0].x;
@@ -2976,7 +3802,7 @@ rule_engine_phase:
     g_stat[idx].encode_push_us    = g_next_encode_push_us; g_next_encode_push_us = 0;
     g_stat[idx].total_us          = t7 - t0;
     g_stat_idx = (g_stat_idx + 1) % STAT_WINDOW;
-    if (++g_stat_count % STAT_WINDOW == 0) print_pipeline_stats();
+    /* if (++g_stat_count % STAT_WINDOW == 0) print_pipeline_stats(); */
 }
 
 static void process_frame_body(uint8_t *nv12, int width, int height) {
@@ -3047,7 +3873,7 @@ static void process_frame_body(uint8_t *nv12, int width, int height) {
     g_stat[idx].encode_push_us    = g_next_encode_push_us; g_next_encode_push_us = 0;
     g_stat[idx].total_us          = t6 - t0;
     g_stat_idx = (g_stat_idx + 1) % STAT_WINDOW;
-    if (++g_stat_count % STAT_WINDOW == 0) print_pipeline_stats();
+    /* if (++g_stat_count % STAT_WINDOW == 0) print_pipeline_stats(); */
 }
 
 void process_frame(uint8_t *nv12, int width, int height) {
@@ -3105,4 +3931,26 @@ PoseMode get_pose_mode(void) {
 
 const char* pose_mode_name(PoseMode mode) {
     return (mode == MODE_FACE) ? "FACE" : "BODY";
+}
+
+void set_arm_profile(int profile) {
+    const int count = (int)(sizeof(ARM_PROFILES) / sizeof(ARM_PROFILES[0]));
+    if (profile < 0 || profile >= count) {
+        profile = ARM_PROFILE_MID_L3_40;
+    }
+    g_arm_profile.store(profile);
+    printf("[ArmProfile] Switched to %s\n", ARM_PROFILES[profile].name);
+}
+
+int get_arm_profile(void) {
+    int profile = g_arm_profile.load();
+    const int count = (int)(sizeof(ARM_PROFILES) / sizeof(ARM_PROFILES[0]));
+    if (profile < 0 || profile >= count) return ARM_PROFILE_MID_L3_40;
+    return profile;
+}
+
+const char* arm_profile_name(int profile) {
+    const int count = (int)(sizeof(ARM_PROFILES) / sizeof(ARM_PROFILES[0]));
+    if (profile < 0 || profile >= count) return "mid_l3_40";
+    return ARM_PROFILES[profile].name;
 }

@@ -103,6 +103,12 @@ typedef struct {
     float gy_wx;
     float gy_wy;
     float gy_wz;
+    /* IMU quaternion, q0/q1/q2/q3 = qw/qx/qy/qz */
+    float gy_qw;
+    float gy_qx;
+    float gy_qy;
+    float gy_qz;
+    bool  quat_valid;
     bool  imu_valid;                        /* checksum + header passed */
     /* PnP 视觉修正量（度），由视觉线程写入，IMU 控制线程读取 */
     float pnp_yaw_correction;

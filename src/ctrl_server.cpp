@@ -113,9 +113,9 @@ static void handle_client(int client)
         char mode_val[8] = "";
         if (get_query_param(path, "mode", mode_val, sizeof(mode_val)) == 0) {
             int mode = atoi(mode_val);
-            if (mode < 0 || mode > 3) {
+            if (mode < 0 || mode > 5) {
                 send_json(client, RESP_BAD,
-                          "{\"ok\":false,\"error\":\"mode must be 0..3\"}\n");
+                          "{\"ok\":false,\"error\":\"mode must be 0..5\"}\n");
                 close(client);
                 return;
             }
@@ -173,7 +173,11 @@ static void handle_client(int client)
                 /* 重新标定 baseline：删除标定文件，下次 nrf24_control_update 会重新设置 baseline */
                 remove("/tmp/calib_mode.txt");
                 remove("/tmp/servo_calib.txt");
+                g_head_center_request = 1;
                 send_json(client, RESP_OK, "{\"ok\":true,\"action\":\"rebaseline\"}\n");
+            } else if (strcmp(action, "head_center") == 0) {
+                g_head_center_request = 1;
+                send_json(client, RESP_OK, "{\"ok\":true,\"action\":\"head_center\"}\n");
             } else if (strcmp(action, "nrf24_reset") == 0) {
                 /* 通过全局状态触发 NRF24 重新初始化（实际效果有限，仅做演示） */
                 send_json(client, RESP_OK, "{\"ok\":true,\"action\":\"nrf24_reset\"}\n");

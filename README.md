@@ -89,7 +89,7 @@ g++ -std=c++17 -O2 \
   src/main.cpp src/rga_npu.cpp src/gst_rtsp.cpp src/gst_rtmp.cpp \
   src/stream_manager.cpp src/ctrl_server.cpp src/ws_client.cpp \
   src/uart_comm.cpp src/wifi.cpp \
-  src/nrf24_linux.c src/bt_stub.c \
+  src/nrf24_linux.c src/imu2_i2c.c src/bt_stub.c \
   -o build/cc \
   $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtsp-server-1.0) \
   -I/usr/include/opencv4 -lopencv_core -lopencv_imgproc -lopencv_calib3d \
@@ -156,9 +156,9 @@ init success → FF AA 验证帧 → 7s 延时(g_uart_block_tx=1) → A-init →
 |------|------|------|
 | `/status` | GET | 返回当前模式、推流类型、move_complete、head_stationary、arm_stable |
 | `/mode` | POST `type=face/body` | 切换 AI 模式 |
-| `/calib` | POST `mode=0/1/2/3` | 标定模式控制（0=关闭, 1=锁定+调舵机, 2=扫描测试, 3=PnP yaw 多点标定） |
+| `/calib` | POST `mode=0/1/2/3/4/5` | 标定模式控制（0=关闭, 1=锁定+调舵机, 2=扫描测试, 3=PnP yaw 多点标定, 4=PnP pitch 多点标定, 5=头部 IMU 九宫格原始数据标定） |
 | `/servo` | POST `k1=50&k2=145` | 实时调整舵机角度 |
-| `/cmd` | POST `action=rebaseline/nrf24_reset` | 重新标定 baseline 或复位 NRF24 |
+| `/cmd` | POST `action=rebaseline/head_center/nrf24_reset` | 重新标定 baseline、把当前头部姿态设为控制中心或复位 NRF24 |
 
 ---
 
@@ -210,25 +210,34 @@ tx = l3·sin(yaw)·cos(pitch)
 ty = l4 - l1·sin(pitch) + l3·cos(pitch)·cos(yaw)
 tz = k·(l2 + l1·cos(pitch) + l3·sin(pitch)·cos(yaw))
 ```
-当前参数：`l1=8`, `l2=5`, `l3=40`, `l4=28`, `k=1.6`（单位 cm）
+当前默认 profile：`far_l3_55`，参数 `l1=11.08`, `l2=6.92`, `l3=55`, `l4=28`, `k=1.6`（单位 cm）
+代码中保留 `mid_l3_40` 旧 profile：`l1=8`, `l2=5`, `l3=40`, `l4=28`, `k=1.6`，J4=`55 + K*Δpitch`（抬头 `K=-0.8`，低头 `K=-1.65`），J5=`50 + 0.4*Δyaw`，以及对应 PnP yaw/pitch 补偿表。当前不开放 HTTP 切换；后续蓝牙/WiFi 指令可直接调用 `set_arm_profile()` 切换。`far_l3_55` 的 PnP 补偿表已按 `docs/calibration-l3-55-2026-07-02.md` 更新，yaw `+75` 点未纳入补偿表。
 
 ### 4. 舵机映射（新定义）
-- J4 俯仰：`servo1 = 30 + (-1.2)·Δpitch`，限幅 [-90°, +90°]
-- J5 水平：`servo2 = 50 + 0.4·Δyaw`，限幅 [0°, 270°]
+- J4 俯仰：`servo1 = 65 + K·Δpitch`，抬头侧 `K=+0.5`，低头侧 `K=+1.65`，限幅 [-90°, +90°]，期望值大于 90° 时发送 90°
+- J5 水平：`servo2 = 50 + 0.2·Δyaw`，限幅 [0°, 270°]
 - 0° = 竖直向下，正 = 向内（低头），负 = 向外（抬头）
 
 ### 5. PnP 视觉零飘修正闭环（imu-pnp-fuse1.0 新增）
 - **PnP 解算**：Face 468 landmarks → `solvePnP` → 提取 head yaw/pitch（屏幕显示欧拉角）
-- **偏移校准**：`pnp_yaw_correction = hy_deg - 14.0`（安装偏角补偿）
-- **静止态触发**：`is_stop && is_stop_yaw` 且 PnP 连续有效时执行修正
-- **修正策略**：绝对值积分 `yaw_delta = -KI_PNP · pnp_yaw_correction`，`KI_PNP = 0.25`
+- **偏移校准**：固定安装偏角通过 `R_mount = Ry(-14°) * Rx(-0.10rad)` 组合到 PnP 旋转矩阵；随后按当前机械臂目标 yaw/pitch 查表插值补偿 `corrected_hy_deg` / `corrected_hp_deg`
+- **Yaw 标定**：`POST /calib?mode=3`，左右两侧目标均会采样，输出 `/tmp/pnp_yaw_calib.csv`
+- **Pitch 标定**：`POST /calib?mode=4`，输出 `/tmp/pnp_pitch_calib.csv`；当前 pitch 补偿表已按 2026-07-02 标定结果填入 `[-30,-15,0,15,30]`
+- **静止态触发**：`is_stop && is_stop_yaw` 且 `pnp_correction_ready` 时执行修正
+- **修正策略**：绝对值积分 `yaw_delta = -KI_PNP · pnp_yaw_correction`，当前代码 `KI_PNP = 0.05`
 - **累积矩阵**：`R_bias_total = R_delta × R_bias_total`，左乘在 IMU 当前姿态上
-- **Pitch 修正**：当前关闭（`pitch_delta = 0`）
+- **Pitch 修正**：PnP pitch 不再写入 `R_bias_total`，也不直接修正 `tz`；静止态下更新独立慢变量 `pitch_visual_bias`（单次限幅 0.25°，总限幅 ±8°），控制输入为 `rel_pitch - pitch_center + pitch_visual_bias`
 - **静止态发令**：Yaw 静止态不再掐死，允许 PnP 修正驱动机械臂微动
+- **有效帧门槛**：当前 `pnp_valid_cnt >= 1` 即触发 `pnp_correction_ready`，尚未做连续多帧一致性过滤
 
 ### 6. 发令策略分化
 - **Yaw**：`STATE_ACCEL_TO_CONST` 主窗口发一次预测令；静止态允许发令（供 PnP 修正微动）
 - **Pitch**：主窗口/第二窗口/静止态均发令（保持微调能力）
+- **舵机刷新**：每条 UART 控制指令都会发送当前计算出的 J4/J5 舵机角；预测帧不再沿用上一条停止态舵机角
+- **Pitch 位置极性**：每个 profile 单独配置。`mid_l3_40` 使用 `+1`，`far_l3_55` 使用 `-1`；PnP pitch 修正同步乘该符号，J4 舵机极性独立配置
+- **Pitch/Yaw IMU 主轴**：当前控制不再直接使用 `rel_roll/rel_pitch/rel_yaw` 欧拉分量，而是用双 IMU 相对旋转矩阵的 forward vector 计算 `vec_pitch/vec_yaw`
+- **头部 IMU 九宫格标定**：`POST /calib?mode=5`，相机依次移动到左上、上、右上、左中、中、右中、左下、下、右下；用户看视频确认头部对准镜头，输出 `/tmp/head_imu_grid_calib.csv`，包含头部 IMU 原始角/角速度、腰部 IMU 原始角和双 IMU 相对姿态
+- **头部中心偏置**：`head_center` 保存当前双 IMU 相对旋转矩阵作为中心，正常控制使用中心坐标下的 `vec_pitch + pitch_visual_bias` 与 `vec_yaw`；正视中心镜头后可用 `POST /cmd?action=head_center` 手动重置中心并清空视觉 pitch 偏置
 
 ### 7. A-init 改进（5帧平均）
 - RX 线程在 10ms 高频下收集 5 帧 IMU 数据算平均
@@ -248,6 +257,7 @@ tz = k·(l2 + l1·cos(pitch) + l3·sin(pitch)·cos(yaw))
 8. **云端延迟**：RTMP ~3s，WebSocket 100ms
 9. **PnP 绝对值积分漂移**：当前 `yaw_delta = KI·pnp_yaw` 是对绝对角度积分，非误差积分，Pnp 绝对值非零时 R_bias_total 会持续累积（预期行为）
 10. **PnP 单帧即触发**：当前 `pnp_valid_cnt >= 1` 即置 `correction_ready`，未做连续多帧一致性过滤
+11. **HTTP `/servo` 与标定循环未完全闭合**：`/servo` 会直接发一次测试指令并写 `/tmp/servo_calib.txt`，但 `nrf24_control_update()` 的 mode=1/2 标定循环目前仍发送固定 `NRF_SERVO1_DEG/NRF_SERVO2_DEG`，读到的 `calib_servo1` 尚未真正用于周期发令
 
 ---
 

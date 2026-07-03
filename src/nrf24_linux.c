@@ -16,6 +16,11 @@
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <linux/spi/spidev.h>
+#include <math.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 /* ======================================================================== */
 /*  Static state                                                            */
@@ -36,6 +41,11 @@ nrf24_shared_state_t g_nrf24_state = {
     .gy_wx      = 0.0f,
     .gy_wy      = 0.0f,
     .gy_wz      = 0.0f,
+    .gy_qw      = 1.0f,
+    .gy_qx      = 0.0f,
+    .gy_qy      = 0.0f,
+    .gy_qz      = 0.0f,
+    .quat_valid = false,
     .imu_valid  = false,
     .pnp_yaw_correction   = 0.0f,
     .pnp_pitch_correction = 0.0f,
@@ -379,68 +389,99 @@ void nrf24_linux_deinit(void)
  * Tries both positions [0..10] and [11..21] for each frame type.
  * Accepts: angle+gyro, gyro+angle, angle+angle, gyro+gyro (any combo).
  */
+static void quat_normalize(float* qw, float* qx, float* qy, float* qz)
+{
+    float n = sqrtf((*qw) * (*qw) + (*qx) * (*qx) + (*qy) * (*qy) + (*qz) * (*qz));
+    if (n < 1e-6f) {
+        *qw = 1.0f; *qx = 0.0f; *qy = 0.0f; *qz = 0.0f;
+        return;
+    }
+    *qw /= n; *qx /= n; *qy /= n; *qz /= n;
+}
+
+static void quat_to_euler_zyx(float qw, float qx, float qy, float qz,
+                              float* roll, float* pitch, float* yaw)
+{
+    quat_normalize(&qw, &qx, &qy, &qz);
+
+    float sinr_cosp = 2.0f * (qw * qx + qy * qz);
+    float cosr_cosp = 1.0f - 2.0f * (qx * qx + qy * qy);
+    float r = atan2f(sinr_cosp, cosr_cosp);
+
+    float sinp = 2.0f * (qw * qy - qz * qx);
+    float p;
+    if (sinp > 1.0f) sinp = 1.0f;
+    if (sinp < -1.0f) sinp = -1.0f;
+    p = asinf(sinp);
+
+    float siny_cosp = 2.0f * (qw * qz + qx * qy);
+    float cosy_cosp = 1.0f - 2.0f * (qy * qy + qz * qz);
+    float y = atan2f(siny_cosp, cosy_cosp);
+
+    *roll  = r * 180.0f / (float)M_PI;
+    *pitch = p * 180.0f / (float)M_PI;
+    *yaw   = y * 180.0f / (float)M_PI;
+}
+
+static bool parse_11b_frame(const uint8_t* p,
+                            float* roll, float* pitch, float* yaw,
+                            float* qw, float* qx, float* qy, float* qz,
+                            float* wx, float* wy, float* wz,
+                            bool* got_orientation, bool* got_gyro)
+{
+    if (p[0] != 0x55) return false;
+
+    uint8_t sum = p[0] + p[1];
+    for (int i = 2; i < 10; i++) sum += p[i];
+    if (sum != p[10]) return false;
+
+    if (p[1] == 0x59) {
+        int16_t q0 = (int16_t)((p[3] << 8) | p[2]);
+        int16_t q1 = (int16_t)((p[5] << 8) | p[4]);
+        int16_t q2 = (int16_t)((p[7] << 8) | p[6]);
+        int16_t q3 = (int16_t)((p[9] << 8) | p[8]);
+        *qw = q0 / 32768.0f;
+        *qx = q1 / 32768.0f;
+        *qy = q2 / 32768.0f;
+        *qz = q3 / 32768.0f;
+        quat_normalize(qw, qx, qy, qz);
+        quat_to_euler_zyx(*qw, *qx, *qy, *qz, roll, pitch, yaw);
+        *got_orientation = true;
+        return true;
+    }
+
+    if (p[1] == 0x52) {
+        int16_t x = (int16_t)((p[3] << 8) | p[2]);
+        int16_t y = (int16_t)((p[5] << 8) | p[4]);
+        int16_t z = (int16_t)((p[7] << 8) | p[6]);
+        *wx = x / 32768.0f * 2000.0f;
+        *wy = y / 32768.0f * 2000.0f;
+        *wz = z / 32768.0f * 2000.0f;
+        *got_gyro = true;
+        return true;
+    }
+
+    return false;
+}
+
 static bool nrf24_parse_22b(const uint8_t* buf,
                             float* roll, float* pitch, float* yaw,
-                            float* wx, float* wy, float* wz)
+                            float* qw, float* qx, float* qy, float* qz,
+                            float* wx, float* wy, float* wz,
+                            bool* got_orientation, bool* got_gyro)
 {
-    bool got_angle = false;
-    bool got_gyro  = false;
+    *got_orientation = false;
+    *got_gyro = false;
+    bool got_any = false;
 
-    /* Try position 0..10 */
-    if (buf[0] == 0x55 && buf[1] == 0x53) {
-        uint8_t sum = 0x55 + 0x53;
-        for (int i = 2; i < 10; i++) sum += buf[i];
-        if (sum == buf[10]) {
-            int16_t r = (int16_t)((buf[3] << 8) | buf[2]);
-            int16_t p = (int16_t)((buf[5] << 8) | buf[4]);
-            int16_t y = (int16_t)((buf[7] << 8) | buf[6]);
-            *roll  = r / 32768.0f * 180.0f;
-            *pitch = p / 32768.0f * 180.0f;
-            *yaw   = y / 32768.0f * 180.0f;
-            got_angle = true;
-        }
-    } else if (buf[0] == 0x55 && buf[1] == 0x52) {
-        uint8_t sum = 0x55 + 0x52;
-        for (int i = 2; i < 10; i++) sum += buf[i];
-        if (sum == buf[10]) {
-            int16_t x = (int16_t)((buf[3] << 8) | buf[2]);
-            int16_t y = (int16_t)((buf[5] << 8) | buf[4]);
-            int16_t z = (int16_t)((buf[7] << 8) | buf[6]);
-            *wx = x / 32768.0f * 2000.0f;
-            *wy = y / 32768.0f * 2000.0f;
-            *wz = z / 32768.0f * 2000.0f;
-            got_gyro = true;
-        }
-    }
+    got_any |= parse_11b_frame(buf, roll, pitch, yaw,
+                               qw, qx, qy, qz, wx, wy, wz,
+                               got_orientation, got_gyro);
+    got_any |= parse_11b_frame(buf + 11, roll, pitch, yaw,
+                               qw, qx, qy, qz, wx, wy, wz,
+                               got_orientation, got_gyro);
 
-    /* Try position 11..21 */
-    if (buf[11] == 0x55 && buf[12] == 0x53) {
-        uint8_t sum = 0x55 + 0x53;
-        for (int i = 13; i < 21; i++) sum += buf[i];
-        if (sum == buf[21]) {
-            int16_t r = (int16_t)((buf[14] << 8) | buf[13]);
-            int16_t p = (int16_t)((buf[16] << 8) | buf[15]);
-            int16_t y = (int16_t)((buf[18] << 8) | buf[17]);
-            *roll  = r / 32768.0f * 180.0f;
-            *pitch = p / 32768.0f * 180.0f;
-            *yaw   = y / 32768.0f * 180.0f;
-            got_angle = true;
-        }
-    } else if (buf[11] == 0x55 && buf[12] == 0x52) {
-        uint8_t sum = 0x55 + 0x52;
-        for (int i = 13; i < 21; i++) sum += buf[i];
-        if (sum == buf[21]) {
-            int16_t x = (int16_t)((buf[14] << 8) | buf[13]);
-            int16_t y = (int16_t)((buf[16] << 8) | buf[15]);
-            int16_t z = (int16_t)((buf[18] << 8) | buf[17]);
-            *wx = x / 32768.0f * 2000.0f;
-            *wy = y / 32768.0f * 2000.0f;
-            *wz = z / 32768.0f * 2000.0f;
-            got_gyro = true;
-        }
-    }
-
-    return got_angle || got_gyro;
+    return got_any;
 }
 
 /* ======================================================================== */
@@ -502,12 +543,18 @@ static void* nrf24_rx_thread_func(void* arg)
                 uint8_t buf[NRF24_PAYLOAD_WIDTH];
                 nrf24_read_rx_payload(buf, NRF24_PAYLOAD_WIDTH);
 
-                float roll = 0.0f, pitch = 0.0f, yaw = 0.0f;
-                float wx = 0.0f, wy = 0.0f, wz = 0.0f;
-                bool valid = nrf24_parse_22b(buf, &roll, &pitch, &yaw, &wx, &wy, &wz);
-                loop_frames++;
+	                float roll = 0.0f, pitch = 0.0f, yaw = 0.0f;
+	                float qw = 1.0f, qx = 0.0f, qy = 0.0f, qz = 0.0f;
+	                float wx = 0.0f, wy = 0.0f, wz = 0.0f;
+	                bool got_orientation = false;
+	                bool got_gyro = false;
+	                bool valid = nrf24_parse_22b(buf, &roll, &pitch, &yaw,
+	                                             &qw, &qx, &qy, &qz,
+	                                             &wx, &wy, &wz,
+	                                             &got_orientation, &got_gyro);
+	                loop_frames++;
 
-                if (valid && have_prev_wz) {
+	                if (valid && got_gyro && have_prev_wz) {
                     struct timespec ts_now_ast;
                     clock_gettime(CLOCK_MONOTONIC, &ts_now_ast);
                     float dt = (ts_now_ast.tv_sec - ts_prev_ast.tv_sec)
@@ -522,18 +569,18 @@ static void* nrf24_rx_thread_func(void* arg)
                         g_nrf24_state.gy_ast_count++;
                     pthread_mutex_unlock(&g_nrf24_state.mutex);
                 }
-                if (valid) {
-                    prev_wz = wz;
-                    have_prev_wz = 1;
-                    clock_gettime(CLOCK_MONOTONIC, &ts_prev_ast);
+	                if (valid && got_gyro) {
+	                    prev_wz = wz;
+	                    have_prev_wz = 1;
+	                    clock_gettime(CLOCK_MONOTONIC, &ts_prev_ast);
                 }
 
                 pthread_mutex_lock(&g_nrf24_state.mutex);
                 memcpy(g_nrf24_state.rx_buffer, buf, NRF24_PAYLOAD_WIDTH);
                 g_nrf24_state.data_ready = true;
                 g_nrf24_state.rx_count++;
-                if (valid) {
-                    float store_roll = roll, store_pitch = pitch, store_yaw = yaw;
+	                if (valid && got_orientation) {
+	                    float store_roll = roll, store_pitch = pitch, store_yaw = yaw;
 
                     /* A-init：握手线程已发信号，收集 5 帧算平均 */
                     if (g_wait_a_init && !g_r_init_set) {
@@ -558,13 +605,18 @@ static void* nrf24_rx_thread_func(void* arg)
                         }
                     }
 
-                    g_nrf24_state.gy_roll  = store_roll;
-                    g_nrf24_state.gy_pitch = store_pitch;
-                    g_nrf24_state.gy_yaw   = store_yaw;
-                    g_nrf24_state.gy_wx    = wx;
-                    g_nrf24_state.gy_wy    = wy;
-                    g_nrf24_state.gy_wz    = wz;
-                    g_nrf24_state.imu_valid = true;
+	                    g_nrf24_state.gy_roll  = store_roll;
+	                    g_nrf24_state.gy_pitch = store_pitch;
+	                    g_nrf24_state.gy_yaw   = store_yaw;
+	                    g_nrf24_state.gy_qw    = qw;
+	                    g_nrf24_state.gy_qx    = qx;
+	                    g_nrf24_state.gy_qy    = qy;
+	                    g_nrf24_state.gy_qz    = qz;
+	                    g_nrf24_state.quat_valid = true;
+	                    g_nrf24_state.gy_wx    = wx;
+	                    g_nrf24_state.gy_wy    = wy;
+	                    g_nrf24_state.gy_wz    = wz;
+	                    g_nrf24_state.imu_valid = true;
                     /* 记录角度历史 */
                     g_nrf24_state.gy_roll_hist[g_nrf24_state.gy_angle_idx] = store_roll;
                     g_nrf24_state.gy_pitch_hist[g_nrf24_state.gy_angle_idx] = store_pitch;
@@ -588,21 +640,22 @@ static void* nrf24_rx_thread_func(void* arg)
                     if (g_nrf24_state.gy_wx_count < NRF24_WX_HIST_SIZE)
                         g_nrf24_state.gy_wx_count++;
 
-                    static int first_frame = 1;
-                    if (first_frame) {
-                        first_frame = 0;
-                        printf("[NRF24] First valid frame received!\n");
-                    }
-                    print_cnt++;
-                    if (print_cnt >= 10) {
-                        print_cnt = 0;
-                        printf("[NRF24] GYRO(%.2f,%.2f,%.2f) ANGLE(%.2f,%.2f,%.2f)\n",
-                               wx, wy, wz, roll, pitch, yaw);
-                    }
-                } else {
-                    g_nrf24_state.error_count++;
-                    g_nrf24_state.imu_valid = false;
-                }
+	                    static int first_frame = 1;
+	                    if (first_frame) {
+	                        first_frame = 0;
+	                        /* printf("[NRF24] First valid frame received!\n"); */
+	                    }
+	                    print_cnt++;
+	                    if (print_cnt >= 10) {
+	                        print_cnt = 0;
+	                        /* printf("[NRF24] GYRO(%.2f,%.2f,%.2f) ANGLE(%.2f,%.2f,%.2f)\n",
+	                               wx, wy, wz, roll, pitch, yaw); */
+	                    }
+	                } else {
+	                    g_nrf24_state.error_count++;
+	                    g_nrf24_state.imu_valid = false;
+	                    g_nrf24_state.quat_valid = false;
+	                }
                 pthread_mutex_unlock(&g_nrf24_state.mutex);
 
                 /* Check RX FIFO empty (FIFO_STATUS bit0 = RX_EMPTY) */

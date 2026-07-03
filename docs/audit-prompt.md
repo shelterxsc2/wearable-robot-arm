@@ -4,7 +4,7 @@
 # 任务
 读取以下文件，理解当前 `imu-victor-hat` 分支的实现状态，并给出一份简明扼要的项目状态汇报。
 
-本分支是在 `imu-newbi-hat` 基础上，针对 **NRF24 IMU 控制机械臂**进行协议升级和代码精简的版本。重点看 NRF24 IMU 控制链路的改动（g_uart_block_tx 延时拦截、11字节 UART 协议 flag=0x00/0x01、运动学参数化 l1~l4、舵机基线30°、打印精简、视觉 PnP 精调规划、云端系统对接），视觉链路和 RuleEngine v2 基本继承前序分支。
+本分支是在 `imu-newbi-hat` 基础上，针对 **NRF24 IMU 控制机械臂**进行协议升级和代码精简的版本。重点看 NRF24 IMU 控制链路的改动（g_uart_block_tx 延时拦截、11字节 UART 协议 flag=0x00/0x01、运动学参数化 l1~l4、舵机基线30°、打印精简、视觉 PnP 静止态零飘修正、云端系统对接），视觉链路和 RuleEngine v2 基本继承前序分支。
 
 > **短期改动方向集中提示**：用户当前的迭代重心集中在 **IMU 数据获取 → 处理 → 最终通过 UART 发送给下位机的完整链路**。后续对话中，应优先精读该链路的源码（`nrf24_linux.c`、`rga_npu.cpp` 中的 `nrf24_control_update()`、`uart_comm.cpp`），对视觉链路、RuleEngine、云端系统只需了解接口和状态，不必深入展开。下位机(STM32)代码仓库 `wearable-robot-arm` / `imu-main-test` 已同步拉取至本地最新版。
 
@@ -19,7 +19,7 @@
 
 ## 2. docs/midterm-report-prompt.md
 中期检查报告 Prompt。重点了解：
-- 视觉 PnP 精调闭环的假设性方案
+- 视觉 PnP 静止态零飘修正闭环的当前实现
 - 云-端协同架构（LL-HLS、WebSocket、HTTP API）
 - 性能指标和已知问题列表
 
@@ -83,22 +83,24 @@ Python Unix Socket 推理服务。重点看：
   `tx = l3·sin(yaw)·cos(pitch)`  
   `ty = l4 - l1·sin(pitch) + l3·cos(pitch)·cos(yaw)`  
   `tz = l2 + l1·cos(pitch) + l3·sin(pitch)·cos(yaw)`  
-  当前参数：`l1=8`, `l2=12`, `l3=52`, `l4=12`
+  当前默认 profile 为 `far_l3_55`：`l1=11.08`, `l2=6.92`, `l3=55`, `l4=28`, `k=1.6`；代码保留 `mid_l3_40` 旧 profile（J4=55、抬头 -0.8、低头 -1.65、J5 yaw 0.4、position pitch sign=+1）和对应 PnP 补偿表，后续由蓝牙/WiFi 指令调用 `set_arm_profile()` 切换
 - **控制轴映射**：Pitch (`wy`) → tz/ty 耦合；Yaw (`wz`) → tx/ty 耦合
 - **极性**：`use_yaw = -rel_yaw`（偏航反向）；俯仰保持原始 `rel_pitch`
 - **门禁**：`g_r_init_set` 且 `!g_uart_block_tx` 且 A-init 完成后才发令
 - **Pitch/Yaw 双轴状态机 + 终点预测器 + 发令判断**
 - **发令策略分化**：
-  - Yaw：只在 `STATE_ACCEL_TO_CONST` 主窗口发一次预测令；静止态直接掐死不发；其他运动态不发
+  - Yaw：`STATE_ACCEL_TO_CONST` 主窗口发预测令；静止态允许发令，供 PnP 零飘修正驱动机械臂微动；其他运动态按当前代码条件放行
   - Pitch：主窗口 / 第二窗口 / 静止态均发令（`is_stop` 时 `predictor.reset()`）
+- **Pitch 位置极性**：每个 profile 单独配置；PnP pitch 修正同步乘该符号，不改变 J4 舵机映射
 - **发令频率与阈值**：150ms/200ms 自适应，5° 阈值
 - **位置死区**：坐标变化 < 1cm 不发令，抑制 Y 轴附近 `atan2` 高灵敏度导致的微抖
-- **动态舵机映射**：J4 俯仰 `servo1 = 30 - 1.2·Δpitch`（限幅 [-90°, +90°]）；J5 水平 `servo2 = 50 + 0.4·Δyaw`（限幅 [0°, 270°]）
+- **动态舵机映射**：J4 俯仰 `servo1 = 65 + K·Δpitch`，抬头侧 `K=+0.5`、低头侧 `K=+1.65`（限幅 [-90°, +90°]，期望值大于 90° 时发送 90°）；J5 水平 `servo2 = 50 + 0.2·Δyaw`（限幅 [0°, 270°]）
 - **头部静止检测**：滞后带（进入 <2°/s，退出 >5°/s）
 - **flag 标志位判断**：`is_prediction = (pitch_should_cmd && !is_stop) || (yaw_should_cmd && !is_stop_yaw)` → `flag = is_prediction ? 0x00 : 0x01`
+- **舵机刷新策略**：每条 UART 控制指令都发送当前计算出的 J4/J5 舵机角；prediction 帧不再复用上一条停止态舵机角
 - 所有 `[NRF-STATE]` 调试打印是否已注释
 
-## 9. src/rga_npu.cpp — PnP 姿态解算（规划中）
+## 9. src/rga_npu.cpp — PnP 姿态解算与静止态零飘修正
 重点看：
 - `estimate_and_draw_pose()`：12 点人脸模型 → `solvePnP`
 - 12 点选取逻辑（从 468 个 landmark 中映射）
@@ -107,7 +109,11 @@ Python Unix Socket 推理服务。重点看：
 - 视觉控制逻辑是否已完全注释废弃
 - 3D 绘制（坐标轴、立方体框、关键点、左上角文字叠加）
 - `[PnP-Debug]` 打印是否已注释
-- **规划中的视觉微调**：`g_arm_stable=1` + `|pnp_yaw - target_yaw| > 2°` 时触发，增益 0.5，限幅 ±10°
+- **当前视觉修正实现**：PnP 提取 yaw/pitch 后写入 `g_nrf24_state`；IMU 控制线程在 `is_stop && is_stop_yaw` 且 `pnp_correction_ready` 时执行 yaw 修正，pitch 修正入口已预留
+- **修正策略**：`yaw_delta = -KI_PNP * pnp_yaw_correction`，当前 `KI_PNP=0.05`；`pitch_delta = -KI_PNP_PITCH * pnp_pitch_correction`，当前 `KI_PNP_PITCH=0.03`
+- **偏角补偿**：固定安装偏角通过 `R_mount = Ry(-14°) * Rx(-0.10rad)` 组合到 PnP 旋转矩阵，并按 `PNP_YAW_CALIBRATION` / `PNP_PITCH_CALIBRATION` 表对机械臂目标 yaw/pitch 插值补偿
+- **PnP yaw/pitch 标定**：`POST /calib?mode=3` 驱动机械臂依次走左右 yaw 目标，视觉线程输出 `/tmp/pnp_yaw_calib.csv`；`POST /calib?mode=4` 驱动机械臂依次走 pitch 目标，视觉线程输出 `/tmp/pnp_pitch_calib.csv`
+- **触发门槛**：当前 `pnp_valid_cnt >= 1` 即置 `pnp_correction_ready`，未做连续多帧一致性过滤
 
 ## 10. src/rga_npu.cpp — 模型加载与初始化
 重点看：
@@ -211,9 +217,9 @@ Bluetooth SPP stub。重点看：
    - 双轴控制架构（Pitch/wy → tz/ty，Yaw/wz → tx/ty）
    - 极性定义：`use_yaw = -rel_yaw`（偏航反向）；俯仰保持原始 `rel_pitch`
    - **11字节 UART 协议**：flag=0x00(预测) / 0x01(确定)
-   - **发令策略分化**：Yaw 只在主窗口发一次预测令、静止态掐死；Pitch 主窗口/第二窗口/静止态均发令
+   - **发令策略分化**：Yaw 主窗口发预测令，静止态允许发令供 PnP 修正微动；Pitch 主窗口/第二窗口/静止态均发令
    - **位置死区**：1cm，抑制 Y 轴附近高灵敏度微抖
-   - **动态舵机映射**：J4 `30 - 1.2·Δpitch`（[-90°,+90°]）；J5 `50 + 0.4·Δyaw`（[0°,270°]）
+   - **动态舵机映射**：J4 `55 + K·Δpitch`，抬头侧 `K=-0.8`、低头侧 `K=-1.65`（[-90°,+90°]）；J5 `50 + 0.4·Δyaw`（[0°,270°]）
    - 发令频率（150ms/200ms 自适应）和阈值（5°）
    - Ctrl+C 退出帧：`AA FF AA FF AA FF AA FF AA FF`
 6. **视觉/推流链路现状**：RTMP vs RTSP 自动选择机制、identity handoff + RGA 转码设计、AI 处理参与情况
@@ -226,14 +232,14 @@ Bluetooth SPP stub。重点看：
     - `g_uart_block_tx` 替代 `g_host_state`：简化延时拦截逻辑
     - 运动学公式参数化：l1=8, l2=5, l3=40, l4=28, k=1.6
     - 舵机基线改为 30°，限幅 [-90°, +90°]
-    - 打印精简：`[UART-RX]` 只存 `/tmp/cmd`，`[NRF-STATE]` 全部注释，`[UART-TX]` 打印关闭
+    - 打印精简：`[UART-RX]` 只存 `/tmp/cmd`，`[NRF-STATE]` 基本注释，`[UART-TX]` 通过 `diag_log()` 写终端和 `/tmp/uart_complete_diag.log`
     - **imu-pnp-fuse1.0**：PnP 视觉零飘修正闭环集成
       - PnP 解算人脸姿态 → 提取 yaw/pitch → 写入共享状态
       - 静止态（`is_stop && is_stop_yaw`）触发修正
-      - 绝对值积分策略：`yaw_delta = -KI_PNP · pnp_yaw_correction`，`KI_PNP = 0.25`
+      - 绝对值积分策略：`yaw_delta = -KI_PNP · pnp_yaw_correction`，`KI_PNP = 0.05`
       - `R_bias_total` 累积修正矩阵，左乘在 IMU 当前姿态上
       - 静止态 yaw 发令放开，允许 PnP 驱动机械臂微动
-      - PnP 偏移简化：删除旋转矩阵偏移，直接用屏幕显示欧拉角 `hy_deg - 14.0`
+      - PnP 偏移链路：使用 `R_mount = Ry(-14°) * Rx(-0.10rad)` 做固定安装校正，并按 `PNP_YAW_CALIBRATION` 插值补偿
       - pitch 修正当前关闭
     - A-init 改进：RX 线程 5 帧平均替代单帧捕获
     - 云端监控系统对接（LL-HLS、WebSocket、HTTP API）
@@ -245,7 +251,7 @@ Bluetooth SPP stub。重点看：
     - 云-端协议统一（离散状态 vs 连续坐标融合）
     - 下位机回传关节角（UART 双向通信）
 
-要求：简明扼要，不要大段粘贴代码，用工程师能理解的语言总结。重点突出 `imu-victor-hat` 相比 `imu-newbi-hat` 的核心变化（11字节协议、flag标志位、g_uart_block_tx、参数化运动学、舵机基线30°、打印精简、视觉PnP规划、云端对接）。
+要求：简明扼要，不要大段粘贴代码，用工程师能理解的语言总结。重点突出 `imu-victor-hat` 相比 `imu-newbi-hat` 的核心变化（11字节协议、flag标志位、g_uart_block_tx、参数化运动学、舵机基线30°、打印精简、视觉PnP静止态零飘修正、云端对接）。
 
 ---
 
@@ -254,4 +260,4 @@ Bluetooth SPP stub。重点看：
 1. **IMU 链路优先原则**：用户当前迭代重心明确在 **IMU 数据获取 → 处理 → UART 发送给下位机** 的完整链路。后续对话中，除非用户主动要求，否则**不要无差别精读视觉链路、RuleEngine、云端系统的源码**。对非 IMU 模块只需了解接口状态，不做深入展开。
 2. **全量读取必须用 Agent**：如果确实需要同时阅读大量文件（>3 个）做全局摸底，应启动 `subagent_type="explore"` 并行读取并返回摘要，**主对话只聚焦 IMU 控制链路源码**（`nrf24_linux.c`、`rga_npu.cpp` 中的 `nrf24_control_update()`、`uart_comm.cpp`），不浪费上下文在无关模块的细节上。
 3. **编译验证**：每次修改完代码后执行以下命令进行编译，但是不要运行：
-cd /home/elf/work/twice && g++ -std=c++17 -O2 src/main.cpp src/rga_npu.cpp src/gst_rtsp.cpp src/gst_rtmp.cpp src/stream_manager.cpp src/ctrl_server.cpp src/ws_client.cpp src/uart_comm.cpp src/wifi.cpp src/nrf24_linux.c src/bt_stub.c -o build/cc $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtsp-server-1.0) -I/usr/include/opencv4 -lopencv_core -lopencv_imgproc -lopencv_calib3d -lrknnrt -lrga -lwpa_client -lpthread 2>&1 | grep -E 'error:|build/cc' || echo "编译完成"
+cd /home/elf/work/twice && g++ -std=c++17 -O2 src/main.cpp src/rga_npu.cpp src/gst_rtsp.cpp src/gst_rtmp.cpp src/stream_manager.cpp src/ctrl_server.cpp src/ws_client.cpp src/uart_comm.cpp src/wifi.cpp src/nrf24_linux.c src/imu2_i2c.c src/bt_stub.c -o build/cc $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtsp-server-1.0) -I/usr/include/opencv4 -lopencv_core -lopencv_imgproc -lopencv_calib3d -lrknnrt -lrga -lwpa_client -lpthread 2>&1 | grep -E 'error:|build/cc' || echo "编译完成"
