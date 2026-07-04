@@ -1182,7 +1182,7 @@ void nrf24_control_update(void)
     static float last_pitch_visual_bias_step = 0.0f;
 
     /* PnP 视觉零飘修正：累积修正矩阵 */
-    static const float KI_PNP = 0.12f;
+    static const float KI_PNP = 0.04f;
     static cv::Mat R_bias_total;
 
     /* A-init 触发信号由握手线程控制 (g_wait_a_init) */
@@ -1948,24 +1948,32 @@ void nrf24_control_update(void)
     }
     last_is_stop_yaw_for_pitch_bias = is_stop_yaw;
 
-    /* ========== PnP 视觉零飘修正（只在完全静止态执行）==========
-     * 当 pitch/yaw 都静止且 PnP 已连续 3 帧有效时，构造旋转修正矩阵
+    /* ========== PnP 视觉零飘修正（只在静止态执行）==========
+     * 当 pitch/yaw 都静止且 PnP 有效时，构造旋转修正矩阵
      * 叠加到 R_bias_total，并重新计算 rel_pitch/rel_yaw。
     */
     float pitch_delta = 0.0f, yaw_delta = 0.0f;
-    static const float KI_PNP_PITCH_BIAS = 0.15f;
+    static const float KI_PNP_PITCH_BIAS = 0.02f;
+    static const float PNP_INTEGRAL_DEADBAND_DEG = 3.0f;
     static const float K_PNP_PITCH_Z_CM = 0.0f;
     bool do_pnp_correct = false;
-    if (g_r_init_set && is_stop && is_stop_yaw && g_arm_stable) {
+    bool pnp_integral_ready = (g_arm_stable || g_head_stationary);
+    if (g_r_init_set && is_stop && is_stop_yaw && pnp_integral_ready) {
         pthread_mutex_lock(&g_nrf24_state.mutex);
         if (g_nrf24_state.pnp_correction_ready) {
-            const ArmKinematicsProfile& profile = current_arm_profile();
-            float pitch_bias_step =
-                KI_PNP_PITCH_BIAS * g_nrf24_state.pnp_pitch_correction;
+            float pnp_pitch = g_nrf24_state.pnp_pitch_correction;
+            float pnp_yaw = g_nrf24_state.pnp_yaw_correction;
+            if (std::fabs(pnp_pitch) <= PNP_INTEGRAL_DEADBAND_DEG) {
+                pnp_pitch = 0.0f;
+            }
+            if (std::fabs(pnp_yaw) <= PNP_INTEGRAL_DEADBAND_DEG) {
+                pnp_yaw = 0.0f;
+            }
+            float pitch_bias_step = KI_PNP_PITCH_BIAS * pnp_pitch;
             pitch_visual_bias_deg += pitch_bias_step;
             last_pitch_visual_bias_step = pitch_bias_step;
             pitch_delta = 0.0f;
-            yaw_delta   = -KI_PNP * g_nrf24_state.pnp_yaw_correction;
+            yaw_delta   = -KI_PNP * pnp_yaw;
             g_nrf24_state.pnp_correction_ready = false;
             do_pnp_correct = true;
         }
