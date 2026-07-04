@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-typedef enum { MODE_FACE = 0, MODE_BODY = 1 } PoseMode;
+typedef enum { MODE_FACE = 0, MODE_BODY = 1, MODE_INTRO = 2 } PoseMode;
 
 int init_npu();
 int init_rga();

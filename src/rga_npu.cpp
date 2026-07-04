@@ -36,6 +36,7 @@
 
 // ========== 全局变量 ==========
 static std::atomic<PoseMode> g_mode{MODE_FACE};
+static std::atomic<int> g_intro_reset_request{1};
 
 // Face landmark model (MediaPipe Face Mesh 468, 192x192)
 static rknn_context face_lm_ctx = 0;
@@ -1138,6 +1139,10 @@ volatile int g_head_center_request = 1;
 /* 独立的 NRF24 IMU 控制链路：俯仰控制（仿照偏航控制架构） */
 void nrf24_control_update(void)
 {
+    if (get_pose_mode() == MODE_INTRO) {
+        return;
+    }
+
     static const float NRF_FACE_X_CM = 0.0f;
     static const float NRF_FACE_Y_CM = 10.0f;
     static const float NRF_FACE_Z_CM = 30.0f;
@@ -3253,6 +3258,316 @@ static void draw_detections(uint8_t* nv12, int img_w, int img_h,
     }
 }
 
+static inline float clampf(float v, float lo, float hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static bool kp_valid(const PoseDetection& det, int idx) {
+    return idx >= 0 && idx < MAX_KEYPOINTS &&
+           det.kps[idx].visibility > KPT_CONF_THRESHOLD;
+}
+
+static void draw_intro_marker(uint8_t* nv12, int img_w, int img_h,
+                              float target_x, float target_y) {
+    uint8_t* y_plane = nv12;
+    int cx = img_w / 2;
+    int cy = img_h / 2;
+    int tx = (int)target_x;
+    int ty = (int)target_y;
+
+    for (int dx = -18; dx <= 18; dx++) {
+        int x = cx + dx;
+        if (x >= 0 && x < img_w && cy >= 0 && cy < img_h) {
+            y_plane[cy * img_w + x] = 220;
+        }
+    }
+    for (int dy = -18; dy <= 18; dy++) {
+        int y = cy + dy;
+        if (cx >= 0 && cx < img_w && y >= 0 && y < img_h) {
+            y_plane[y * img_w + cx] = 220;
+        }
+    }
+    for (int d = -12; d <= 12; d++) {
+        int x1 = tx + d;
+        int y1 = ty;
+        int x2 = tx;
+        int y2 = ty + d;
+        if (x1 >= 0 && x1 < img_w && y1 >= 0 && y1 < img_h) {
+            y_plane[y1 * img_w + x1] = 255;
+        }
+        if (x2 >= 0 && x2 < img_w && y2 >= 0 && y2 < img_h) {
+            y_plane[y2 * img_w + x2] = 255;
+        }
+    }
+}
+
+static void update_intro_control(uint8_t* nv12, int img_w, int img_h,
+                                 const std::vector<PoseDetection>& detections) {
+    static bool intro_initialized = false;
+    static float intro_arm_yaw_deg = 0.0f;
+    static float intro_servo_yaw_deg = 0.0f;
+    static float intro_space_x_cm = -20.0f;
+    static float last_sent_x = 0.0f;
+    static float last_sent_y = 0.0f;
+    static float last_sent_z = 0.0f;
+    static float last_sent_j5 = 0.0f;
+    static uint64_t last_cmd_us = 0;
+    static uint64_t hand_center_since_us = 0;
+    static uint64_t last_space_center_us = 0;
+    static uint64_t last_space_present_us = 0;
+    static uint64_t last_space_move_us = 0;
+    static int intro_active_wrist_idx = 10;
+    static int lost_frames = 0;
+    static float intro_dbg_err_norm = 0.0f;
+    static float intro_dbg_hand_offset_norm = 0.0f;
+    static float intro_dbg_servo_gain = 60.0f;
+    static int intro_dbg_servo_mode = 0;
+    static int intro_dbg_wrist_visible = 0;
+    static bool intro_yaw_hold = false;
+
+    const uint64_t now_us = get_us();
+
+    const float INTRO_BASE_X_CM = -20.0f;
+    const float INTRO_BASE_Y_CM = 85.0f;
+    const float INTRO_BASE_Z_CM = 15.0f;
+    const float INTRO_SERVO1_BASE_DEG = 65.0f;
+    const float INTRO_SERVO2_BASE_DEG = 30.0f;
+    const float INTRO_SERVO2_CENTER_LOCK_DEG = 50.0f;
+    const float INTRO_IMAGE_TO_YAW_SIGN = 1.0f;
+    const float INTRO_CENTER_HOLD_ENTER_NORM = 0.06f;
+    const float INTRO_CENTER_HOLD_EXIT_NORM = 0.12f;
+    const float INTRO_TARGET_WRIST_WEIGHT = 0.90f;
+    const float INTRO_SERVO2_GAIN_DEG = 60.0f;
+    const float INTRO_SERVO2_SPACE_MOVING_GAIN_SCALE = 0.20f;
+    const float INTRO_SERVO2_DELTA_LIMIT_DEG = 60.0f;
+    const float INTRO_SERVO2_SEND_DEADBAND_DEG = 4.0f;
+    const float INTRO_HAND_CENTER_NORM = 0.18f;
+    const float INTRO_HAND_PRESENT_NORM = 0.30f;
+    const float INTRO_SPACE_CENTER_STEP_CM = 4.0f;
+    const uint64_t INTRO_SERVO_PERIOD_US = 700000;
+    const uint64_t INTRO_HAND_CENTER_HOLD_US = 800000;
+    const uint64_t INTRO_SPACE_CENTER_PERIOD_US = 900000;
+    const uint64_t INTRO_SPACE_PRESENT_PERIOD_US = 900000;
+    const uint64_t INTRO_SPACE_MOVING_GAIN_US = 900000;
+
+    auto send_intro_cmd = [&](float x, float y, float z,
+                              float arm_yaw_deg, float servo_yaw_deg) {
+        float j4 = INTRO_SERVO1_BASE_DEG;
+        float j5 = INTRO_SERVO2_BASE_DEG + servo_yaw_deg;
+        j5 = clampf(j5, 0.0f, 270.0f);
+        if (uart_send_arm_target(x, y, z, j5, j4, 0x01) == 0) {
+            g_arm_target_yaw_deg.store(arm_yaw_deg);
+            g_arm_target_pitch_deg.store(0.0f);
+            last_sent_x = x;
+            last_sent_y = y;
+            last_sent_z = z;
+            last_sent_j5 = j5;
+            last_cmd_us = now_us;
+            printf("[INTRO-CMD] tx=%.2f ty=%.2f tz=%.2f j5=%.2f j4=%.2f "
+                   "| arm_yaw=%+.2f servo_yaw=%+.2f gain=%.1f err=%.3f "
+                   "hand=%.3f rw=%d servo_mode=%d\n",
+                   x, y, z, j5, j4, arm_yaw_deg, servo_yaw_deg,
+                   intro_dbg_servo_gain, intro_dbg_err_norm,
+                   intro_dbg_hand_offset_norm, intro_dbg_wrist_visible,
+                   intro_dbg_servo_mode);
+        }
+    };
+
+    if (!intro_initialized || g_intro_reset_request.exchange(0) != 0) {
+        intro_initialized = true;
+        intro_arm_yaw_deg = 0.0f;
+        intro_servo_yaw_deg = 0.0f;
+        intro_space_x_cm = INTRO_BASE_X_CM;
+        intro_dbg_servo_mode = 0;
+        intro_yaw_hold = false;
+        hand_center_since_us = 0;
+        last_space_center_us = 0;
+        last_space_present_us = 0;
+        last_space_move_us = 0;
+        intro_active_wrist_idx = 10;
+        lost_frames = 0;
+        send_intro_cmd(INTRO_BASE_X_CM, INTRO_BASE_Y_CM, INTRO_BASE_Z_CM,
+                       intro_arm_yaw_deg, intro_servo_yaw_deg);
+        return;
+    }
+
+    if (detections.empty()) {
+        lost_frames++;
+        return;
+    }
+    lost_frames = 0;
+
+    const PoseDetection& det = detections[0];
+    float torso_x = 0.0f;
+    float torso_y = 0.0f;
+    int torso_count = 0;
+    const int torso_ids[] = {5, 6, 11, 12};
+    for (int i = 0; i < 4; i++) {
+        int k = torso_ids[i];
+        if (kp_valid(det, k)) {
+            torso_x += det.kps[k].x;
+            torso_y += det.kps[k].y;
+            torso_count++;
+        }
+    }
+    if (torso_count > 0) {
+        torso_x /= (float)torso_count;
+        torso_y /= (float)torso_count;
+    } else {
+        torso_x = (det.x1 + det.x2) * 0.5f;
+        torso_y = (det.y1 + det.y2) * 0.5f;
+    }
+
+    const int wrist_ids[] = {9, 10};
+    bool wrist_visible[2] = {false, false};
+    float wrist_offset_norm[2] = {0.0f, 0.0f};
+    for (int i = 0; i < 2; i++) {
+        int k = wrist_ids[i];
+        if (kp_valid(det, k)) {
+            wrist_visible[i] = true;
+            wrist_offset_norm[i] =
+                (det.kps[k].x - torso_x) / ((float)img_w * 0.5f);
+        }
+    }
+    int wrist_idx = wrist_visible[1] ? intro_active_wrist_idx : -1;
+
+    float target_x = torso_x;
+    float target_y = torso_y;
+    if (wrist_idx >= 0) {
+        target_x = INTRO_TARGET_WRIST_WEIGHT * det.kps[wrist_idx].x +
+                   (1.0f - INTRO_TARGET_WRIST_WEIGHT) * torso_x;
+        target_y = 0.70f * det.kps[wrist_idx].y + 0.30f * torso_y;
+    }
+    target_x = clampf(target_x, 0.0f, (float)(img_w - 1));
+    target_y = clampf(target_y, 0.0f, (float)(img_h - 1));
+    draw_intro_marker(nv12, img_w, img_h, target_x, target_y);
+
+    float err_norm = (target_x - (float)img_w * 0.5f) / ((float)img_w * 0.5f);
+    err_norm = clampf(err_norm, -1.0f, 1.0f);
+    float abs_err_norm = std::fabs(err_norm);
+    if (intro_yaw_hold) {
+        if (abs_err_norm >= INTRO_CENTER_HOLD_EXIT_NORM) {
+            intro_yaw_hold = false;
+        }
+    } else if (abs_err_norm <= INTRO_CENTER_HOLD_ENTER_NORM) {
+        intro_yaw_hold = true;
+    }
+
+    float active_hand_offset_norm = 0.0f;
+    bool active_hand_offset_valid = false;
+    if (intro_active_wrist_idx >= 0) {
+        int active_slot = (intro_active_wrist_idx == 9) ? 0 :
+                          (intro_active_wrist_idx == 10) ? 1 : -1;
+        if (active_slot >= 0 && wrist_visible[active_slot]) {
+            active_hand_offset_norm = wrist_offset_norm[active_slot];
+            active_hand_offset_valid = true;
+        }
+    }
+    if (active_hand_offset_valid) {
+        intro_dbg_hand_offset_norm = active_hand_offset_norm;
+        intro_dbg_wrist_visible = 1;
+        if (std::fabs(active_hand_offset_norm) <= INTRO_HAND_CENTER_NORM) {
+            if (hand_center_since_us == 0) {
+                hand_center_since_us = now_us;
+            }
+        } else {
+            hand_center_since_us = 0;
+        }
+    } else {
+        intro_dbg_hand_offset_norm = 0.0f;
+        intro_dbg_wrist_visible = 0;
+        hand_center_since_us = 0;
+    }
+    intro_dbg_err_norm = err_norm;
+    bool hand_center_stable =
+        hand_center_since_us != 0 &&
+        now_us - hand_center_since_us >= INTRO_HAND_CENTER_HOLD_US;
+    bool hand_extended_for_servo =
+        active_hand_offset_valid &&
+        std::fabs(active_hand_offset_norm) >= INTRO_HAND_PRESENT_NORM;
+    bool space_moved_this_frame = false;
+    if (hand_center_stable &&
+        now_us - last_space_center_us >= INTRO_SPACE_CENTER_PERIOD_US) {
+        float prev_space_x_cm = intro_space_x_cm;
+        if (intro_space_x_cm < 0.0f) {
+            intro_space_x_cm = std::min(0.0f,
+                                        intro_space_x_cm + INTRO_SPACE_CENTER_STEP_CM);
+        } else if (intro_space_x_cm > 0.0f) {
+            intro_space_x_cm = std::max(0.0f,
+                                        intro_space_x_cm - INTRO_SPACE_CENTER_STEP_CM);
+        }
+        space_moved_this_frame =
+            space_moved_this_frame || intro_space_x_cm != prev_space_x_cm;
+        if (space_moved_this_frame) {
+            last_space_move_us = now_us;
+        }
+        last_space_center_us = now_us;
+    }
+    if (active_hand_offset_valid &&
+        std::fabs(active_hand_offset_norm) >= INTRO_HAND_PRESENT_NORM &&
+        now_us - last_space_present_us >= INTRO_SPACE_PRESENT_PERIOD_US) {
+        float prev_space_x_cm = intro_space_x_cm;
+        if (intro_space_x_cm > INTRO_BASE_X_CM) {
+            intro_space_x_cm = std::max(INTRO_BASE_X_CM,
+                                        intro_space_x_cm - INTRO_SPACE_CENTER_STEP_CM);
+            last_space_present_us = now_us;
+        } else if (intro_space_x_cm < INTRO_BASE_X_CM) {
+            intro_space_x_cm = std::min(INTRO_BASE_X_CM,
+                                        intro_space_x_cm + INTRO_SPACE_CENTER_STEP_CM);
+            last_space_present_us = now_us;
+        }
+        space_moved_this_frame =
+            space_moved_this_frame || intro_space_x_cm != prev_space_x_cm;
+        if (space_moved_this_frame) {
+            last_space_move_us = now_us;
+        }
+    }
+
+    float effective_servo2_gain = INTRO_SERVO2_GAIN_DEG;
+    bool space_motion_active =
+        last_space_move_us != 0 &&
+        now_us - last_space_move_us <= INTRO_SPACE_MOVING_GAIN_US;
+    if (space_motion_active) {
+        effective_servo2_gain *= INTRO_SERVO2_SPACE_MOVING_GAIN_SCALE;
+    }
+    intro_dbg_servo_gain = effective_servo2_gain;
+    if (hand_center_stable) {
+        intro_servo_yaw_deg =
+            clampf(INTRO_SERVO2_CENTER_LOCK_DEG - INTRO_SERVO2_BASE_DEG,
+                   -INTRO_SERVO2_DELTA_LIMIT_DEG, INTRO_SERVO2_DELTA_LIMIT_DEG);
+        intro_yaw_hold = true;
+        intro_dbg_servo_gain = 0.0f;
+        intro_dbg_servo_mode = 2;
+    } else if (hand_extended_for_servo && !intro_yaw_hold) {
+        float desired_servo_yaw_deg =
+            clampf(INTRO_IMAGE_TO_YAW_SIGN * err_norm * effective_servo2_gain,
+                   -INTRO_SERVO2_DELTA_LIMIT_DEG, INTRO_SERVO2_DELTA_LIMIT_DEG);
+        intro_servo_yaw_deg = 0.60f * intro_servo_yaw_deg +
+                              0.40f * desired_servo_yaw_deg;
+        intro_dbg_servo_mode = 1;
+    } else {
+        intro_dbg_servo_gain = 0.0f;
+        intro_dbg_servo_mode = 0;
+    }
+
+    float tx = intro_space_x_cm;
+    float ty = INTRO_BASE_Y_CM;
+    float tz = INTRO_BASE_Z_CM;
+
+    bool changed_enough =
+        std::fabs(tx - last_sent_x) >= INTRO_SPACE_CENTER_STEP_CM ||
+        std::fabs(ty - last_sent_y) >= 0.8f ||
+        std::fabs(tz - last_sent_z) >= 0.8f ||
+        std::fabs((INTRO_SERVO2_BASE_DEG + intro_servo_yaw_deg) - last_sent_j5) >=
+            INTRO_SERVO2_SEND_DEADBAND_DEG;
+
+    if (changed_enough && now_us - last_cmd_us >= INTRO_SERVO_PERIOD_US) {
+        send_intro_cmd(tx, ty, tz, intro_arm_yaw_deg, intro_servo_yaw_deg);
+    }
+}
+
 // ========== NPU初始化 ==========
 static int init_single_model(const char* path, rknn_context* ctx,
                               rknn_tensor_attr* out_attr,
@@ -3861,8 +4176,9 @@ static void process_frame_body(uint8_t *nv12, int width, int height) {
     }
     uint64_t t4 = get_us();
 
+    PoseMode mode = get_pose_mode();
     static FaceTracker tracker(MODE_BODY, 17);
-    if (tracker.mode != MODE_BODY) tracker.reset_mode(MODE_BODY, 17);
+    if (tracker.mode != mode) tracker.reset_mode(mode, 17);
     tracker.tele_frames++;
 
     int matched_idx = tracker.update(detections, width, height);
@@ -3878,6 +4194,9 @@ static void process_frame_body(uint8_t *nv12, int width, int height) {
     if (!display_dets.empty()) {
         draw_detections(nv12, width, height, display_dets, 17);
         // BODY模式不画3D人脸姿态
+    }
+    if (mode == MODE_INTRO) {
+        update_intro_control(nv12, width, height, display_dets);
     }
     uint64_t t6 = get_us();
 
@@ -3940,7 +4259,11 @@ void cleanup_rga() {}
 
 // ========== Mode控制 ==========
 void set_pose_mode(PoseMode mode) {
+    PoseMode old_mode = g_mode.load();
     g_mode.store(mode);
+    if (mode == MODE_INTRO && old_mode != MODE_INTRO) {
+        g_intro_reset_request.store(1);
+    }
     printf("[Mode] Switched to %s\n", pose_mode_name(mode));
 }
 
@@ -3949,7 +4272,10 @@ PoseMode get_pose_mode(void) {
 }
 
 const char* pose_mode_name(PoseMode mode) {
-    return (mode == MODE_FACE) ? "FACE" : "BODY";
+    if (mode == MODE_FACE) return "FACE";
+    if (mode == MODE_BODY) return "BODY";
+    if (mode == MODE_INTRO) return "INTRO";
+    return "UNKNOWN";
 }
 
 void set_arm_profile(int profile) {

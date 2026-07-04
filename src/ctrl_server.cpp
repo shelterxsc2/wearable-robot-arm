@@ -102,6 +102,9 @@ static void handle_client(int client)
             } else if (strcmp(type_val, "body") == 0) {
                 set_pose_mode(MODE_BODY);
                 send_json(client, RESP_OK, "{\"ok\":true,\"mode\":\"body\"}\n");
+            } else if (strcmp(type_val, "intro") == 0) {
+                set_pose_mode(MODE_INTRO);
+                send_json(client, RESP_OK, "{\"ok\":true,\"mode\":\"intro\"}\n");
             } else {
                 send_json(client, RESP_BAD, "{\"ok\":false,\"error\":\"invalid type\"}\n");
             }
