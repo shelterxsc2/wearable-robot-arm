@@ -37,6 +37,7 @@
 // ========== 全局变量 ==========
 static std::atomic<PoseMode> g_mode{MODE_FACE};
 static std::atomic<int> g_intro_reset_request{1};
+static std::atomic<int> g_interview_reset_request{1};
 
 // Face landmark model (MediaPipe Face Mesh 468, 192x192)
 static rknn_context face_lm_ctx = 0;
@@ -1139,7 +1140,8 @@ volatile int g_head_center_request = 1;
 /* 独立的 NRF24 IMU 控制链路：俯仰控制（仿照偏航控制架构） */
 void nrf24_control_update(void)
 {
-    if (get_pose_mode() == MODE_INTRO) {
+    PoseMode mode = get_pose_mode();
+    if (mode == MODE_INTRO || mode == MODE_INTERVIEW) {
         return;
     }
 
@@ -3568,6 +3570,277 @@ static void update_intro_control(uint8_t* nv12, int img_w, int img_h,
     }
 }
 
+static float det_area(const PoseDetection& det) {
+    return std::max(0.0f, det.x2 - det.x1) *
+           std::max(0.0f, det.y2 - det.y1);
+}
+
+static bool estimate_head_center(const PoseDetection& det, float* cx, float* cy) {
+    float sx = 0.0f;
+    float sy = 0.0f;
+    int count = 0;
+    const int head_ids[] = {0, 1, 2, 3, 4};
+    for (int i = 0; i < 5; i++) {
+        int k = head_ids[i];
+        if (kp_valid(det, k)) {
+            sx += det.kps[k].x;
+            sy += det.kps[k].y;
+            count++;
+        }
+    }
+    if (count > 0) {
+        *cx = sx / (float)count;
+        *cy = sy / (float)count;
+        return true;
+    }
+
+    float w = std::max(1.0f, det.x2 - det.x1);
+    float h = std::max(1.0f, det.y2 - det.y1);
+    *cx = det.x1 + w * 0.5f;
+    *cy = det.y1 + h * 0.18f;
+    return false;
+}
+
+static float estimate_frontal_score(const PoseDetection& det) {
+    float score = 0.0f;
+    if (kp_valid(det, 0)) score += 1.0f;
+    if (kp_valid(det, 1) && kp_valid(det, 2)) score += 2.0f;
+    if (kp_valid(det, 3) && kp_valid(det, 4)) score += 1.0f;
+    if (kp_valid(det, 5) && kp_valid(det, 6)) score += 1.0f;
+
+    if (kp_valid(det, 0) && kp_valid(det, 1) && kp_valid(det, 2)) {
+        float le = std::fabs(det.kps[0].x - det.kps[1].x);
+        float re = std::fabs(det.kps[2].x - det.kps[0].x);
+        float denom = std::max(1.0f, le + re);
+        score += std::max(0.0f, 1.0f - std::fabs(le - re) / denom);
+    }
+    if (kp_valid(det, 5) && kp_valid(det, 6)) {
+        float shoulder_w = std::fabs(det.kps[6].x - det.kps[5].x);
+        float box_w = std::max(1.0f, det.x2 - det.x1);
+        score += clampf(shoulder_w / (box_w * 0.5f), 0.0f, 1.0f);
+    }
+    return score;
+}
+
+static void update_interview_control(uint8_t* nv12, int img_w, int img_h,
+                                     const std::vector<PoseDetection>& detections) {
+    static bool interview_initialized = false;
+    static float interview_servo_yaw_deg = 0.0f;
+    static float last_sent_j5 = 0.0f;
+    static uint64_t last_cmd_us = 0;
+    static bool target_filter_init = false;
+    static float filtered_target_x = 0.0f;
+    static float filtered_target_y = 0.0f;
+    static uint64_t last_update_us = 0;
+    static bool interview_yaw_hold = false;
+    static int interview_dbg_source = 0;
+    static int interview_dbg_people = 0;
+    static float interview_dbg_i_step = 0.0f;
+    static float interview_dbg_err_norm = 0.0f;
+    static float interview_dbg_lw_vis = 0.0f;
+    static float interview_dbg_rw_vis = 0.0f;
+    static float interview_dbg_wrist_offset_norm = 0.0f;
+
+    const uint64_t now_us = get_us();
+
+    const float INTERVIEW_BASE_X_CM = 10.0f;
+    const float INTERVIEW_BASE_Y_CM = 85.0f;
+    const float INTERVIEW_BASE_Z_CM = 15.0f;
+    const float INTERVIEW_SERVO1_BASE_DEG = 65.0f;
+    const float INTERVIEW_SERVO2_BASE_DEG = 50.0f;
+    const float INTERVIEW_IMAGE_TO_YAW_SIGN = 1.0f;
+    const float INTERVIEW_SERVO2_I_GAIN_DEG_PER_SEC = 24.0f;
+    const float INTERVIEW_SERVO2_DELTA_LIMIT_DEG = 45.0f;
+    const float INTERVIEW_SERVO2_SEND_DEADBAND_DEG = 3.0f;
+    const float INTERVIEW_HOLD_ENTER_NORM = 0.05f;
+    const float INTERVIEW_HOLD_EXIT_NORM = 0.10f;
+    const float INTERVIEW_WRIST_CONF_THRESHOLD = 0.15f;
+    const uint64_t INTERVIEW_SERVO_PERIOD_US = 700000;
+
+    auto send_interview_cmd = [&](float servo_yaw_deg) {
+        float j4 = INTERVIEW_SERVO1_BASE_DEG;
+        float j5 = clampf(INTERVIEW_SERVO2_BASE_DEG + servo_yaw_deg, 0.0f, 270.0f);
+        if (uart_send_arm_target(INTERVIEW_BASE_X_CM, INTERVIEW_BASE_Y_CM,
+                                 INTERVIEW_BASE_Z_CM, j5, j4, 0x01) == 0) {
+            g_arm_target_yaw_deg.store(0.0f);
+            g_arm_target_pitch_deg.store(0.0f);
+            last_sent_j5 = j5;
+            last_cmd_us = now_us;
+            printf("[INTERVIEW-CMD] tx=%.2f ty=%.2f tz=%.2f j5=%.2f j4=%.2f "
+                   "| servo_yaw=%+.2f err=%.3f istep=%+.2f source=%d people=%d "
+                   "lw=%.2f rw=%.2f wrist=%.3f\n",
+                   INTERVIEW_BASE_X_CM, INTERVIEW_BASE_Y_CM, INTERVIEW_BASE_Z_CM,
+                   j5, j4, servo_yaw_deg, interview_dbg_err_norm,
+                   interview_dbg_i_step, interview_dbg_source, interview_dbg_people,
+                   interview_dbg_lw_vis, interview_dbg_rw_vis,
+                   interview_dbg_wrist_offset_norm);
+        }
+    };
+
+    if (!interview_initialized || g_interview_reset_request.exchange(0) != 0) {
+        interview_initialized = true;
+        interview_servo_yaw_deg = 0.0f;
+        target_filter_init = false;
+        last_update_us = now_us;
+        interview_yaw_hold = false;
+        interview_dbg_source = 0;
+        interview_dbg_people = 0;
+        interview_dbg_i_step = 0.0f;
+        interview_dbg_err_norm = 0.0f;
+        interview_dbg_lw_vis = 0.0f;
+        interview_dbg_rw_vis = 0.0f;
+        interview_dbg_wrist_offset_norm = 0.0f;
+        send_interview_cmd(interview_servo_yaw_deg);
+        return;
+    }
+
+    if (detections.empty()) {
+        return;
+    }
+
+    std::vector<int> order;
+    order.reserve(detections.size());
+    for (size_t i = 0; i < detections.size(); i++) {
+        order.push_back((int)i);
+    }
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        return det_area(detections[a]) > det_area(detections[b]);
+    });
+
+    float target_x = 0.0f;
+    float target_y = 0.0f;
+    bool have_target = false;
+    interview_dbg_people = (int)std::min<size_t>(2, order.size());
+
+    if (order.size() >= 2) {
+        int first_idx = order[0];
+        int second_idx = order[1];
+        float second_best_score = -1.0f;
+        float first_area = det_area(detections[first_idx]);
+        for (size_t i = 1; i < order.size(); i++) {
+            int idx = order[i];
+            float area_ratio = det_area(detections[idx]) / std::max(1.0f, first_area);
+            if (area_ratio < 0.25f) {
+                continue;
+            }
+            float frontal_score = estimate_frontal_score(detections[idx]);
+            float candidate_score = frontal_score + 0.5f * area_ratio;
+            if (candidate_score > second_best_score) {
+                second_best_score = candidate_score;
+                second_idx = idx;
+            }
+        }
+        float h1x = 0.0f, h1y = 0.0f, h2x = 0.0f, h2y = 0.0f;
+        estimate_head_center(detections[first_idx], &h1x, &h1y);
+        estimate_head_center(detections[second_idx], &h2x, &h2y);
+        target_x = (h1x + h2x) * 0.5f;
+        target_y = (h1y + h2y) * 0.5f;
+        have_target = true;
+        interview_dbg_source = 2;
+        interview_dbg_lw_vis = 0.0f;
+        interview_dbg_rw_vis = 0.0f;
+        interview_dbg_wrist_offset_norm = 0.0f;
+    } else if (order.size() == 1) {
+        const PoseDetection& det = detections[order[0]];
+        float torso_x = 0.0f;
+        float torso_y = 0.0f;
+        int torso_count = 0;
+        const int torso_ids[] = {5, 6, 11, 12};
+        for (int i = 0; i < 4; i++) {
+            int k = torso_ids[i];
+            if (kp_valid(det, k)) {
+                torso_x += det.kps[k].x;
+                torso_y += det.kps[k].y;
+                torso_count++;
+            }
+        }
+        if (torso_count > 0) {
+            torso_x /= (float)torso_count;
+            torso_y /= (float)torso_count;
+        } else {
+            torso_x = (det.x1 + det.x2) * 0.5f;
+            torso_y = (det.y1 + det.y2) * 0.5f;
+        }
+
+        interview_dbg_lw_vis = det.kps[9].visibility;
+        interview_dbg_rw_vis = det.kps[10].visibility;
+        bool lw_valid = det.kps[9].visibility >= INTERVIEW_WRIST_CONF_THRESHOLD;
+
+        if (lw_valid) {
+            target_x = det.kps[9].x;
+            target_y = det.kps[9].y;
+            interview_dbg_wrist_offset_norm =
+                (target_x - torso_x) / ((float)img_w * 0.5f);
+            have_target = true;
+            interview_dbg_source = 1;
+        } else {
+            estimate_head_center(det, &target_x, &target_y);
+            interview_dbg_wrist_offset_norm = 0.0f;
+            have_target = true;
+            interview_dbg_source = 3;
+        }
+    } else {
+        interview_dbg_lw_vis = 0.0f;
+        interview_dbg_rw_vis = 0.0f;
+        interview_dbg_wrist_offset_norm = 0.0f;
+    }
+
+    if (!have_target) {
+        return;
+    }
+
+    target_x = clampf(target_x, 0.0f, (float)(img_w - 1));
+    target_y = clampf(target_y, 0.0f, (float)(img_h - 1));
+    if (!target_filter_init) {
+        filtered_target_x = target_x;
+        filtered_target_y = target_y;
+        target_filter_init = true;
+    } else {
+        filtered_target_x = 0.75f * filtered_target_x + 0.25f * target_x;
+        filtered_target_y = 0.75f * filtered_target_y + 0.25f * target_y;
+    }
+    draw_intro_marker(nv12, img_w, img_h, filtered_target_x, filtered_target_y);
+
+    float err_norm =
+        (filtered_target_x - (float)img_w * 0.5f) / ((float)img_w * 0.5f);
+    err_norm = clampf(err_norm, -1.0f, 1.0f);
+    interview_dbg_err_norm = err_norm;
+
+    float abs_err_norm = std::fabs(err_norm);
+    if (interview_yaw_hold) {
+        if (abs_err_norm >= INTERVIEW_HOLD_EXIT_NORM) {
+            interview_yaw_hold = false;
+        }
+    } else if (abs_err_norm <= INTERVIEW_HOLD_ENTER_NORM) {
+        interview_yaw_hold = true;
+    }
+
+    float dt_sec = 0.0f;
+    if (last_update_us != 0 && now_us > last_update_us) {
+        dt_sec = (float)(now_us - last_update_us) / 1000000.0f;
+        dt_sec = clampf(dt_sec, 0.0f, 0.20f);
+    }
+    last_update_us = now_us;
+    interview_dbg_i_step = 0.0f;
+    if (!interview_yaw_hold && dt_sec > 0.0f) {
+        interview_dbg_i_step =
+            INTERVIEW_IMAGE_TO_YAW_SIGN * err_norm *
+            INTERVIEW_SERVO2_I_GAIN_DEG_PER_SEC * dt_sec;
+        interview_servo_yaw_deg =
+            clampf(interview_servo_yaw_deg + interview_dbg_i_step,
+                   -INTERVIEW_SERVO2_DELTA_LIMIT_DEG,
+                   INTERVIEW_SERVO2_DELTA_LIMIT_DEG);
+    }
+
+    float j5 = clampf(INTERVIEW_SERVO2_BASE_DEG + interview_servo_yaw_deg,
+                      0.0f, 270.0f);
+    bool changed_enough =
+        std::fabs(j5 - last_sent_j5) >= INTERVIEW_SERVO2_SEND_DEADBAND_DEG;
+    if (changed_enough && now_us - last_cmd_us >= INTERVIEW_SERVO_PERIOD_US) {
+        send_interview_cmd(interview_servo_yaw_deg);
+    }
+}
+
 // ========== NPU初始化 ==========
 static int init_single_model(const char* path, rknn_context* ctx,
                               rknn_tensor_attr* out_attr,
@@ -4181,13 +4454,17 @@ static void process_frame_body(uint8_t *nv12, int width, int height) {
     if (tracker.mode != mode) tracker.reset_mode(mode, 17);
     tracker.tele_frames++;
 
-    int matched_idx = tracker.update(detections, width, height);
     std::vector<PoseDetection> display_dets;
 
-    if (matched_idx >= 0) {
-        tracker.tele_tracked++;
-        tracker.apply_filter(detections[matched_idx]);
-        display_dets.push_back(detections[matched_idx]);
+    if (mode == MODE_INTERVIEW) {
+        display_dets = detections;
+    } else {
+        int matched_idx = tracker.update(detections, width, height);
+        if (matched_idx >= 0) {
+            tracker.tele_tracked++;
+            tracker.apply_filter(detections[matched_idx]);
+            display_dets.push_back(detections[matched_idx]);
+        }
     }
     uint64_t t5 = get_us();
 
@@ -4197,6 +4474,8 @@ static void process_frame_body(uint8_t *nv12, int width, int height) {
     }
     if (mode == MODE_INTRO) {
         update_intro_control(nv12, width, height, display_dets);
+    } else if (mode == MODE_INTERVIEW) {
+        update_interview_control(nv12, width, height, detections);
     }
     uint64_t t6 = get_us();
 
@@ -4257,12 +4536,44 @@ void cleanup_npu() {
 
 void cleanup_rga() {}
 
+static void send_face_home_from_scenario(void) {
+    const ArmKinematicsProfile& profile = current_arm_profile();
+    float tx = 0.0f;
+    float ty = profile.l4 + profile.l3;
+    float tz = profile.l2 + profile.l1;
+    float j5 = clampf(profile.servo2_baseline, 0.0f, 270.0f);
+    float j4 = clampf(profile.servo1_baseline, -90.0f, 90.0f);
+
+    int ret = uart_send_arm_target(tx, ty, tz, j5, j4, 0x01);
+    if (ret == 0) {
+        g_arm_target_yaw_deg.store(0.0f);
+        g_arm_target_pitch_deg.store(0.0f);
+        printf("[ModeHome] scenario -> face home tx=%.2f ty=%.2f tz=%.2f "
+               "j5=%.2f j4=%.2f profile=%s\n",
+               tx, ty, tz, j5, j4, profile.name);
+    } else {
+        printf("[ModeHome] scenario -> face home send failed ret=%d\n", ret);
+    }
+}
+
 // ========== Mode控制 ==========
 void set_pose_mode(PoseMode mode) {
     PoseMode old_mode = g_mode.load();
+    bool exiting_scenario_to_face =
+        mode == MODE_FACE &&
+        (old_mode == MODE_INTRO || old_mode == MODE_INTERVIEW);
+    if (exiting_scenario_to_face) {
+        send_face_home_from_scenario();
+    }
+
     g_mode.store(mode);
     if (mode == MODE_INTRO && old_mode != MODE_INTRO) {
         g_intro_reset_request.store(1);
+    } else if (mode == MODE_INTERVIEW && old_mode != MODE_INTERVIEW) {
+        g_interview_reset_request.store(1);
+    } else if (exiting_scenario_to_face) {
+        g_head_center_request = 1;
+        printf("[ModeHome] requested head IMU center recapture for FACE\n");
     }
     printf("[Mode] Switched to %s\n", pose_mode_name(mode));
 }
@@ -4275,6 +4586,7 @@ const char* pose_mode_name(PoseMode mode) {
     if (mode == MODE_FACE) return "FACE";
     if (mode == MODE_BODY) return "BODY";
     if (mode == MODE_INTRO) return "INTRO";
+    if (mode == MODE_INTERVIEW) return "INTERVIEW";
     return "UNKNOWN";
 }
 

@@ -188,7 +188,7 @@ UART 回环测试工具。重点看：
 BLE HC-08 遥控器客户端。重点看：
 - 目标设备 `HC-08 / F8:2E:0C:E3:99:C8`
 - FFE0/FFE1 透传 characteristic 连接和后台重连逻辑
-- 三字节遥控协议：`55 01` 切 L3 profile，`55 02` 情景预留，`55 03` 反转 IMU pitch 极性
+- 三字节遥控协议：`55 01` 切 L3 profile，`55 02 00/01/02/03` 切 `face/intro/interview/body`，`55 03` 反转 IMU pitch 极性
 
 # 输出要求
 

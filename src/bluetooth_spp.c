@@ -78,7 +78,7 @@ static int str_ieq(const char *a, const char *b)
  * 三字节遥控协议:
  *   55 00 00       idle
  *   55 01 00/01    arm profile: 00=L3-40, 01=L3-55
- *   55 02 00/01/02 scene reserved, log only
+ *   55 02 00/01/02/03 scene: 00=FACE, 01=INTRO, 02=INTERVIEW, 03=BODY
  *   55 03 xx       toggle IMU pitch sign
  * ============================================================ */
 static void handle_remote_frame(uint8_t cmd, uint8_t value)
@@ -116,7 +116,21 @@ static void handle_remote_frame(uint8_t cmd, uint8_t value)
             break;
 
         case 0x02:
-            printf("[BT] Remote scene value 0x%02X received (reserved)\n", value);
+            if (value == 0x00) {
+                set_pose_mode(MODE_FACE);
+                printf("[BT] Remote scene -> face\n");
+            } else if (value == 0x01) {
+                set_pose_mode(MODE_INTRO);
+                printf("[BT] Remote scene -> intro\n");
+            } else if (value == 0x02) {
+                set_pose_mode(MODE_INTERVIEW);
+                printf("[BT] Remote scene -> interview\n");
+            } else if (value == 0x03) {
+                set_pose_mode(MODE_BODY);
+                printf("[BT] Remote scene -> body\n");
+            } else {
+                printf("[BT] Remote scene value 0x%02X ignored\n", value);
+            }
             break;
 
         case 0x03: {
