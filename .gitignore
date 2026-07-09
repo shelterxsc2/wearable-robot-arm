@@ -54,3 +54,6 @@ Thumbs.db
 
 # Local development workspace (sync code to mcu-stm32/ instead)
 RoboticArmControlProject/
+# Python cache
+__pycache__/
+*.pyc

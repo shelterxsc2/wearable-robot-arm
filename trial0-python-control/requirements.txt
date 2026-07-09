@@ -1,0 +1,9 @@
+ultralytics
+opencv-python
+openvino
+websocket-client
+numpy<2.5,>=2
+sounddevice
+soundfile
+sherpa-onnx
+onnxruntime-openvino==1.24.1

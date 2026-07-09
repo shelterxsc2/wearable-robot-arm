@@ -1,0 +1,11 @@
+[Unit]
+Description=Configure DK-2500 CON3 (IT8786 COM3) for high-speed UART
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sio_com3_highspeed.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
