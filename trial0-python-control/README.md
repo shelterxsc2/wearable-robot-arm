@@ -523,6 +523,8 @@ python3 tools/stm32_bridge_crosstalk_probe.py
 | 录制 | @录制 |
 | 停止 | @停止 |
 | 并肩 | @并肩 |
+| 原画 | @原画 |
+| 标注 | @标注 |
 
 ### 5.1 修改关键词
 
@@ -778,7 +780,7 @@ pip install "numpy<2.5,>=2" --force-reinstall --no-deps
    ```bash
    amixer -c 1 set 'Auto Gain Control' on
    ```
-3. **关键词不匹配**：确认你说的词在 `voice/keywords.txt` 里。当前默认是 `拉远/拉近/介绍/正面/采访/开机/关机/录制/停止/并肩`。
+3. **关键词不匹配**：确认你说的词在 `voice/keywords.txt` 里。当前默认是 `拉远/拉近/介绍/正面/采访/开机/关机/录制/停止/并肩/原画/标注`。
 4. **VAD 过滤掉了**：默认 VAD 已经调得比较宽松（threshold=0.3，hangover=800ms），并且 KWS 现在会在每个音频块都解码，只在连续静音 10 个块后才 reset。如果仍然漏检，可尝试：
    - `--voice-vad-threshold 0.2 --voice-vad-hangover-ms 1200`
    - `--voice-no-vad` 彻底关闭 VAD

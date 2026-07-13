@@ -39,6 +39,7 @@ CONTROL_PERIOD_S = 0.05
 
 KI_PNP = 0.04
 KI_PNP_PITCH_BIAS = 0.02
+PNP_FRAME_ERROR_LIMIT_DEG = 15.0
 K_PNP_PITCH_Z_CM = 0.0
 PNP_INTEGRAL_DEADBAND_DEG = 3.0
 
@@ -81,6 +82,7 @@ INTRO_TARGET_WRIST_WEIGHT = 0.90
 INTRO_SERVO2_GAIN_DEG = 60.0
 INTRO_SERVO2_SPACE_MOVING_GAIN_SCALE = 0.20
 INTRO_SERVO2_DELTA_LIMIT_DEG = 60.0
+SCENARIO_SERVO_MAX_STEP_DEG = 5.0
 INTRO_SERVO2_SEND_DEADBAND_DEG = 4.0
 INTRO_HAND_CENTER_NORM = 0.18
 INTRO_HAND_PRESENT_NORM = 0.30
@@ -108,6 +110,15 @@ INTERVIEW_SERVO_PERIOD_US = 700_000
 FIRST_PERSON_BASE_X_CM = -20.0
 FIRST_PERSON_BASE_Y_CM = 30.0
 FIRST_PERSON_BASE_Z_CM = 20.0
+# Safe first-person camera-space coordinate window, in cm.  The upstream arm
+# protocol accepts int16 coordinates, but practical workspace is much smaller;
+# keep this around the existing first-person base pose.
+FIRST_PERSON_MIN_X_CM = -35.0
+FIRST_PERSON_MAX_X_CM = -5.0
+FIRST_PERSON_MIN_Y_CM = 15.0
+FIRST_PERSON_MAX_Y_CM = 55.0
+FIRST_PERSON_MIN_Z_CM = 5.0
+FIRST_PERSON_MAX_Z_CM = 35.0
 FIRST_PERSON_BASE_J4_DEG = 10.0
 FIRST_PERSON_BASE_J5_DEG = 180.0
 FIRST_PERSON_YAW_GAIN = 1.0
@@ -147,6 +158,7 @@ STATE_NAMES = {
 # Default arm profile: far_l3_55
 ARM_PROFILE_FAR_L3_55 = 1
 ARM_PROFILE_MID_L3_40 = 0
+ARM_PROFILE_EXTRA_FAR_L3_65 = 2
 
 # PnP calibration tables (from rga_npu.cpp)
 PNP_YAW_CALIB_L3_40 = [
@@ -207,7 +219,22 @@ ARM_PROFILES = [
     ),
     ArmKinematicsProfile(
         name="far_l3_55",
-        l1=11.08, l2=6.92, l3=55.0, l4=28.0,
+        l1=9.2333333333, l2=5.7666666667, l3=55.0, l4=28.0,
+        pitch_z_gain=1.6,
+        servo1_baseline=60.0,
+        servo1_gain_up=-0.5,
+        servo1_gain_down=-1.65,
+        servo2_baseline=50.0,
+        servo2_yaw_gain=0.2,
+        position_pitch_sign=1,
+        pitch_pos_fade_start_yaw_deg=45.0,
+        pitch_pos_fade_end_yaw_deg=60.0,
+        yaw_calib=PNP_YAW_CALIB_L3_55,
+        pitch_calib=PNP_PITCH_CALIB_L3_55,
+    ),
+    ArmKinematicsProfile(
+        name="extra_far_l3_65",
+        l1=9.2333333333, l2=5.7666666667, l3=65.0, l4=28.0,
         pitch_z_gain=1.6,
         servo1_baseline=65.0,
         servo1_gain_up=-0.5,
@@ -1041,6 +1068,14 @@ class ControlContext(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
+    def request_voice_power_off(self, timeout_s: float = 3.0) -> bool:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def confirm_voice_power_off(self) -> bool:
+        raise NotImplementedError
+
+    @abc.abstractmethod
     def power_off_arm(self) -> bool:
         raise NotImplementedError
 
@@ -1053,6 +1088,10 @@ class ControlContext(abc.ABC):
 
     @abc.abstractmethod
     def get_mode(self) -> str:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def switch_stream_mode(self, mode: str) -> Dict[str, Any]:
         raise NotImplementedError
 
 
@@ -1082,16 +1121,28 @@ def _make_handler(context: ControlContext):
             self.end_headers()
             self.wfile.write(body)
 
+        def _handle_stream_switch(self):
+            mode = _parse_query(self.path).get("mode", "")
+            if mode not in ("auto", "cloud", "local"):
+                self._send_json(400, {"ok": False, "error": "mode must be auto, cloud or local"})
+                return
+            result = context.switch_stream_mode(mode)
+            self._send_json(200 if result.get("ok") else 503, result)
+
         def do_GET(self):
             if self.path == "/status" or self.path.startswith("/status"):
                 self._send_json(200, context.get_status())
+            elif self.path.startswith("/stream"):
+                self._handle_stream_switch()
             else:
                 self._send_json(404, {"ok": False, "error": "not found"})
 
         def do_POST(self):
             path = self.path
             q = _parse_query(path)
-            if path.startswith("/mode"):
+            if path.startswith("/stream"):
+                self._handle_stream_switch()
+            elif path.startswith("/mode"):
                 t = q.get("type", "")
                 if t in ("face", "body", "intro", "interview", "first_person"):
                     context.set_mode(t)
@@ -1234,6 +1285,14 @@ class Nrf24Controller:
         self.effective_pitch_visual_bias_deg = 0.0
         self.last_is_stop_yaw_for_pitch_bias = True
         self.last_pitch_visual_bias_step = 0.0
+        self.visual_pitch_pending_sign = 0
+        self.visual_yaw_pending_sign = 0
+        self.visual_pitch_last_cmd_sign = 0
+        self.visual_yaw_last_cmd_sign = 0
+        self.visual_pitch_blocked_sign = 0
+        self.visual_yaw_blocked_sign = 0
+        self.visual_pitch_reversal_pending = False
+        self.visual_yaw_reversal_pending = False
 
         self.rel_rate_init = False
         self.prev_vec_pitch = 0.0
@@ -1297,6 +1356,9 @@ class Nrf24Controller:
             "last_send_us": 0,
             "last_j4": FIRST_PERSON_BASE_J4_DEG,
             "last_j5": FIRST_PERSON_BASE_J5_DEG,
+            "target_x": FIRST_PERSON_BASE_X_CM,
+            "target_y": FIRST_PERSON_BASE_Y_CM,
+            "target_z": FIRST_PERSON_BASE_Z_CM,
         }
 
         # Calibration state
@@ -1668,6 +1730,40 @@ class Nrf24Controller:
 
     # ------------------------------------------------------------------
 
+    def set_first_person_target(self, x: float, y: float, z: float) -> Dict[str, Any]:
+        """Set persistent first-person camera-space coordinates in cm."""
+        st = self._first_person_state
+        st["target_x"] = clamp(float(x), FIRST_PERSON_MIN_X_CM, FIRST_PERSON_MAX_X_CM)
+        st["target_y"] = clamp(float(y), FIRST_PERSON_MIN_Y_CM, FIRST_PERSON_MAX_Y_CM)
+        st["target_z"] = clamp(float(z), FIRST_PERSON_MIN_Z_CM, FIRST_PERSON_MAX_Z_CM)
+        print(
+            f"[FirstPerson] target xyz set: x={st['target_x']:.1f} "
+            f"y={st['target_y']:.1f} z={st['target_z']:.1f}"
+        )
+        return self._make_first_person_current_command()
+
+    def set_first_person_discrete_target(self, x: int, y: int, z: int) -> Dict[str, Any]:
+        """Map cloud D-pad values (-5..5) to first-person camera coordinates."""
+        xi = int(clamp(int(x), -5, 5))
+        yi = int(clamp(int(y), -5, 5))
+        zi = int(clamp(int(z), -5, 5))
+        return self.set_first_person_target(
+            FIRST_PERSON_BASE_X_CM + xi * 3.0,
+            FIRST_PERSON_BASE_Y_CM + yi * 5.0,
+            FIRST_PERSON_BASE_Z_CM + zi * 3.0,
+        )
+
+    def _make_first_person_current_command(self) -> Dict[str, Any]:
+        st = self._first_person_state
+        return {
+            "x": st.get("target_x", FIRST_PERSON_BASE_X_CM),
+            "y": st.get("target_y", FIRST_PERSON_BASE_Y_CM),
+            "z": st.get("target_z", FIRST_PERSON_BASE_Z_CM),
+            "servo1": st.get("last_j4", FIRST_PERSON_BASE_J4_DEG),
+            "servo2": st.get("last_j5", FIRST_PERSON_BASE_J5_DEG),
+            "flag": 0x01,
+        }
+
     def set_pose_mode(self, mode: str) -> Optional[Dict[str, Any]]:
         """Switch pose mode. Returns a face-home command if exiting scenario modes."""
         mode = mode.lower()
@@ -1718,19 +1814,15 @@ class Nrf24Controller:
         st["last_j4"] = FIRST_PERSON_BASE_J4_DEG
         st["last_j5"] = FIRST_PERSON_BASE_J5_DEG
         st["last_send_us"] = 0
+        st.setdefault("target_x", FIRST_PERSON_BASE_X_CM)
+        st.setdefault("target_y", FIRST_PERSON_BASE_Y_CM)
+        st.setdefault("target_z", FIRST_PERSON_BASE_Z_CM)
         self.arm_target_yaw = 0.0
         self.arm_target_pitch = 0.0
-        print(f"[FirstPerson] initial pose: x={FIRST_PERSON_BASE_X_CM:.1f} "
-              f"y={FIRST_PERSON_BASE_Y_CM:.1f} z={FIRST_PERSON_BASE_Z_CM:.1f} "
+        print(f"[FirstPerson] initial pose: x={st['target_x']:.1f} "
+              f"y={st['target_y']:.1f} z={st['target_z']:.1f} "
               f"J5={FIRST_PERSON_BASE_J5_DEG:.1f} J4={FIRST_PERSON_BASE_J4_DEG:.1f}")
-        return {
-            "x": FIRST_PERSON_BASE_X_CM,
-            "y": FIRST_PERSON_BASE_Y_CM,
-            "z": FIRST_PERSON_BASE_Z_CM,
-            "servo1": FIRST_PERSON_BASE_J4_DEG,
-            "servo2": FIRST_PERSON_BASE_J5_DEG,
-            "flag": 0x01,
-        }
+        return self._make_first_person_current_command()
 
     def _update_first_person_control(self, vec_yaw: float, vec_pitch: float,
                                      now_us: int) -> Optional[Dict[str, Any]]:
@@ -1754,9 +1846,9 @@ class Nrf24Controller:
         self.arm_target_yaw = vec_yaw
         self.arm_target_pitch = vec_pitch
         return {
-            "x": FIRST_PERSON_BASE_X_CM,
-            "y": FIRST_PERSON_BASE_Y_CM,
-            "z": FIRST_PERSON_BASE_Z_CM,
+            "x": st.get("target_x", FIRST_PERSON_BASE_X_CM),
+            "y": st.get("target_y", FIRST_PERSON_BASE_Y_CM),
+            "z": st.get("target_z", FIRST_PERSON_BASE_Z_CM),
             "servo1": j4,
             "servo2": j5,
             "flag": 0x01,
@@ -1829,10 +1921,15 @@ class Nrf24Controller:
         current_us = now_us or int(time.perf_counter() * 1_000_000)
 
         def make_command() -> Dict[str, Any]:
-            j5 = clamp(
+            desired_j5 = clamp(
                 INTRO_SERVO2_BASE_DEG + st["intro_servo_yaw_deg"],
                 0.0,
                 270.0,
+            )
+            j5 = clamp(
+                desired_j5,
+                st["last_sent_j5"] - SCENARIO_SERVO_MAX_STEP_DEG,
+                st["last_sent_j5"] + SCENARIO_SERVO_MAX_STEP_DEG,
             )
             command = {
                 "x": st["intro_space_x_cm"],
@@ -1867,7 +1964,7 @@ class Nrf24Controller:
                 "last_sent_x": 0.0,
                 "last_sent_y": 0.0,
                 "last_sent_z": 0.0,
-                "last_sent_j5": 0.0,
+                "last_sent_j5": INTRO_SERVO2_BASE_DEG,
             })
             return make_command()
 
@@ -1999,10 +2096,12 @@ class Nrf24Controller:
                                  now_us: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """Interview scenario: center on speaker(s) via integrated yaw servo."""
         st = self._interview_state
-        if st["first"]:
+        first_update = st["first"]
+        if first_update:
             st["first"] = False
             st["interview_servo_yaw_deg"] = 0.0
             st["last_send_us"] = 0
+            st["last_sent_j5"] = INTERVIEW_SERVO2_BASE_DEG
 
         if not detections:
             return None
@@ -2066,12 +2165,19 @@ class Nrf24Controller:
                 INTERVIEW_SERVO2_DELTA_LIMIT_DEG,
             )
 
-        j5 = INTERVIEW_SERVO2_BASE_DEG + st["interview_servo_yaw_deg"]
-        j5 = clamp(j5, 0.0, 270.0)
+        desired_j5 = clamp(
+            INTERVIEW_SERVO2_BASE_DEG + st["interview_servo_yaw_deg"], 0.0, 270.0
+        )
+        j5 = clamp(
+            desired_j5,
+            st["last_sent_j5"] - SCENARIO_SERVO_MAX_STEP_DEG,
+            st["last_sent_j5"] + SCENARIO_SERVO_MAX_STEP_DEG,
+        )
         j4 = INTERVIEW_SERVO1_BASE_DEG
 
         if current_us - st["last_send_us"] >= INTERVIEW_SERVO_PERIOD_US:
-            if abs(j5 - st["last_sent_j5"]) >= INTERVIEW_SERVO2_SEND_DEADBAND_DEG:
+            if (first_update or
+                    abs(j5 - st["last_sent_j5"]) >= INTERVIEW_SERVO2_SEND_DEADBAND_DEG):
                 st["last_send_us"] = current_us
                 st["last_sent_j5"] = j5
                 st["last_source"] = source
@@ -2098,11 +2204,26 @@ class Nrf24Controller:
         self.pitch_visual_bias_deg = 0.0
         self.effective_pitch_visual_bias_deg = 0.0
         self.R_bias_total = None
+        self._reset_visual_direction_state()
         self.last_cmd_target_pitch = 0.0
         self.last_cmd_target_yaw = 0.0
         self.predictor.reset()
         self.predictor_yaw.reset()
         print("[Ctrl] Rebaseline requested")
+
+    def _reset_visual_direction_state(self):
+        self.visual_pitch_pending_sign = 0
+        self.visual_yaw_pending_sign = 0
+        self.visual_pitch_last_cmd_sign = 0
+        self.visual_yaw_last_cmd_sign = 0
+        self.visual_pitch_blocked_sign = 0
+        self.visual_yaw_blocked_sign = 0
+        self.visual_pitch_reversal_pending = False
+        self.visual_yaw_reversal_pending = False
+
+    @staticmethod
+    def _step_sign(value: float) -> int:
+        return 1 if value > 0.0 else (-1 if value < 0.0 else 0)
 
     @staticmethod
     def _remove_calib_files():
@@ -2282,6 +2403,7 @@ class Nrf24Controller:
             self.effective_pitch_visual_bias_deg = 0.0
             self.last_is_stop_yaw_for_pitch_bias = True
             self.last_pitch_visual_bias_step = 0.0
+            self._reset_visual_direction_state()
             self.last_cmd_target_pitch = 0.0
             self.last_cmd_target_yaw = 0.0
             self.predictor.reset()
@@ -2333,21 +2455,53 @@ class Nrf24Controller:
             self.last_pitch_visual_bias_step = 0.0
         self.last_is_stop_yaw_for_pitch_bias = is_stop_yaw
 
-        # ----- PnP drift correction (only when fully stationary) -----
+        # A corresponding IMU movement releases the visual direction lock.
+        if not is_stop:
+            self.visual_pitch_blocked_sign = 0
+            self.visual_pitch_last_cmd_sign = 0
+            self.visual_pitch_reversal_pending = False
+            self.visual_pitch_pending_sign = 0
+        if not is_stop_yaw:
+            self.visual_yaw_blocked_sign = 0
+            self.visual_yaw_last_cmd_sign = 0
+            self.visual_yaw_reversal_pending = False
+            self.visual_yaw_pending_sign = 0
+
+        # ----- PnP drift correction -----
+        # Consume each fresh visual frame without waiting for the IMUs or arm to stop.
         do_pnp_correct = False
         yaw_delta = 0.0
         pitch_delta = 0.0
-        if r_init_set and is_stop and is_stop_yaw and self.arm_stable:
-            ready, pnp_pitch_corr, pnp_yaw_corr = self._consume_pnp_correction()
-            if ready:
-                if abs(pnp_pitch_corr) <= PNP_INTEGRAL_DEADBAND_DEG:
-                    pnp_pitch_corr = 0.0
-                if abs(pnp_yaw_corr) <= PNP_INTEGRAL_DEADBAND_DEG:
-                    pnp_yaw_corr = 0.0
-                pitch_step = KI_PNP_PITCH_BIAS * pnp_pitch_corr
+        ready, pnp_pitch_corr, pnp_yaw_corr = self._consume_pnp_correction()
+        if ready:
+            pitch_corr_limited = clamp(
+                pnp_pitch_corr, -PNP_FRAME_ERROR_LIMIT_DEG, PNP_FRAME_ERROR_LIMIT_DEG
+            )
+            yaw_corr_limited = clamp(
+                pnp_yaw_corr, -PNP_FRAME_ERROR_LIMIT_DEG, PNP_FRAME_ERROR_LIMIT_DEG
+            )
+            pitch_step = KI_PNP_PITCH_BIAS * pitch_corr_limited
+            yaw_step = -KI_PNP * yaw_corr_limited
+            pitch_sign = self._step_sign(pitch_step)
+            yaw_sign = self._step_sign(yaw_step)
+
+            if (pitch_sign and not self.visual_pitch_reversal_pending and
+                    pitch_sign != self.visual_pitch_blocked_sign):
+                if (self.visual_pitch_last_cmd_sign and
+                        pitch_sign != self.visual_pitch_last_cmd_sign):
+                    self.visual_pitch_reversal_pending = True
                 self.pitch_visual_bias_deg += pitch_step
                 self.last_pitch_visual_bias_step = pitch_step
-                yaw_delta = -KI_PNP * pnp_yaw_corr
+                self.visual_pitch_pending_sign = pitch_sign
+                do_pnp_correct = True
+
+            if (yaw_sign and not self.visual_yaw_reversal_pending and
+                    yaw_sign != self.visual_yaw_blocked_sign):
+                if (self.visual_yaw_last_cmd_sign and
+                        yaw_sign != self.visual_yaw_last_cmd_sign):
+                    self.visual_yaw_reversal_pending = True
+                yaw_delta = yaw_step
+                self.visual_yaw_pending_sign = yaw_sign
                 do_pnp_correct = True
 
         if do_pnp_correct:
@@ -2378,20 +2532,31 @@ class Nrf24Controller:
         target_pitch_deg = pitch_input_deg if is_stop else self.predictor.get_target_yaw(pitch_input_deg)
         target_position_pitch_deg = (position_pitch_input_deg if is_stop
                                      else self.predictor.get_target_yaw(position_pitch_input_deg))
+        if self.visual_pitch_reversal_pending:
+            midpoint_delta = normalize_angle_deg(target_pitch_deg - self.last_cmd_target_pitch) * 0.5
+            target_pitch_deg = normalize_angle_deg(self.last_cmd_target_pitch + midpoint_delta)
+            target_position_pitch_deg = target_pitch_deg
         delta_pitch_deg = normalize_angle_deg(target_pitch_deg - self.last_cmd_target_pitch)
         pitch_moved_enough = abs(delta_pitch_deg) > CMD_PITCH_THRESHOLD_DEG
 
         pitch_interval = FAST_INTERVAL_US if curr_state in (STATE_ACCEL_TO_CONST, STATE_CONST_TO_DECEL) else INTERVAL_US
         pitch_interval_ok = (now_us - self.last_cmd_us) >= pitch_interval
-        pitch_should_cmd = pitch_interval_ok and pitch_moved_enough
+        pitch_should_cmd = pitch_interval_ok and (
+            pitch_moved_enough or self.visual_pitch_reversal_pending
+        )
 
         target_yaw_deg = yaw_control_deg if is_stop_yaw else self.predictor_yaw.get_target_yaw(yaw_control_deg)
+        if self.visual_yaw_reversal_pending:
+            midpoint_delta = normalize_angle_deg(target_yaw_deg - self.last_cmd_target_yaw) * 0.5
+            target_yaw_deg = normalize_angle_deg(self.last_cmd_target_yaw + midpoint_delta)
         delta_yaw_deg = normalize_angle_deg(target_yaw_deg - self.last_cmd_target_yaw)
         yaw_moved_enough = abs(delta_yaw_deg) > CMD_YAW_THRESHOLD_DEG
 
         yaw_interval = FAST_INTERVAL_US if curr_state_yaw in (STATE_ACCEL_TO_CONST, STATE_CONST_TO_DECEL) else INTERVAL_US
         yaw_interval_ok = (now_us - self.last_cmd_us_yaw) >= yaw_interval
-        yaw_should_cmd = yaw_interval_ok and yaw_moved_enough
+        yaw_should_cmd = yaw_interval_ok and (
+            yaw_moved_enough or self.visual_yaw_reversal_pending
+        )
 
         should_cmd = pitch_should_cmd or yaw_should_cmd
         result = None
@@ -2404,7 +2569,9 @@ class Nrf24Controller:
             )
 
             pos_changed_enough = False
-            if not self.prev_sent_initialized:
+            if self.visual_pitch_reversal_pending or self.visual_yaw_reversal_pending:
+                pos_changed_enough = True
+            elif not self.prev_sent_initialized:
                 pos_changed_enough = True
             else:
                 pos_changed_enough = (
@@ -2444,9 +2611,23 @@ class Nrf24Controller:
                 if pitch_should_cmd:
                     self.last_cmd_target_pitch = target_pitch_deg
                     self.last_cmd_us = now_us
+                    if self.visual_pitch_pending_sign:
+                        if self.visual_pitch_reversal_pending:
+                            self.visual_pitch_blocked_sign = self.visual_pitch_pending_sign
+                            self.visual_pitch_reversal_pending = False
+                        else:
+                            self.visual_pitch_last_cmd_sign = self.visual_pitch_pending_sign
+                        self.visual_pitch_pending_sign = 0
                 if yaw_should_cmd:
                     self.last_cmd_target_yaw = target_yaw_deg
                     self.last_cmd_us_yaw = now_us
+                    if self.visual_yaw_pending_sign:
+                        if self.visual_yaw_reversal_pending:
+                            self.visual_yaw_blocked_sign = self.visual_yaw_pending_sign
+                            self.visual_yaw_reversal_pending = False
+                        else:
+                            self.visual_yaw_last_cmd_sign = self.visual_yaw_pending_sign
+                        self.visual_yaw_pending_sign = 0
                 self.last_any_cmd_us = now_us
 
                 self.arm_target_yaw = target_yaw_deg
@@ -2531,6 +2712,7 @@ class ElfControlThread(threading.Thread, ControlContext):
         self._auto_first_person_at: Optional[float] = None
         self._auto_first_person_done = False
         self._shutdown_in_progress = False
+        self._voice_power_off_deadline = 0.0
 
     def put_pnp_correction(self, yaw_correction: float, pitch_correction: float,
                            valid: bool = True):
@@ -2556,6 +2738,17 @@ class ElfControlThread(threading.Thread, ControlContext):
     def set_calib_mode(self, mode: int):
         self.controller.set_calib_mode(mode)
 
+    def set_first_person_discrete_target(self, x: int, y: int, z: int) -> bool:
+        cmd = self.controller.set_first_person_discrete_target(x, y, z)
+        if self.controller.pose_mode != "first_person":
+            self.set_mode("first_person")
+        if not self.uart_sink.arm_powered:
+            return False
+        return self.uart_sink.send_arm_target(
+            cmd["x"], cmd["y"], cmd["z"],
+            cmd["servo2"], cmd["servo1"], cmd["flag"]
+        )
+
     def power_on_arm(self) -> bool:
         with self._power_lock:
             if self.uart_sink.arm_powered:
@@ -2569,6 +2762,7 @@ class ElfControlThread(threading.Thread, ControlContext):
                 print("[Power] power-on frame failed")
                 return False
             self._shutdown_in_progress = False
+            self._voice_power_off_deadline = 0.0
             self.uart_sink.block_tx = True
             self._reset_control_after_power_on()
             self._power_reinit_thread = threading.Thread(
@@ -2579,6 +2773,58 @@ class ElfControlThread(threading.Thread, ControlContext):
             self._update_status()
             return True
 
+    def request_voice_power_off(self, timeout_s: float = 3.0) -> bool:
+        with self._power_lock:
+            if self._voice_power_off_deadline > time.perf_counter():
+                print("[PowerConfirm] confirmation already pending")
+                return False
+            if self.controller.pose_mode != "face":
+                print(f"[PowerConfirm] ignored outside FACE: {self.controller.pose_mode}")
+                return False
+            if not self.uart_sink.arm_powered:
+                print("[PowerConfirm] arm already off")
+                return False
+            self._shutdown_in_progress = True
+            self._auto_first_person_at = None
+            if not self._send_safe_shutdown_pose_locked(wait_before_power_off=False):
+                self._shutdown_in_progress = False
+                self.uart_sink.block_tx = False
+                print("[PowerConfirm] safe pose failed; confirmation not started")
+                return False
+            self._voice_power_off_deadline = time.perf_counter() + max(0.1, timeout_s)
+            print(f"[PowerConfirm] show OK gesture within {timeout_s:.1f}s")
+            return True
+
+    def confirm_voice_power_off(self) -> bool:
+        with self._power_lock:
+            deadline = self._voice_power_off_deadline
+            if deadline <= 0.0 or time.perf_counter() > deadline:
+                return False
+            self._voice_power_off_deadline = 0.0
+            ok = self.uart_sink.send_power_off()
+            if ok:
+                self.flush_queues()
+                print("[PowerConfirm] OK confirmed; arm power-off frame sent")
+                self._update_status()
+                return True
+            self._shutdown_in_progress = False
+            self.uart_sink.block_tx = False
+            print("[PowerConfirm] power-off frame failed")
+            return False
+
+    def _check_voice_power_off_timeout(self) -> None:
+        deadline = self._voice_power_off_deadline
+        if deadline <= 0.0 or time.perf_counter() <= deadline:
+            return
+        with self._power_lock:
+            if self._voice_power_off_deadline <= 0.0 or time.perf_counter() <= self._voice_power_off_deadline:
+                return
+            self._voice_power_off_deadline = 0.0
+            self._shutdown_in_progress = False
+            self.uart_sink.block_tx = False
+            print("[PowerConfirm] timeout; power-off cancelled")
+            self._update_status()
+
     def power_off_arm(self) -> bool:
         with self._power_lock:
             return self._safe_power_off_locked()
@@ -2588,6 +2834,7 @@ class ElfControlThread(threading.Thread, ControlContext):
             print("[Power] arm already off; ignoring power-off request")
             return False
         self._shutdown_in_progress = True
+        self._voice_power_off_deadline = 0.0
         self._auto_first_person_at = None
         if not self._send_safe_shutdown_pose_locked():
             print("[Power] safe shutdown pose failed; power-off frame not sent")
@@ -2600,7 +2847,7 @@ class ElfControlThread(threading.Thread, ControlContext):
             self._update_status()
         return ok
 
-    def _send_safe_shutdown_pose_locked(self) -> bool:
+    def _send_safe_shutdown_pose_locked(self, wait_before_power_off: bool = True) -> bool:
         self.flush_queues()
         self.controller.profile_idx = ARM_PROFILE_FAR_L3_55
         cmd = self.controller.set_pose_mode("face")
@@ -2614,8 +2861,11 @@ class ElfControlThread(threading.Thread, ControlContext):
         if not ok:
             return False
         self.uart_sink.block_tx = True
-        print(f"[Power] safe face pose sent; waiting {SAFE_POWER_OFF_WAIT_S:.1f}s before power-off")
-        time.sleep(SAFE_POWER_OFF_WAIT_S)
+        if wait_before_power_off:
+            print(f"[Power] safe face pose sent; waiting {SAFE_POWER_OFF_WAIT_S:.1f}s before power-off")
+            time.sleep(SAFE_POWER_OFF_WAIT_S)
+        else:
+            print("[Power] safe face pose sent; waiting for gesture confirmation")
         return True
 
     def _reset_control_after_power_on(self) -> None:
@@ -2635,7 +2885,8 @@ class ElfControlThread(threading.Thread, ControlContext):
             time.sleep(self.uart_sink.HOMING_BLOCK_S)
         self._capture_a_init(timeout=10.0)
         self.uart_sink.block_tx = False
-        self._schedule_auto_first_person()
+        self._auto_first_person_at = None
+        self._auto_first_person_done = True
         self._update_status()
         print("[UART-Handshake] power-on TX unblocked")
 
@@ -2652,21 +2903,11 @@ class ElfControlThread(threading.Thread, ControlContext):
         return False
 
     def _schedule_auto_first_person(self) -> None:
-        if self._auto_first_person_done:
-            return
-        self._auto_first_person_at = time.perf_counter() + AUTO_FIRST_PERSON_DELAY_S
-        print(f"[FirstPerson] auto switch scheduled in {AUTO_FIRST_PERSON_DELAY_S:.0f}s")
+        self._auto_first_person_at = None
+        self._auto_first_person_done = True
 
     def _check_auto_first_person(self) -> None:
-        if self._auto_first_person_done or self._auto_first_person_at is None:
-            return
-        if time.perf_counter() < self._auto_first_person_at:
-            return
-        self._auto_first_person_done = True
-        self._auto_first_person_at = None
-        if self.get_mode() == "face" and self.uart_sink.arm_powered:
-            print("[FirstPerson] auto switching from FACE")
-            self.set_mode("first_person")
+        return
 
     def send_servo_test(self, k1: float, k2: float):
         # Persist k1 (J5 yaw) to /tmp/servo_calib.txt, matching upstream /servo handler.
@@ -2691,6 +2932,12 @@ class ElfControlThread(threading.Thread, ControlContext):
                 home_cmd["servo2"], home_cmd["servo1"], home_cmd["flag"]
             )
 
+    def switch_stream_mode(self, mode: str) -> Dict[str, Any]:
+        reporter = getattr(self, "cloud_reporter", None)
+        if reporter is None:
+            return {"ok": False, "error": "streamer is not initialized"}
+        return reporter.switch_stream_mode(mode)
+
     def get_mode(self) -> str:
         return self.controller.pose_mode
 
@@ -2711,8 +2958,11 @@ class ElfControlThread(threading.Thread, ControlContext):
     def _update_status(self):
         c = self.controller
         with self._lock:
+            reporter = getattr(self, "cloud_reporter", None)
+            stream_status = reporter.get_stream_status() if reporter is not None else None
             self._status = {
                 "running": True,
+                "stream": stream_status,
                 "loop_count": self._loop_count,
                 "arm_profile": c.profile.name,
                 "arm_target_yaw": round(c.arm_target_yaw, 2),
@@ -2740,27 +2990,13 @@ class ElfControlThread(threading.Thread, ControlContext):
         self.imu2_source.start()
         self.uart_sink.start()
 
-        # Temporary fallback while voice input is unavailable: automatically
-        # send the H7 init frame after init_success, then run homing/A-init.
-        if not self.uart_sink.arm_powered and self.uart_sink.init_success:
-            if self.uart_sink.send_power_on():
-                print("[UART-Handshake] Auto power-on frame sent")
-            else:
-                print("[UART-Handshake] Auto power-on frame failed")
-        elif not self.uart_sink.init_success:
-            print("[UART-Handshake] init_success missing; TX remains blocked")
-
-        if self.uart_sink.arm_powered:
-            self.uart_sink.block_tx = True
-            if not isinstance(self.uart_sink, StubUartArmSink):
-                print(f"[UART-Handshake] Waiting {self.uart_sink.HOMING_BLOCK_S}s for homing...")
-                time.sleep(self.uart_sink.HOMING_BLOCK_S)
-            self._capture_a_init(timeout=10.0)
-            self.uart_sink.block_tx = False
-            self._schedule_auto_first_person()
-            print("[UART-Handshake] TX unblocked")
+        # Default startup leaves the arm powered off.  The FF AA verification
+        # frame is sent only after an explicit power_on command/voice trigger.
+        if self.uart_sink.init_success:
+            print("[UART-Handshake] init_success received; arm remains powered off")
         else:
-            self.uart_sink.block_tx = True
+            print("[UART-Handshake] init_success missing; arm remains powered off")
+        self.uart_sink.block_tx = True
 
         if self.ctrl_port > 0:
             self.http_server = HttpControlServer(self, self.ctrl_port)
@@ -2812,6 +3048,7 @@ class ElfControlThread(threading.Thread, ControlContext):
         print("[ElfControl] Thread stopped")
 
     def _tick(self):
+        self._check_voice_power_off_timeout()
         if self._shutdown_in_progress:
             return
         # Consume vision-generated scenario commands at the fixed control rate.

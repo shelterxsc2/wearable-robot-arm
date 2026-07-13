@@ -84,6 +84,10 @@ from lowlatency_streamer import (
 )
 
 
+# Feed rule/mode inference transitions into arm control.
+ENABLE_RULE_MODE_CONTROL = True
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -215,8 +219,27 @@ class PreprocessorThread(threading.Thread):
             self.body_in_q.put(BodyJob(frame_idx, frame, body_inp, scale, x_off, y_off))
 
 
+class AnnotationMode:
+    """Thread-safe switch between annotated output and the untouched camera frame."""
+
+    def __init__(self):
+        self._enabled = True
+        self._lock = threading.Lock()
+
+    def set_enabled(self, enabled: bool) -> bool:
+        with self._lock:
+            changed = self._enabled != enabled
+            self._enabled = enabled
+            return changed
+
+    def is_enabled(self) -> bool:
+        with self._lock:
+            return self._enabled
+
+
 class PostprocessorThread(threading.Thread):
-    def __init__(self, pipeline, body_done_q, out_q, stop_ev, stats, img_w, img_h, elf_thread=None):
+    def __init__(self, pipeline, body_done_q, out_q, stop_ev, stats, img_w, img_h,
+                 elf_thread=None, annotation_mode=None):
         super().__init__(daemon=True)
         self.pipeline = pipeline
         self.body_done_q = body_done_q
@@ -226,6 +249,7 @@ class PostprocessorThread(threading.Thread):
         self.img_w = img_w
         self.img_h = img_h
         self.elf_thread = elf_thread
+        self.annotation_mode = annotation_mode
         self.tracker = FaceTracker()
         self.pose_est = PoseEstimator()
         self.rule_engine_state = RuleEngineState()
@@ -328,7 +352,9 @@ class PostprocessorThread(threading.Thread):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2
             )
 
-        matched_idx = self.tracker.update(body_dets, self.img_w, self.img_h)
+        matched_idx = self.tracker.update(
+            body_dets, self.img_w, self.img_h, center_large=(mode == "face")
+        )
 
         # Base runs Face/PnP only in FACE. BODY and both scenario modes use
         # body detections only; scenario commands were already computed above.
@@ -350,7 +376,12 @@ class PostprocessorThread(threading.Thread):
                 hand_ms = (time.perf_counter() - t_hand0) * 1000.0
             total_ms = (time.perf_counter() - t0) * 1000.0
             self.stats.add(total_ms, done.body_ms, face_ms, hand_ms, pnp_ms, rule_ms)
-            self.out_q.put((done.frame_idx, display))
+            output_frame = (
+                display
+                if self.annotation_mode is None or self.annotation_mode.is_enabled()
+                else done.frame
+            )
+            self.out_q.put((done.frame_idx, output_frame))
             return
 
         if 0 <= matched_idx < len(body_dets):
@@ -473,13 +504,6 @@ class PostprocessorThread(threading.Thread):
             # ---------- Hand Landmarks ----------
             t_hand0 = time.perf_counter()
             kps = best_det["kps"]
-            current_state = int(rule_state[0]) if rule_state is not None else 0
-            skip_hand = set()
-            if current_state == 1:
-                skip_hand.add(1)  # right
-            elif current_state == 2:
-                skip_hand.add(0)  # left
-
             hand_rois = [
                 estimate_hand_roi(kps[9], kps[7], self.img_w, self.img_h),
                 estimate_hand_roi(kps[10], kps[8], self.img_w, self.img_h),
@@ -488,7 +512,7 @@ class PostprocessorThread(threading.Thread):
             hand_labels = ["Left", "Right"]
             hand_info_lines = []
             for idx, roi in enumerate(hand_rois):
-                if idx in skip_hand:
+                if not self._is_hand_above_shoulder(kps, idx):
                     continue
                 if roi is None:
                     continue
@@ -534,7 +558,12 @@ class PostprocessorThread(threading.Thread):
 
         total_ms = (time.perf_counter() - t0) * 1000.0
         self.stats.add(total_ms, done.body_ms, face_ms, hand_ms, pnp_ms, rule_ms)
-        self.out_q.put((done.frame_idx, display))
+        output_frame = (
+            display
+            if self.annotation_mode is None or self.annotation_mode.is_enabled()
+            else done.frame
+        )
+        self.out_q.put((done.frame_idx, output_frame))
 
     def _infer_rule_for_body_only(self, body_dets):
         if not body_dets:
@@ -550,7 +579,7 @@ class PostprocessorThread(threading.Thread):
     def _handle_rule_mode_transition(self, curr_mode: int) -> None:
         prev_mode = self._prev_rule_mode
         self._prev_rule_mode = curr_mode
-        if prev_mode is None or self.elf_thread is None:
+        if not ENABLE_RULE_MODE_CONTROL or prev_mode is None or self.elf_thread is None:
             return
 
         try:
@@ -560,9 +589,7 @@ class PostprocessorThread(threading.Thread):
             elif prev_mode == 0 and curr_mode == 2:
                 self.elf_thread.set_mode("interview")
                 print("[RuleCmd] mode0 -> mode2: interview")
-            elif prev_mode == 2 and curr_mode == 0:
-                self.elf_thread.set_mode("face")
-                print("[RuleCmd] mode2 -> mode0: face")
+            # mode2 -> mode0 does not automatically return to face mode.
         except Exception as e:
             print(f"[RuleCmd] transition {prev_mode}->{curr_mode} failed: {e}")
 
@@ -577,6 +604,8 @@ class PostprocessorThread(threading.Thread):
         ]
         hand_colors = [(255, 0, 0), (0, 255, 255)]
         for idx, roi in enumerate(hand_rois):
+            if not self._is_hand_above_shoulder(kps, idx):
+                continue
             if roi is None:
                 continue
             hand_result = detect_hand_landmarks(self.pipeline, frame, roi)
@@ -595,6 +624,16 @@ class PostprocessorThread(threading.Thread):
             else:
                 # Scenario modes only accept OK as an escape-to-face command.
                 continue
+
+    @staticmethod
+    def _is_hand_above_shoulder(kps, hand_idx: int) -> bool:
+        wrist_idx, shoulder_idx = ((9, 5) if hand_idx == 0 else (10, 6))
+        wrist = kps[wrist_idx]
+        shoulder = kps[shoulder_idx]
+        if (wrist.get("visibility", 0.0) <= KPT_CONF_THRESHOLD or
+                shoulder.get("visibility", 0.0) <= KPT_CONF_THRESHOLD):
+            return False
+        return float(wrist["y"]) < float(shoulder["y"])
 
     def _handle_gesture_control(self, hand_idx: int, hand_result: dict, ok_only: bool = False) -> None:
         if self.elf_thread is None:
@@ -637,10 +676,19 @@ class PostprocessorThread(threading.Thread):
 
         kind, value, desc = action
         try:
+            if label == "OK" and self.elf_thread.confirm_voice_power_off():
+                self._last_gesture_trigger_s = now_s
+                self._gesture_count = 0
+                print("[GestureCmd] OK -> power-off confirmed")
+                return
             if kind == "profile":
                 self.elf_thread.set_arm_profile(value)
+                reporter = getattr(self.elf_thread, "cloud_reporter", None)
+                if reporter is not None:
+                    reporter.report_zoom(_profile_to_zoom(value))
             elif kind == "mode":
-                self.elf_thread.set_mode(value)
+                reporter = getattr(self.elf_thread, "cloud_reporter", None)
+                _set_mode_and_report_view(self.elf_thread, reporter, value, _mode_to_view_mode(value))
             self._last_gesture_trigger_s = now_s
             self._gesture_count = 0
             print(f"[GestureCmd] {desc}")
@@ -672,7 +720,8 @@ class PostprocessorThread(threading.Thread):
 
 
 def output_loop(out_q, stop_ev, stats, headless, frames_limit, output_dir,
-                run_result=None, display_q=None, ll_streamer=None, save_frames=False):
+                run_result=None, display_q=None, ll_streamer=None, save_frames=False,
+                annotation_mode=None):
     expected_idx = 0
     buffer = {}
     processed = 0
@@ -688,13 +737,15 @@ def output_loop(out_q, stop_ev, stats, headless, frames_limit, output_dir,
         if frame_idx == expected_idx:
             prev_show_time, processed, expected_idx = _emit_frame(
                 display, frame_idx, prev_show_time, processed, expected_idx,
-                headless, output_dir, display_q, ll_streamer, save_frames
+                headless, output_dir, display_q, ll_streamer, save_frames,
+                annotation_mode
             )
             while expected_idx in buffer:
                 display = buffer.pop(expected_idx)
                 prev_show_time, processed, expected_idx = _emit_frame(
                     display, expected_idx, prev_show_time, processed, expected_idx,
-                    headless, output_dir, display_q, ll_streamer, save_frames
+                    headless, output_dir, display_q, ll_streamer, save_frames,
+                    annotation_mode
                 )
         else:
             buffer[frame_idx] = display
@@ -709,8 +760,12 @@ def output_loop(out_q, stop_ev, stats, headless, frames_limit, output_dir,
 
 
 def _emit_frame(display, frame_idx, prev_show_time, processed, expected_idx,
-                headless, output_dir, display_q, ll_streamer, save_frames):
-    prev_show_time = _overlay_fps(display, prev_show_time)
+                headless, output_dir, display_q, ll_streamer, save_frames,
+                annotation_mode):
+    if annotation_mode is None or annotation_mode.is_enabled():
+        prev_show_time = _overlay_fps(display, prev_show_time)
+    else:
+        prev_show_time = time.perf_counter()
     if ll_streamer is not None:
         ll_streamer.write_frame(display)
     if headless and save_frames:
@@ -750,8 +805,102 @@ def _normalize_voice_keyword(keyword: str) -> str:
     return keyword
 
 
-def _handle_voice_command(voice_thread, elf_thread) -> None:
-    if voice_thread is None or elf_thread is None:
+
+
+def _mode_to_view_mode(mode: str) -> int:
+    mode = (mode or "").lower()
+    if mode == "interview":
+        return 0
+    if mode == "intro":
+        return 2
+    return 1
+
+
+def _view_mode_to_mode(view_mode: int) -> str:
+    return {0: "interview", 1: "face", 2: "intro"}.get(int(view_mode), "face")
+
+
+def _report_third_person_before_view_mode(elf_thread, ll_streamer) -> None:
+    if elf_thread is None or ll_streamer is None:
+        return
+    if elf_thread.get_mode() == "first_person":
+        ll_streamer.report_track_obj(1)
+        print("[CloudReport] first_person -> trackObj=1 before viewMode")
+
+
+def _set_mode_and_report_view(elf_thread, ll_streamer, mode: str, view_mode: int) -> None:
+    _report_third_person_before_view_mode(elf_thread, ll_streamer)
+    elf_thread.set_mode(mode)
+    if ll_streamer is not None:
+        ll_streamer.report_view_mode(int(view_mode))
+
+
+def _profile_to_zoom(profile_idx: int) -> int:
+    return 2 if int(profile_idx) == 0 else 0
+
+
+def _zoom_to_profile(zoom: int) -> int:
+    # l3=65 is retained for later tuning but excluded from normal controls.
+    return 0 if int(zoom) == 2 else 1
+
+
+def _handle_cloud_zoom(elf_thread, ll_streamer, zoom: int, source: str = "cloud") -> None:
+    if elf_thread is None:
+        return
+    profile_idx = _zoom_to_profile(zoom)
+    elf_thread.set_arm_profile(profile_idx)
+    if ll_streamer is not None:
+        ll_streamer.report_zoom(int(zoom))
+    print(f"[CloudCmd] set_zoom={zoom} -> profile={profile_idx}")
+
+
+def _handle_cloud_view_mode(elf_thread, ll_streamer, view_mode: int, source: str = "cloud") -> None:
+    if elf_thread is None:
+        return
+    mode = _view_mode_to_mode(view_mode)
+    _set_mode_and_report_view(elf_thread, ll_streamer, mode, int(view_mode))
+    print(f"[CloudCmd] set_view_mode={view_mode} -> mode={mode}")
+
+
+def _handle_cloud_track_obj(elf_thread, ll_streamer, track_obj: int, source: str = "cloud") -> None:
+    if elf_thread is None:
+        return
+    if int(track_obj) == 0:
+        elf_thread.set_mode("first_person")
+        mode = "first_person"
+    else:
+        if elf_thread.get_mode() == "first_person":
+            elf_thread.set_mode("face")
+        mode = elf_thread.get_mode()
+    if ll_streamer is not None:
+        ll_streamer.report_track_obj(int(track_obj))
+    print(f"[CloudCmd] track_obj={track_obj} -> {mode}")
+
+
+def _handle_cloud_annotation_mode(annotation_mode, enabled: bool,
+                                  source: str = "cloud") -> None:
+    if annotation_mode is None:
+        return
+    changed = annotation_mode.set_enabled(bool(enabled))
+    label = "annotation" if enabled else "raw"
+    print(f"[CloudCmd] set_annotation_mode={bool(enabled)} -> {label}, changed={changed}")
+
+
+def _handle_cloud_target(elf_thread, ll_streamer, target: dict, source: str = "cloud") -> None:
+    if elf_thread is None:
+        return
+    x = int(target.get("x", 0))
+    y = int(target.get("y", 0))
+    z = int(target.get("z", 0))
+    if ll_streamer is not None:
+        ll_streamer.report_target_pose(x, y, z)
+    ok = elf_thread.set_first_person_discrete_target(x, y, z)
+    state = "sent" if ok else "stored"
+    print(f"[CloudCmd] set_target first_person x={x} y={y} z={z} {state}={ok}")
+
+def _handle_voice_command(voice_thread, elf_thread, ll_streamer=None,
+                          annotation_mode=None) -> None:
+    if voice_thread is None:
         return
     latest = voice_thread.get_latest(consume=True)
     if latest is None:
@@ -759,27 +908,58 @@ def _handle_voice_command(voice_thread, elf_thread) -> None:
     keyword, _ts = latest
     keyword = _normalize_voice_keyword(keyword)
     try:
-        if keyword == "拉远":
+        if keyword == "原画":
+            changed = annotation_mode.set_enabled(False) if annotation_mode is not None else False
+            if changed and ll_streamer is not None:
+                ll_streamer.report_annotation_mode(False)
+            print(f"[VoiceCmd] 原画 -> raw mode changed={changed}")
+        elif keyword == "标注":
+            changed = annotation_mode.set_enabled(True) if annotation_mode is not None else False
+            if changed and ll_streamer is not None:
+                ll_streamer.report_annotation_mode(True)
+            print(f"[VoiceCmd] 标注 -> annotation mode changed={changed}")
+        elif keyword == "拉远":
             elf_thread.set_arm_profile(1)  # far_l3_55, l3=55
-            print("[VoiceCmd] 拉远 -> profile far_l3_55")
+            if ll_streamer is not None:
+                ll_streamer.report_zoom(0)
+            print("[VoiceCmd] 拉远 -> profile far_l3_55, zoom=0")
         elif keyword == "拉近":
             elf_thread.set_arm_profile(0)  # mid_l3_40, l3=40
-            print("[VoiceCmd] 拉近 -> profile mid_l3_40")
+            if ll_streamer is not None:
+                ll_streamer.report_zoom(2)
+            print("[VoiceCmd] 拉近 -> profile mid_l3_40, zoom=2")
         elif keyword == "介绍":
-            elf_thread.set_mode("intro")
-            print("[VoiceCmd] 介绍 -> mode intro")
+            _set_mode_and_report_view(elf_thread, ll_streamer, "intro", 2)
+            print("[VoiceCmd] 介绍 -> mode intro, viewMode=2")
         elif keyword == "采访":
-            elf_thread.set_mode("interview")
-            print("[VoiceCmd] 采访 -> mode interview")
-        elif keyword == "正面":
-            elf_thread.set_mode("face")
-            print("[VoiceCmd] 正面 -> mode face")
+            _set_mode_and_report_view(elf_thread, ll_streamer, "interview", 0)
+            print("[VoiceCmd] 采访 -> mode interview, viewMode=0")
+        elif keyword in ("正面", "正脸"):
+            _set_mode_and_report_view(elf_thread, ll_streamer, "face", 1)
+            print(f"[VoiceCmd] {keyword} -> mode face, viewMode=1")
+        elif keyword == "并肩":
+            if elf_thread.get_mode() != "first_person":
+                elf_thread.set_mode("first_person")
+                if ll_streamer is not None:
+                    ll_streamer.report_track_obj(0)
+                print("[VoiceCmd] 并肩 -> mode first_person, trackObj=0")
+            else:
+                print("[VoiceCmd] 并肩 ignored; already first_person")
         elif keyword == "开机":
             ok = elf_thread.power_on_arm()
             print(f"[VoiceCmd] 开机 -> power_on ok={ok}")
         elif keyword == "关机":
-            ok = elf_thread.power_off_arm()
-            print(f"[VoiceCmd] 关机 -> power_off ok={ok}")
+            if elf_thread.get_mode() != "face":
+                print(f"[VoiceCmd] 关机 ignored outside face: {elf_thread.get_mode()}")
+            else:
+                ok = elf_thread.request_voice_power_off(timeout_s=3.0)
+                print(f"[VoiceCmd] 关机 -> waiting for OK gesture, started={ok}")
+        elif keyword == "录制":
+            ok = ll_streamer.request_record("start", {"source": "voice", "keyword": keyword}) if ll_streamer is not None else False
+            print(f"[VoiceCmd] 录制 -> record_start ok={ok}")
+        elif keyword == "停止":
+            ok = ll_streamer.request_record("stop", {"source": "voice", "keyword": keyword}) if ll_streamer is not None else False
+            print(f"[VoiceCmd] 停止 -> record_stop ok={ok}")
         else:
             print(f"[VoiceCmd] ignored keyword: {keyword}")
     except Exception as e:
@@ -795,6 +975,8 @@ def main():
                         help="Save JPEG frames in headless mode (default: disabled)")
     parser.add_argument("--device-id", type=str, default="device-002",
                         help="Cloud device ID for WebSocket registration")
+    parser.add_argument("--device-key", type=str, default=os.environ.get("DEVICE_KEY"),
+                        help="Cloud device key for WebSocket/record-control authentication")
     parser.add_argument("--ws-url", type=str, default=None,
                         help="WebSocket URL (default: derived from stream URL)")
     parser.add_argument("--voice", action="store_true", default=True,
@@ -833,10 +1015,11 @@ def main():
     parser.add_argument("--no-stream", action="store_true",
                         help="Disable RTMP/WebSocket streaming (default: streaming enabled)")
     parser.add_argument("--rtsp", action="store_true",
-                        help="Use default RTSP URL (rtsp://127.0.0.1:8554/stream) instead of RTMP")
+                        help="Compatibility alias for --stream-mode local")
+    parser.add_argument("--stream-mode", choices=("auto", "cloud", "local"), default="auto",
+                        help="Stream state machine mode: auto tries cloud then local; cloud/local force one target")
     parser.add_argument("--stream-url", type=str, default=None,
-                        help="RTMP/RTSP URL to stream to. Defaults to the RTMP URL used by "
-                             "demos/camera_demo_lowlatency.py.")
+                        help="RTMP/RTSP URL to stream to. Defaults to cloud RTMP; failed RTMP handshake falls back to local RTSP.")
     parser.add_argument("--stream-fps", type=int, default=15,
                         help="Stream frame rate (default: 15)")
     parser.add_argument("--stream-width", type=int, default=None,
@@ -851,13 +1034,16 @@ def main():
                         help="I2C bus for IMU2 (default: /dev/i2c-4)")
     parser.add_argument("--ctrl-port", type=int, default=8080, help="HTTP control port (0 to disable)")
     args = parser.parse_args()
+    if args.no_voice:
+        args.voice = False
 
     print("\n" + "=" * 60)
     print("PingPong async body + PnP pipeline starting...")
     print("=" * 60)
 
     pipeline = SimplePipeline()
-    print("[Rule] Rule Engine model loaded by SimplePipeline")
+    control_state = "enabled" if ENABLE_RULE_MODE_CONTROL else "disabled"
+    print(f"[Rule] Rule Engine model loaded; control integration={control_state}")
     # Legacy naming compatibility: detect_hand_landmarks reads hand outputs
     # from hand_lm_input_names in this pipeline variant.
     pipeline.hand_lm_output_names = pipeline.hand_lm_input_names
@@ -891,6 +1077,8 @@ def main():
     out_q = queue.Queue()
     stop_ev = threading.Event()
     stats = FrameStats()
+    annotation_mode = AnnotationMode()
+    print("[DisplayMode] annotation (default)")
 
     voice_thread = None
     if args.voice:
@@ -922,18 +1110,20 @@ def main():
         pool_size=args.body_pool_size,
     )
     post_thread = PostprocessorThread(
-        pipeline, body_done_q, out_q, stop_ev, stats, actual_w, actual_h, elf_thread
+        pipeline, body_done_q, out_q, stop_ev, stats, actual_w, actual_h,
+        elf_thread, annotation_mode
     )
     run_result = {}
     display_q = queue.Queue()
 
     headless = not args.show_window
 
-    # Default streaming URL matches demos/camera_demo_lowlatency.py (RTMP),
-    # or RTSP when --rtsp is given.
+    # Default streaming tries cloud RTMP first. LowLatencyStreamer performs a
+    # short RTMP publish handshake and falls back to local RTSP on failure.
+    stream_mode = "local" if args.rtsp else args.stream_mode
     stream_url = args.stream_url
     if not args.no_stream and stream_url is None:
-        if args.rtsp:
+        if stream_mode == "local":
             stream_url = get_default_rtsp_url()
         else:
             stream_url = get_default_rtmp_url(args.device_id)
@@ -955,13 +1145,25 @@ def main():
             stream_url=stream_url,
             ws_url=ws_url,
             device_id=args.device_id,
+            device_key=args.device_key,
+            on_target=lambda target, source="cloud": _handle_cloud_target(elf_thread, ll_streamer, target, source),
+            on_zoom=lambda zoom, source="cloud": _handle_cloud_zoom(elf_thread, ll_streamer, zoom, source),
+            on_view_mode=lambda view_mode, source="cloud": _handle_cloud_view_mode(elf_thread, ll_streamer, view_mode, source),
+            on_track_obj=lambda track_obj, source="cloud": _handle_cloud_track_obj(elf_thread, ll_streamer, track_obj, source),
+            on_annotation_mode=lambda enabled, source="cloud": _handle_cloud_annotation_mode(annotation_mode, enabled, source),
+            stream_mode=stream_mode,
+            audio_queue=(
+                voice_thread.stream_audio_queue if voice_thread is not None else None
+            ),
         )
+        if elf_thread is not None:
+            elf_thread.cloud_reporter = ll_streamer
         ll_streamer.probe_and_start(actual_w, actual_h, args.stream_fps)
 
     out_thread = threading.Thread(
         target=output_loop,
         args=(out_q, stop_ev, stats, headless, args.frames, args.output_dir,
-              run_result, display_q, ll_streamer, args.save_frames),
+              run_result, display_q, ll_streamer, args.save_frames, annotation_mode),
         daemon=True,
     )
 
@@ -1002,13 +1204,13 @@ def main():
         if headless:
             # Keep running until Ctrl+C or the configured --frames limit is reached.
             while not stop_ev.is_set():
-                _handle_voice_command(voice_thread, elf_thread)
+                _handle_voice_command(voice_thread, elf_thread, ll_streamer, annotation_mode)
                 time.sleep(0.1)
         else:
             # Run OpenCV highgui on the main thread to avoid Qt cross-thread warnings.
             while not stop_ev.is_set() or out_thread.is_alive() or not display_q.empty():
                 if not stop_ev.is_set():
-                    _handle_voice_command(voice_thread, elf_thread)
+                    _handle_voice_command(voice_thread, elf_thread, ll_streamer, annotation_mode)
                 try:
                     _frame_idx, display = display_q.get(timeout=0.05)
                 except queue.Empty:

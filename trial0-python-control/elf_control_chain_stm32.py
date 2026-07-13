@@ -221,6 +221,8 @@ class Stm32DataHubBridge:
             "wx": 0.0, "wy": 0.0, "wz": 0.0,
             "imu_valid": False,
             "quat_valid": False,
+            "sample_seq": 0,
+            "updated_monotonic": 0.0,
         }
         self._waist_imu: Dict[str, Any] = {
             "roll": 0.0, "pitch": 0.0, "yaw": 0.0,
@@ -437,6 +439,7 @@ class Stm32DataHubBridge:
         yaw = data.get("yaw", 0.0)
         qw, qx, qy, qz = _euler_to_quat(roll, pitch, yaw)
         with self._lock:
+            sample_seq = int(self._head_imu.get("sample_seq", 0)) + 1
             self._head_imu.update(
                 roll=roll,
                 pitch=pitch,
@@ -447,6 +450,8 @@ class Stm32DataHubBridge:
                 wz=data.get("wz", 0.0),
                 imu_valid=True,
                 quat_valid=True,
+                sample_seq=sample_seq,
+                updated_monotonic=time.monotonic(),
             )
 
     def _handle_arm_frame(self, payload: bytes):
@@ -555,7 +560,12 @@ class Stm32DataHubBridge:
 
     def get_head_imu(self) -> Dict[str, Any]:
         with self._lock:
-            return dict(self._head_imu)
+            data = dict(self._head_imu)
+        age_s = time.monotonic() - float(data.get("updated_monotonic", 0.0))
+        if age_s > 0.3:
+            data["imu_valid"] = False
+        data["age_s"] = age_s
+        return data
 
     def get_waist_imu(self) -> Dict[str, Any]:
         with self._lock:
@@ -588,6 +598,7 @@ class BridgeNrf24ImuSource(Nrf24ImuSource):
     def __init__(self, bridge: Stm32DataHubBridge):
         super().__init__()
         self._bridge = bridge
+        self._last_sample_seq = -1
 
     def start(self):
         self._bridge.start()
@@ -597,8 +608,10 @@ class BridgeNrf24ImuSource(Nrf24ImuSource):
 
     def poll(self) -> Optional[Dict[str, Any]]:
         data = self._bridge.get_head_imu()
-        if data.get("imu_valid"):
+        sample_seq = int(data.get("sample_seq", 0))
+        if data.get("imu_valid") and sample_seq != self._last_sample_seq:
             self._on_valid_frame(data)
+            self._last_sample_seq = sample_seq
         return data
 
 

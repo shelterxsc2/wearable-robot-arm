@@ -33,7 +33,8 @@ ENABLE_STREAMING = os.system("which ffmpeg >/dev/null 2>&1") == 0
 if 'LIBVA_DRIVER_NAME' not in os.environ:
     os.environ['LIBVA_DRIVER_NAME'] = 'iHD'
 
-DEVICE_ID = "device-002"
+DEVICE_ID = os.environ.get("DEVICE_ID", "device-002")
+DEVICE_KEY = os.environ.get("DEVICE_KEY", "")
 
 # ================== 摄像头帧率优化配置 ==================
 # 目标摄像头帧率。该 Realtek USB 2.0 摄像头在 1080p 下实测最高约 20fps
@@ -101,7 +102,8 @@ def get_rtmp_url():
     return f"rtmp://{cloud_ip}:1935/live/{DEVICE_ID}"
 
 RTMP_URL = get_rtmp_url()
-WS_URL = f"ws://47.93.162.124/ws?deviceId={DEVICE_ID}"
+_ws_query = f"deviceId={DEVICE_ID}" + (f"&deviceKey={DEVICE_KEY}" if DEVICE_KEY else "")
+WS_URL = f"ws://47.93.162.124/ws?{_ws_query}"
 
 FACE_MODEL_PATH = os.path.join(SCRIPT_DIR, "models", "best_wflw_v8_pose20_openvino_model")
 BODY_MODEL_PATH = os.path.join(SCRIPT_DIR, "models", "yolo26n-pose (1)_openvino_model")
@@ -399,19 +401,14 @@ def _send_ws_heartbeat(ws, start_time, frame_count):
     ws.send(json.dumps(msg, default=lambda o: float(o) if isinstance(o, np.generic) else str(o)))
 
 # ================== 前端遥控目标参数 ==================
-target_pose = {
-    'cam_pos_mm': [0.0, 0.0, 500.0],   # 以人脸为原点的摄像头目标3维坐标 (mm)
-    'euler_deg': [0.0, 0.0, 0.0]       # 以正对人脸为(0,0,0)的绕随体轴目标欧拉角 (deg)
-}
+target_pose = {'x': 0, 'y': 0, 'z': 0}  # 新协议: -5..5 离散三元组
 target_lock = threading.Lock()
 
-# 控制模式：0=精细控制，1=粗略控制
-ctrl_mode = 0
-ctrl_lock = threading.Lock()
-
-# 跟踪对象：0=面部，1=手部
-track_obj = 0
+# 跟踪对象：0=第一人称，1=第三人称
+track_obj = 1
 track_lock = threading.Lock()
+zoom = 1
+view_mode = 1
 
 def ws_worker():
     """WebSocket 客户端线程：Base-compatible registration + 100ms heartbeat."""
@@ -456,22 +453,28 @@ def ws_worker():
                 if ptype in ('set_target', 'target_pose'):
                     t = packet.get('target', {})
                     with target_lock:
-                        target_pose['cam_pos_mm'] = [float(v) for v in t.get('cam_pos_mm', [0.0, 0.0, 500.0])]
-                        target_pose['euler_deg'] = [float(v) for v in t.get('euler_deg', [0.0, 0.0, 0.0])]
-                    print(f"[Target] Received from cloud: pos={target_pose['cam_pos_mm']} mm, euler={target_pose['euler_deg']} deg")
-                elif ptype == 'ctrl_mode':
-                    mode = packet.get('ctrlMode', 0)
-                    with ctrl_lock:
-                        global ctrl_mode
-                        ctrl_mode = int(mode)
-                    mode_str = '精细控制' if ctrl_mode == 0 else '粗略控制'
-                    print(f"[CtrlMode] Received from cloud: {ctrl_mode} ({mode_str})")
+                        target_pose['x'] = max(-5, min(5, int(t.get('x', 0))))
+                        target_pose['y'] = max(-5, min(5, int(t.get('y', 0))))
+                        target_pose['z'] = max(-5, min(5, int(t.get('z', 0))))
+                    print(f"[Target] Received from cloud: {target_pose}")
+                elif ptype == 'set_zoom':
+                    global zoom
+                    zoom = max(0, min(2, int(packet.get('zoom', 1))))
+                    print(f"[Zoom] Received from cloud: {zoom}")
+                elif ptype == 'set_view_mode':
+                    global view_mode
+                    view_mode = max(0, min(2, int(packet.get('viewMode', 1))))
+                    print(f"[ViewMode] Received from cloud: {view_mode}")
+                elif ptype == 'record_control_ack':
+                    print(f"[Record] ack: {packet}")
+                elif ptype == 'record_state':
+                    print(f"[Record] state: {packet.get('data', {})}")
                 elif ptype == 'track_obj':
-                    obj = packet.get('trackObj', 0)
+                    obj = packet.get('trackObj', 1)
                     with track_lock:
                         global track_obj
-                        track_obj = int(obj)
-                    obj_str = '面部' if track_obj == 0 else '手部'
+                        track_obj = max(0, min(1, int(obj)))
+                    obj_str = '第一人称' if track_obj == 0 else '第三人称'
                     print(f"[TrackObj] Received from cloud: {track_obj} ({obj_str})")
             except websocket.WebSocketTimeoutException:
                 pass
@@ -745,18 +748,8 @@ try:
                 # 目标差值（目标 - 当前）
                 cam = pose['cam_in_face']
                 with target_lock:
-                    tgt_pos = list(target_pose['cam_pos_mm'])
-                    tgt_eul = list(target_pose['euler_deg'])
-                with ctrl_lock:
-                    current_mode = ctrl_mode
-                d_pos = [tgt_pos[i] - cam['pos_mm'][i] for i in range(3)]
-                d_pitch = tgt_eul[2] - cam['pitch']
-                d_yaw   = tgt_eul[1] - cam['yaw']
-                d_roll  = tgt_eul[0] - cam['roll']
-                d_dist  = np.linalg.norm(d_pos) / 10.0  # mm -> cm
-                mode_label = 'Fine' if current_mode == 0 else 'Coarse'
-                print(f"  TargetDiff [{mode_label}] P:{d_pitch:.1f} Y:{d_yaw:.1f} R:{d_roll:.1f} "
-                      f"D:{d_dist:.1f}cm Pos:({d_pos[0]:.1f},{d_pos[1]:.1f},{d_pos[2]:.1f})mm")
+                    tgt = dict(target_pose)
+                print(f"  TargetState x={tgt['x']} y={tgt['y']} z={tgt['z']} zoom={zoom} viewMode={view_mode}")
             else:
                 print(f"[Info] FPS:{fps_30:.1f} Frames:{frame_count} (no face)")
             last_fps_time = now

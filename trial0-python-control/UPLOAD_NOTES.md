@@ -1,6 +1,6 @@
 # trial0 Python Control Package
 
-This folder contains the organized Python runtime from /home/time/work/trial0 as of 2026-07-10.
+This folder contains the organized Python runtime from /home/time/work/trial0 as of 2026-07-13.
 
 ## Included
 
@@ -35,9 +35,11 @@ Those assets must be present on the target device or the paths must be adjusted 
 
 ## Current Control Behavior
 
-- Auto power-on is enabled after init success while the microphone is unavailable.
-- After power-on and A-init, the system stays in face mode for 10 seconds, then switches to first_person.
+- Arm power is disabled by default; startup does not send the power-on frame.
+- Startup no longer switches to first_person after a fixed delay.
 - First-person initial pose is x=-20, y=30, z=20, J4=10, J5=180.
 - First-person mode uses head IMU only: yaw controls J5 and pitch controls J4.
-- BLE remote continues to work in first-person mode via the local HTTP control server.
-- Power-off and Ctrl+C first send the far_l3_55 face-home pose, wait 3 seconds, then send the retract frame.
+- Streaming supports cloud/local/auto selection and runtime HTTP switching.
+- Rule-engine mode inference is connected to intro/interview control.
+- Voice power-off is accepted only in face mode and requires an OK gesture during confirmation.
+- Visual correction uses per-frame limits and per-axis reversal locking.

@@ -103,6 +103,7 @@ class MicAudioThread(threading.Thread):
         auto_gain_target_db: float | None = None,
         auto_gain_max_db: float | None = None,
         auto_gain_min_db: float | None = None,
+        stream_queue: queue.Queue | None = None,
     ) -> None:
         super().__init__(daemon=True)
         self.out_queue = out_queue
@@ -115,6 +116,7 @@ class MicAudioThread(threading.Thread):
         self.auto_gain_target_db = auto_gain_target_db if auto_gain_target_db is not None else config.VOICE_AUTO_GAIN_TARGET_DB
         self.auto_gain_max_db = auto_gain_max_db if auto_gain_max_db is not None else config.VOICE_AUTO_GAIN_MAX_DB
         self.auto_gain_min_db = auto_gain_min_db if auto_gain_min_db is not None else config.VOICE_AUTO_GAIN_MIN_DB
+        self.stream_queue = stream_queue
         self.ratio = config.VOICE_SAMPLE_RATE / self.capture_rate
         self._stop_event = threading.Event()
 
@@ -172,6 +174,18 @@ class MicAudioThread(threading.Thread):
                         x_old = np.linspace(0.0, 1.0, len(block))
                         x_new = np.linspace(0.0, 1.0, int(len(block) * ratio))
                         resampled = np.interp(x_new, x_old, block)
+                    if self.stream_queue is not None:
+                        stream_block = np.clip(
+                            resampled * self.gain, -1.0, 1.0
+                        ).astype(np.float32)
+                        try:
+                            self.stream_queue.put_nowait(stream_block)
+                        except queue.Full:
+                            try:
+                                self.stream_queue.get_nowait()
+                                self.stream_queue.put_nowait(stream_block)
+                            except (queue.Empty, queue.Full):
+                                pass
                     resampled = _apply_gain(
                         resampled,
                         fixed_gain=self.gain,

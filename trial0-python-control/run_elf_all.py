@@ -140,21 +140,16 @@ def _cleanup(main_proc: subprocess.Popen | None, rtsp_proc: subprocess.Popen | N
 def main() -> None:
     extra_args = list(sys.argv[1:])
 
-    has_stream_override = (
-        "--rtsp" in extra_args
-        or "--no-stream" in extra_args
-        or any(a == "--stream-url" or a.startswith("--stream-url=") for a in extra_args)
-    )
+    has_stream_url = any(a == "--stream-url" or a.startswith("--stream-url=") for a in extra_args)
 
-    # This launcher owns a local MediaMTX server, so default to local RTSP
-    # instead of the cloud RTMP URL used by run_elf_main.sh directly.
-    if not has_stream_override:
-        extra_args.append("--rtsp")
+    # This launcher still owns a local MediaMTX server, but the demo now defaults
+    # to cloud RTMP handshake and falls back to local RTSP if RTMP publish fails.
+    # Passing --rtsp explicitly keeps the old force-local behavior.
 
-    # Allow pushing to a LAN-visible address via RTSP_HOST.
+    # Allow pushing forced RTSP to a LAN-visible address via RTSP_HOST.
     # If the user already passed --stream-url, do not override.
     rtsp_host = os.environ.get("RTSP_HOST")
-    if rtsp_host and not any(a == "--stream-url" or a.startswith("--stream-url=") for a in extra_args):
+    if rtsp_host and "--rtsp" in extra_args and not has_stream_url:
         extra_args.extend(["--stream-url", f"rtsp://{rtsp_host}:8554/stream"])
 
     rtsp_proc = _start_rtsp_server()

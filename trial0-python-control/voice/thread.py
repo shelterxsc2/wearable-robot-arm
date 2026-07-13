@@ -44,9 +44,13 @@ class VoiceKwsThread(threading.Thread):
         keywords_threshold: float | None = None,
         num_trailing_blanks: int | None = None,
         num_threads: int | None = None,
+        enable_stream_audio: bool = True,
     ) -> None:
         super().__init__(daemon=True)
         self.audio_queue: queue.Queue = queue.Queue()
+        self.stream_audio_queue: queue.Queue | None = (
+            queue.Queue(maxsize=64) if enable_stream_audio else None
+        )
         self.audio_thread = MicAudioThread(
             self.audio_queue,
             device_id=device_id,
@@ -58,6 +62,7 @@ class VoiceKwsThread(threading.Thread):
             auto_gain_target_db=auto_gain_target_db,
             auto_gain_max_db=auto_gain_max_db,
             auto_gain_min_db=auto_gain_min_db,
+            stream_queue=self.stream_audio_queue,
         )
         self.kws = SherpaKwsSpotter(
             model_dir=model_dir,

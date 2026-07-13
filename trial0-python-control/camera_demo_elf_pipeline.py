@@ -269,7 +269,7 @@ class FaceTracker:
         self.face_size_life = 0
         self.prev_roi_size = 0.0
 
-    def update(self, dets, img_w, img_h):
+    def update(self, dets, img_w, img_h, center_large=False):
         """返回最佳 detection 的下标，未锁定返回 -1
         优先选择有有效人脸关键点（鼻子+眼）的检测框，避免选中背景/天花板。
         """
@@ -302,7 +302,15 @@ class FaceTracker:
             cy = (det['y1'] + det['y2']) * 0.5
 
             face_ok = has_face(det)
-            if SELFIE_MODE:
+            if center_large:
+                if not face_ok:
+                    continue
+                center_dist = math.hypot(cx - img_w * 0.5, cy - img_h * 0.5)
+                half_diagonal = max(1.0, math.hypot(img_w, img_h) * 0.5)
+                center_norm = center_dist / half_diagonal
+                area_norm = math.sqrt(det_area(det) / max(1.0, img_w * img_h))
+                score = 0.60 * center_norm - 0.40 * area_norm
+            elif SELFIE_MODE:
                 # 自拍/操作者模式：选面积最大且带人脸关键点的框
                 face_bonus = 0.0 if face_ok else short_edge * 0.5
                 score = -math.sqrt(det_area(det)) * 2.0 + face_bonus
