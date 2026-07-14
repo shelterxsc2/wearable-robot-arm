@@ -1,6 +1,6 @@
 # J4 舵机标定操作手册（方案 A）
 
-> 文档状态：历史标定操作参考。开始实机前先阅读 `HANDOFF.md` 与 `CONTROL.md`，确认当前 profile、模式、机械限位和急停；本文记录的 baseline/K 值不自动代表当前 `fourth` 源码。
+> 文档状态：历史标定操作参考，不属于 `no-arm-test` 已验收内容。开始实机前先阅读 `HANDOFF.md` 与 `CONTROL.md`，确认 profile、限位和急停；本文记录的 baseline/K 值不自动代表当前源码。
 
 > **目标**: 确定 `baseline_roll`、`baseline_servo1`、`K_SERVO` 三个参数
 > **工具**: 运行中的机械臂 + 上位机程序 + NRF24 IMU

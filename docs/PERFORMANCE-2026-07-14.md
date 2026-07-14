@@ -2,7 +2,7 @@
 
 ## 测试边界
 
-- 分支：`migration/trial0-rk3588`，工作树版本；`build/cc` 重新编译。
+- 测试发生于迁移工作树，结果与代码随后提交到 `no-arm-test`；`build/cc` 为当日重新编译版本。
 - 完整 RTSP 管线：1920×1080@30 输入、Body、Face/PnP、双手异步旁路、OSD、H264/RTSP。
 - `VOICE_KWS_DISABLE=1`，本轮只完成无 KWS 基线；用户要求停止后未运行 KWS A/B 组。
 - 机械臂保持默认收起，NRF/UART 目标发送被门控。
@@ -37,7 +37,7 @@
 - RSS 在本轮无持续增长，温度升至约 70°C，需更长时间测试确认热稳态及降频行为。
 - 因未运行 KWS 组，不能给出语音开启后的 FPS 降幅、Body P95 增幅或整机 KWS CPU/RSS 墳量。
 
-原始数据：`/tmp/fourth_perf_baseline.log`、`/tmp/fourth_perf_baseline_metrics.csv`。
+设备上的原始数据位于 `/tmp/fourth_perf_baseline.log`、`/tmp/fourth_perf_baseline_metrics.csv`，不随 Git 提交。
 
 ## Hand interval=3 + KWS（5 分钟追加测试）
 
@@ -60,4 +60,4 @@
 
 严重安全发现：现场音频在 5 分钟内产生 32 次 KWS 事件，包含 `开机` 和 `关机`。本轮 `开机` 因 H7 未报告 `init success` 被安全状态机拒绝，机械臂没有展开，但当前阈值 0.25 不适合直接开放机械控制。完成真实语料/噪声标定、提高阈值并为开关机增加独立确认前，应禁用语音开关机动作。
 
-原始数据：`/tmp/fourth_perf_hand3_kws.log`、`/tmp/fourth_perf_hand3_kws_metrics.csv`。
+设备上的原始数据位于 `/tmp/fourth_perf_hand3_kws.log`、`/tmp/fourth_perf_hand3_kws_metrics.csv`，不随 Git 提交。

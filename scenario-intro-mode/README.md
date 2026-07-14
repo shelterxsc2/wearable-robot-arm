@@ -1,6 +1,6 @@
 # scenario-intro-mode 历史快照
 
-> 归档说明：本目录是 INTRO 模式早期独立快照，不是当前构建入口，也不代表根 `src/` 的现状。
+> 归档说明：本目录是 INTRO 模式早期独立快照，不是当前 `no-arm-test` 构建入口，也不代表根 `src/` 的现状。
 
 INTRO 与 INTERVIEW 后来已经合入根 `src/rga_npu.cpp`，并在 `fourth` 迁移分支上继续加入 FIRST_PERSON、统一控制路由和手势 OSD。因此：
 

@@ -1,10 +1,10 @@
 # fourth 开发交接说明
 
-> 状态日期：2026-07-13。本文是下一位开发者的首要入口；所有结论均可在 `fourth` 目录内验证。
+> 状态日期：2026-07-14。本文是下一位开发者的首要入口；所有结论均可在 `fourth` 目录内验证。
 
 ## 1. 当前结论
 
-`fourth` 已从原 RK3588 主控工程上建立迁移分支，并完成统一控制入口、第一人称模式、云端下行适配、异步手部识别、手势情景控制、CPU 语音 KWS 和基础无硬件回放。当前二进制可编译，但整个迁移工作树尚未形成正式 Git 提交，语音、手势控制和整机综合验收也未完成。
+`fourth` 已完成统一控制入口、FIRST_PERSON、云端下行、异步手部识别、手势情景控制、CPU 语音 KWS 和基础回放，并以 `no-arm-test` 分支推送 GitHub。当前二进制可编译，视觉+Hand+KWS 已做阶段性能测试；机械臂动作、KWS 安全和整机综合验收仍未完成。
 
 继续开发时不要重新从相邻项目复制整个目录。应以 `fourth` 为唯一工作树，仅在需要追溯算法来源时阅读本文件的来源说明。
 
@@ -20,11 +20,10 @@
 
 ## 3. 当前工作树与构建状态
 
-- 分支：`migration/trial0-rk3588`。
-- HEAD：`025f3b3`，与原 `imu-victor-hat` 基线相同。
-- 迁移代码、模型、测试和文档目前位于未提交修改/未跟踪文件中。
-- `build/cc` 已在 2026-07-13 重编译成功；编译有旧代码的 ignored-return/narrowing 警告，没有新增编译错误。
-- sidecar 已改为并行启动并等待 socket 就绪；Ctrl+C/初始化失败/推流失败统一逆序清理，实测不残留主进程、sidecar、8080/8554 或 socket。
+- 分支：`no-arm-test`，GitHub `origin/no-arm-test`。
+- 已推送提交：`e995dc8`；原历史基线仍为 `025f3b3`。
+- `build/cc` 已在 2026-07-14 重编译成功；只有旧代码的 ignored-return/narrowing 警告。
+- RuleEngine 与 HandPipeline 是必需 sidecar；VoiceKWS 可降级。性能测试退出时曾只完成部分清理并遗留 root-owned socket，需修复并重新验证正常 SIGINT、timeout 和初始化失败三条路径。
 - Python sidecar 通过 `py_compile`；FIRST_PERSON C++ 纯逻辑和 Python 回放有测试，但实机综合测试不能由这些测试替代。
 
 提交前必须执行 `git status --short`，逐项确认模型、大文件、备份和用户原有修改，禁止盲目 `git add -A`。
@@ -79,23 +78,24 @@
 |---|---|---|
 | FIRST_PERSON 实机验收 | 代码和纯逻辑测试完成 | 低速确认 J4/J5 极性、机械限位、退出 FACE 回中、连续运行稳定。|
 | 手势接情景 | 代码已接、纯决策测试完成 | 实测准确率/误触发，验收举手门槛、连续确认、冷却、退出回中和急停。|
-| 手势性能 | 单手推理曾约 8 ms | 测人体+人脸+双手+推流长时间 FPS、P95/P99、温度和内存。|
-| 视觉 15 FPS 控制输入 | 架构上每处理帧更新 | 实机证明稳定 13～15 FPS；区分视觉更新率和 UART 发令率。|
+| 手势性能 | interval=3+KWS：平均 13.31 ms、P95 28.60 ms | 补双手比例、队列覆盖计数和 20～30 分钟热稳态。|
+| 视觉性能 | 平均约 16.25 FPS，5 秒窗口最低 12 FPS | 尚不满足任意连续窗口都 >13 FPS；继续定位尾延迟。|
 | 云端协议 | 兼容解析已写 | 用真实下行抓包覆盖所有类型、范围、错误包和重连。|
-| annotation | 状态已统一 | 让开关贯穿全部 OSD 分支并补测试。|
-| 语音 KWS | trial0 12 词语义、云端上报和开关机已接入 | 验收麦克风、误触发、录像服务响应、事件延迟和视觉 A/B FPS。|
+| annotation | 状态已统一且原画模式恢复未绘制帧 | 补各模式自动测试和云端一致性验证。|
+| 语音 KWS | 12 词与控制已接；5 分钟出现 32 次事件 | 当前禁止实机开关机；提高阈值、加入唤醒/二次确认并建立噪声语料。|
+| 生命周期 | 进程和端口可退出 | 修复部分清理后遗留 socket，证明日志到 `Shutdown complete`。|
 | 情景模式扩展 | INTRO/INTERVIEW 基线 | 逐模式状态机迁移、回放、实机验收；禁止一次性大合并。|
 | 控制闭环 | 视觉修正为实验态 | 优化 PnP 多帧门槛/积分策略；若需要完整闭环，增加下位机反馈。|
 | 仿真 | 语义和 S-curve 部分覆盖 | 增加真实云包、传感器噪声、串口时序；动力学/碰撞需独立方案。|
 
 ## 6. 推荐下一步顺序
 
-1. 保存一份干净的当前迁移提交：先审查 diff，再分“控制迁移、手势旁路、文档”提交。
-2. 做 10～30 分钟实机视觉压力测试：单人单手、双手、手到四边、无人、sidecar 重启、RTMP/RTSP 两种路径。
+1. 禁用或隔离语音开关机动作，完成 KWS 阈值、唤醒/二次确认和噪声误触发测试。
+2. 修复 SIGINT/timeout 的 sidecar socket 残留，再做 10～30 分钟视觉压力测试。
 3. 记录每秒视觉 FPS、Body/Face/Hand 时延、队列覆盖次数、RGA 错误、CPU/NPU 温度；不能只看平均 8 ms。
 4. 低速验收 FIRST_PERSON 和退出 FACE 的回中动作。
 5. 抓取真实云端下行包，固定协议样例并增加回放测试。
-6. 完成 annotation 绘制开关和 REST/云端状态一致性。
+6. 验证 annotation 在全部模式的 REST/云端状态一致性。
 7. 验收手势情景映射并补来源租约/急停仲裁；语音和更多情景模式使用同一控制路由。
 
 ## 7. 开发不变量
@@ -126,7 +126,8 @@ g++ -std=c++17 -Isrc tests/gesture_control_test.cpp \
 g++ -std=c++17 -Isrc tests/rule_mode_control_test.cpp \
   src/rule_mode_control.cpp -o /tmp/rule_mode_control_test
 /tmp/rule_mode_control_test
-python3 -m py_compile scripts/rule_engine_server.py scripts/hand_pipeline_server.py
+python3 -m py_compile scripts/rule_engine_server.py scripts/hand_pipeline_server.py \
+  scripts/voice_kws_server.py
 git diff --check
 ```
 
@@ -150,6 +151,9 @@ git diff --check
 | `scripts/hand_pipeline_server.py` | Hand landmark/embedder/classifier socket 服务。|
 | `src/control_router.cpp/h` | 多来源统一控制入口。|
 | `src/cloud_command.cpp/h` | trial0 风格云端 JSON 适配。|
+| `src/cloud_report.cpp/h` | zoom/view/track/annotation/record 云端上行队列。|
+| `src/arm_power_control.cpp/h` | 默认收起、展开归位/A-init、收起确认窗口。|
+| `src/voice_control.cpp/h` | 12 个 KWS 关键词的语义派发；当前危险词未开放验收。|
 | `src/first_person_control.cpp/h` | FIRST_PERSON J4/J5 纯映射。|
 | `src/ctrl_server.cpp` | REST API。|
 | `src/uart_comm.cpp` | 唯一机械臂串口发送层。|

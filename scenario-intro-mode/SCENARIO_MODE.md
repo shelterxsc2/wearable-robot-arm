@@ -1,6 +1,6 @@
 # INTRO 模式快照说明
 
-此文件夹保存 INTRO 模式合入根工程前的历史源码。根目录当前已经包含 INTRO、INTERVIEW 和 FIRST_PERSON；本快照不再维护。
+此文件夹保存 INTRO 模式合入根工程前的历史源码。根目录 `no-arm-test` 已包含 INTRO、INTERVIEW、FIRST_PERSON、Hand 和 VoiceKWS；本快照不再维护。
 
 历史入口曾为：
 

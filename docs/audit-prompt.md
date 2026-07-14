@@ -23,7 +23,9 @@
 - 视觉/控制核心：`src/rga_npu.cpp`, `src/rga_npu.h`
 - 手部链路：`src/gesture_overlay.cpp/h`, `src/gesture_control.cpp/h`, `scripts/hand_pipeline_server.py`
 - RuleEngine：`scripts/rule_engine_server.py`
-- 控制路由：`src/control_router.cpp/h`, `src/cloud_command.cpp/h`
+- 语音：`scripts/voice_kws_server.py`, `src/voice_control.cpp/h`, `config/voice_kws.json`
+- 控制路由：`src/control_router.cpp/h`, `src/cloud_command.cpp/h`, `src/cloud_report.cpp/h`
+- 展开/收起：`src/arm_power_control.cpp/h`
 - FIRST_PERSON：`src/first_person_control.cpp/h`
 - 外部入口：`src/ctrl_server.cpp`, `src/ws_client.cpp`, `src/bluetooth_spp.c`
 - 设备出口：`src/uart_comm.cpp/h`
@@ -42,7 +44,7 @@
 ### 视觉与手势
 
 - `process_frame()` 热路径是否等待 Python 推理？
-- 每 2 帧提交、双手两个槽位和“最新帧覆盖”是否存在线程竞态？
+- 每 3 帧提交、双手两个槽位和“最新帧覆盖”是否存在线程竞态？
 - pending/work buffer 生命周期是否安全？
 - 左右手结果是否会串侧、陈旧或误绘？
 - NV12 ROI 是否始终偶数、方形、16 对齐、完整在帧内？
@@ -58,6 +60,7 @@
 - 视觉 15 FPS 是否被错误等同为 UART 15 Hz？
 - 手势举手门槛、连续 3 次确认、1.5 秒冷却、模式白名单和 generation 防陈旧结果是否正确？
 - 手势是否始终经过 `control_router`，且没有直接写 UART？
+- `no-arm-test` 是否被误解为编译期硬件锁？语音误识别能否到达开机状态机？
 
 ### 可靠性
 
@@ -65,6 +68,7 @@
 - 部分初始化失败后的 free/close/join 是否完整？
 - 网络、摄像头、NPU、RGA、NRF24、IMU2、蓝牙任一失效时是否安全降级？
 - `/tmp` socket/状态文件是否可能残留并影响重启？
+- SIGINT、timeout 和初始化失败是否都能走到 `Shutdown complete`？
 
 ## 验证命令
 
@@ -75,7 +79,8 @@ git status --short
 git diff --check
 python3 -m unittest tests.test_control_replay
 python3 simulation/control_replay.py simulation/example_first_person.jsonl
-python3 -m py_compile scripts/rule_engine_server.py scripts/hand_pipeline_server.py
+python3 -m py_compile scripts/rule_engine_server.py scripts/hand_pipeline_server.py \
+  scripts/voice_kws_server.py
 ```
 
 完整构建使用根 `README.md` 的命令。不要为了审计自动启动 `build/cc`，因为它会初始化硬件并可能发送机械臂指令。

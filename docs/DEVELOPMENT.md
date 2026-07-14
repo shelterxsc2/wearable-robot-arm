@@ -8,7 +8,7 @@ git status --short
 git diff --check
 ```
 
-当前迁移工作树包含未提交和未跟踪文件。不要 reset、restore 或批量覆盖；先区分迁移改动、模型、构建产物和用户原有文件。
+当前主快照已提交到 `no-arm-test`。开始工作前仍应检查工作树，禁止覆盖用户后续修改。
 
 ## 2. 构建与纯逻辑测试
 
@@ -17,7 +17,8 @@ git diff --check
 ```bash
 python3 -m unittest tests.test_control_replay
 python3 simulation/control_replay.py simulation/example_first_person.jsonl
-python3 -m py_compile scripts/rule_engine_server.py scripts/hand_pipeline_server.py
+python3 -m py_compile scripts/rule_engine_server.py scripts/hand_pipeline_server.py \
+  scripts/voice_kws_server.py
 git diff --check
 ```
 
@@ -33,19 +34,19 @@ git diff --check
 
 ## 4. 常见日志
 
-- `wrist-ROI async OSD ready ... fixed interval=2`：手势 worker 初始化。
+- `wrist-ROI async control ready ... fixed interval=3`：手势 worker 初始化。
 - `side=Left/Right ... infer=...ms`：某侧手部结果。
 - `waiting for sidecar` / `connected to sidecar`：Python 服务连接状态。
 - `reject invalid ROI`：C++ 边界检查拒绝非法框，应调查上游关键点。
 - `RGA ROI crop/resize/color failed`：RGA 阶段错误；保留完整 rect/stride 日志。
 - `[ControlRouter] source=...`：统一控制入口日志。
 - `[FIRST-PERSON-CMD]`：实际 FIRST_PERSON UART 目标已发送。
-- `[Main] All sidecars ready`：两个 Python 服务均已创建 socket，主程序才继续初始化 NPU。
-- `[Main] Shutdown complete`：Ctrl+C 逆序清理完成；随后不应残留 `build/cc`、sidecar、8080/8554 或两个 socket。
+- `[Main] All sidecars ready`：必需 RuleEngine/HandPipeline 已就绪；VoiceKWS 随后可降级启动。
+- `[Main] Shutdown complete`：逆序清理完成标志；随后不应残留 `build/cc`、sidecar、8080/8554 或三个 socket。
 
 ## 5. 生命周期验证
 
-主程序负责 RuleEngine 和 HandPipeline 的完整生命周期，不应手工另开生产 sidecar。修改初始化或关闭流程后，至少验证一次：启动后存在主进程和两个子进程；发送一次 SIGINT；日志到达 `Shutdown complete`；`pgrep`、8080/8554 和 `/tmp/*.sock` 均无残留。
+主程序负责三个 sidecar 生命周期，不应手工另开生产实例。至少验证正常 SIGINT、timeout 和初始化失败：日志到达 `Shutdown complete`；`pgrep`、8080/8554 和三个 socket 均无残留。2026-07-14 性能测试曾在部分清理后遗留 root-owned Rule/Hand socket，这是当前待修问题。
 
 ## 6. RGA Bus error 处理
 
@@ -57,12 +58,6 @@ git diff --check
 4. 不要通过忽略返回值继续 resize/color。
 5. 重编译后先测四边和角落，再长时间运行。
 
-## 7. 提交建议
+## 7. 提交与分支
 
-将当前大工作树拆成至少三类提交：
-
-- 控制迁移与测试；
-- 手势模型/sidecar/OSD；
-- 文档与交接。
-
-模型文件需确认仓库容量策略；`build/cc` 通常不应作为源码提交。手势控制提交信息应明确“代码已接入、实机未验收”，不能把纯决策测试描述成机械安全验证。
+远端分支为 `origin/no-arm-test`。`build/cc`、缓存和日志不提交；根目录 Body/Face/Rule RKNN 仍受 `.gitignore` 管理，Hand/KWS 模型和 Sherpa runtime 已提交。任何机械相关提交必须区分代码接入与机械安全验收。

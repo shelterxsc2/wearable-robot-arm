@@ -1,6 +1,6 @@
 # fourth 项目架构
 
-> 当前代码快照：2026-07-13。迁移来源和未完成验收见 `MIGRATION.md` 与 `HANDOFF.md`。
+> 当前代码快照：2026-07-14，分支 `no-arm-test`。迁移来源和未完成验收见 `MIGRATION.md` 与 `HANDOFF.md`。
 
 ## 1. 系统目标
 
@@ -25,7 +25,7 @@
 REST ───────┐
 Cloud WS ───┤
 Bluetooth ──┼→ control_router → mode/profile/target/annotation
-Voice future┤
+Voice KWS ──┤
 Gesture ────┘
 
 Camera → GStreamer → RGA/RKNN Body ─┬→ Face landmarks/PnP
@@ -86,22 +86,22 @@ Mode-specific control ───────────────────�
 ## 6. 启动顺序
 
 1. 安装 SIGINT/SIGTERM 处理器，清理临时状态，设置 CPU 性能模式和网络；
-2. 并行 fork RuleEngine 与 HandPipeline，等待两个 socket 实际就绪；
-3. 初始化 Body、Face、RGA 和手势 worker；
+2. 并行 fork 必需的 RuleEngine 与 HandPipeline，等待两个 socket 实际就绪；随后启动可降级 VoiceKWS；
+3. 初始化 Body、Face、RGA 和手势 worker；可降级启动 VoiceKWS；
 4. 初始化蓝牙、UART、HTTP、NRF24、IMU2；
 5. 探测 RTMP，失败则 RTSP；
-6. 启动 H7 握手和 50 ms NRF 控制定时器；
+6. 默认保持机械臂收起并阻塞目标发送；显式开机后等待归位、重采 A-init，再开放 50 ms NRF 控制；
 7. 进入 GStreamer loop。
 
-任一 sidecar 启动失败或运行中退出都会触发统一关闭。Ctrl+C、SIGTERM、推流失败和初始化失败共用同一逆序清理路径；主进程关闭时会停止并回收 sidecar、线程、socket 和监听端口。sidecar 还设置父进程死亡信号，主进程被强制杀死时不会长期变成孤儿。
+RuleEngine/HandPipeline 启动失败或运行中退出会停止系统；VoiceKWS 失败只禁用语音。设计上 Ctrl+C、SIGTERM、推流失败和初始化失败共用逆序清理路径，但 2026-07-14 timeout/SIGINT 性能测试曾在部分清理后遗留 Rule/Hand socket，因此“完整回收”仍需修复并复验。sidecar 设置父进程死亡信号，避免长期孤儿进程。
 
-H7 握手、A-init 和 `g_uart_block_tx` 是安全链的一部分，不应为了调试视觉随意删除。
+展开/收起帧、A-init、`arm_power_control` 和 `g_uart_block_tx` 是安全链的一部分，不应为了调试视觉随意删除。`no-arm-test` 不是硬件锁，运行前仍需物理隔离。
 
 ## 7. 模式与控制
 
 模式为 FACE、BODY、INTRO、INTERVIEW、FIRST_PERSON。详细输入、发令周期和接入方向见 `CONTROL.md`。
 
-视觉约 13～15 FPS 是观察更新速率；机械命令由死区和最小时间间隔节流。INTRO/INTERVIEW 目前约 700 ms 级发令限制，FIRST_PERSON 150 ms，普通头控还依赖运动状态。
+阶段实测视觉平均约 16 FPS，但 5 秒窗口可降至 12 FPS；机械命令仍由死区和最小时间间隔节流。INTRO/INTERVIEW 约 700 ms 级限制，FIRST_PERSON 150 ms，普通头控还依赖运动状态。
 
 ## 8. 数据与模型
 
@@ -112,7 +112,7 @@ H7 握手、A-init 和 `g_uart_block_tx` 是安全链的一部分，不应为了
 - `models/hand/*`：hand detector、landmark、embedder、canned classifier；
 - `models/sherpa-onnx-*`、`models/silero_vad.onnx`：离线中文 KWS 与软 VAD；
 - `calib/`：相机内参与畸变；
-- `/tmp/*.sock`：两个 sidecar socket；
+- `/tmp/rule_engine.sock`、`/tmp/hand_pipeline.sock`、`/tmp/voice_kws.sock`：三个 sidecar socket；
 - `/tmp/calib_mode.txt`、`/tmp/servo_calib.txt`：临时标定控制；
 - `/tmp/cmd`：UART RX 调试记录。
 
@@ -122,7 +122,9 @@ H7 握手、A-init 和 `g_uart_block_tx` 是安全链的一部分，不应为了
 - control router 缺少真正的来源优先级/租约；
 - 云端协议缺真实包固定测试；
 - PnP 修正仍是实验态；
-- 手势情景控制已接入（每 3 帧采样、连续 3 个有效结果）但缺准确率、误触发和机械实机验收；
+- 手势情景控制已接入（每 3 帧采样、连续 3 个有效结果）但缺机械实机验收；
+- KWS 当前阈值在 5 分钟现场测试产生 32 次事件，不能开放语音机械动作；
+- timeout/SIGINT 性能测试曾遗留 root-owned sidecar socket，生命周期清理需修复；
 - 完整系统没有关节反馈、动力学和碰撞闭环；
 - 多份历史设计文档描述旧参数，已加状态标记，当前数值以源码为准。
 

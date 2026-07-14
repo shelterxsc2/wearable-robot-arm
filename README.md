@@ -1,9 +1,9 @@
 # fourth：RK3588 可穿戴机械臂上位机
 
-> 交接快照：2026-07-13
-> 当前分支：`migration/trial0-rk3588`
+> 交接快照：2026-07-14
+> 当前分支：`no-arm-test`
 > Git 基线：`025f3b3`（原 `imu-victor-hat`）
-> 当前性质：迁移开发工作树；迁移改动尚未形成正式提交，源码和本文档应一起评审、测试后提交。
+> 当前提交：`e995dc8` 起的无机械臂性能测试分支；代码已推送 GitHub，但机械动作尚未验收。
 
 `fourth` 是当前可继续开发的独立目录。后续开发者不需要读取相邻目录或历史对话；外部项目名只用于说明代码来源，当前行为以本目录源码为准。
 
@@ -44,13 +44,13 @@ STM32H723 已负责逆运动学、S-curve 和电机/舵机执行。本项目不�
 
 ## 视觉与手势当前节拍
 
-- 摄像头管线声明 1920×1080@30 FPS；Body/Face 实际处理约 13～15 FPS，需以实机日志为准。
+- 摄像头声明 1920×1080@30 FPS；阶段实测平均约 16 FPS、5 秒窗口 P05/P50/P95 为 12/18/18，不能承诺恒定 15 FPS。
 - 视觉控制观察值在每个已处理视觉帧更新；机械臂 UART 发令另有死区和时间限频，不能把“视觉 15 FPS”误写成“UART 15 Hz”。
 - 手部旁路固定每 3 个视觉帧采样一次；一个采样帧若同时有左右手，会把两只手都交给异步 worker。
 - 只有腕点高于同侧肩点时才产生手部 ROI；BODY/FIRST_PERSON 不运行手势裁剪。
 - 以视觉 15 FPS 估算，手势约 5 轮/秒；连续 3 次确认约需 0.6 秒。
 - 右上角分别显示 `Left Hand`、`Right Hand`。这里的左右是被拍摄者的 COCO 语义左右，不是屏幕左右。
-- 控制要求 score ≥ 0.70、同侧连续 3 次一致，并有 1.5 秒全局冷却；`ILoveYou` 替代 trial0 的 `OK` 作为返回 FACE 手势。
+- 控制要求 score ≥ 0.70、同侧连续 3 次一致，并有 1.5 秒全局冷却；`ILoveYou` 承担 trial0 的 `OK` 语义，优先确认待处理收起，否则返回 FACE。
 
 ## 构建
 
@@ -74,7 +74,7 @@ g++ -std=c++17 -O2 \
   -lrknnrt -lrga -lwpa_client -lpthread
 ```
 
-依赖包括 GStreamer、OpenCV、Rockchip RKNN Runtime、librga、DBus、wpa_supplicant client，以及 Python 的 `rknnlite`/`rknn-toolkit-lite2` 运行环境。模型文件已放在 `models/`；不要假设所有模型都由 Git 跟踪。
+依赖包括 GStreamer、OpenCV、Rockchip RKNN Runtime、librga、DBus、wpa_supplicant client，以及 Python 的 `rknnlite`/`rknn-toolkit-lite2`。Hand/KWS 模型和 Sherpa ARM64 Python runtime 已提交；根目录 Body/Face/Rule RKNN 受 `.gitignore` 管理，克隆后需单独准备。
 
 ## 测试
 
@@ -92,7 +92,8 @@ g++ -std=c++17 -Isrc tests/gesture_control_test.cpp \
 g++ -std=c++17 -Isrc tests/rule_mode_control_test.cpp \
   src/rule_mode_control.cpp -o /tmp/rule_mode_control_test
 /tmp/rule_mode_control_test
-python3 -m py_compile scripts/rule_engine_server.py scripts/hand_pipeline_server.py
+python3 -m py_compile scripts/rule_engine_server.py scripts/hand_pipeline_server.py \
+  scripts/voice_kws_server.py
 ```
 
 主程序会接触网络、摄像头、NRF24、蓝牙和 UART。实机运行前先确认机械臂活动空间、急停方式、串口设备和当前模式：
@@ -108,7 +109,7 @@ sudo ./build/cc
 
 ```text
 src/          C/C++ 主程序、视觉、控制、推流及硬件通信
-scripts/      RuleEngine 与 HandPipeline Python sidecar
+scripts/      RuleEngine、HandPipeline、VoiceKWS sidecar 与测试脚本
 models/       Body、Face、RuleEngine、Hand RKNN 模型
 calib/        相机内参与畸变参数
 tests/        无硬件单元/回放测试
@@ -122,7 +123,10 @@ scenario-intro-mode/  旧 INTRO 快照，仅作历史对照，不是当前构建
 - 手势已能切换情景/profile，但尚未实机验收；运行前必须确认活动空间、退出回中和急停方式。
 - 语音模块只能调用统一控制路由，不能直接持有 UART。
 - VoiceKWS 为可降级 CPU sidecar，默认绑核 CPU 2、nice 10；退出不影响视觉主链。
-- 云端、REST、蓝牙、未来语音/手势共享云服务和接口语义，但最终设备命令必须经过端侧仲裁。
+- 5 分钟现场测试产生 32 次 KWS 事件（含开机/关机）；完成阈值标定、唤醒/二次确认前，不得连接可展开机械臂运行语音控制。
+- `no-arm-test` 是分支/验收状态，不是编译期硬锁；主程序仍会打开 `/dev/ttyS9`，必须物理隔离机械臂或确认 H7 不可执行。
+- 性能测试的 timeout/SIGINT 路径曾留下 root-owned sidecar socket；退出后必须用 `pgrep`、`ss` 和 `/tmp/*.sock` 三项复核。
+- 云端、REST、蓝牙、语音和手势共享接口语义，但最终设备命令必须经过端侧仲裁。
 - 不新增 STM32 桥；本机已经采集传感器并与机械臂通信。
 - 不要用仿真通过代替实机限位、极性、碰撞和通信时序验收。
 
