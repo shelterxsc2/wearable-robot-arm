@@ -3,6 +3,7 @@
  * 启用process_frame进行AI推理和绘制
  */
 #include "gst_rtsp.h"
+#include "stream_manager.h"
 #include "rga_npu.h"
 #include <cstdio>
 #include <cstdlib>
@@ -202,6 +203,10 @@ static void client_connected_cb(GstRTSPServer *server, GstRTSPClient *client, gp
     (void)server; (void)client; (void)user_data;
 }
 
+static GstRTSPFilterResult remove_client_cb(GstRTSPServer *, GstRTSPClient *, gpointer) {
+    return GST_RTSP_FILTER_REMOVE;
+}
+
 static void media_configure_cb(GstRTSPMediaFactory *factory, GstRTSPMedia *media, gpointer user_data) {
     GstElement *element = gst_rtsp_media_get_element(media);
     if (!element) {
@@ -290,7 +295,8 @@ int start_rtsp_server(const char *device, GMainLoop **loop_ptr) {
     // 监听客户端连接事件
     g_signal_connect(server, "client-connected", G_CALLBACK(client_connected_cb), NULL);
 
-    if (gst_rtsp_server_attach(server, NULL) == 0) {
+    guint attach_id = gst_rtsp_server_attach(server, NULL);
+    if (attach_id == 0) {
         g_printerr("[RTSP] Cannot attach server\n");
         g_object_unref(server);
         return -1;
@@ -305,8 +311,13 @@ int start_rtsp_server(const char *device, GMainLoop **loop_ptr) {
 
     GMainLoop *loop = g_main_loop_new(NULL, FALSE);
     *loop_ptr = loop;
+    stream_manager_notify_loop_ready(loop);
     g_main_loop_run(loop);
 
+    g_source_remove(attach_id);
+    /* Disconnect active viewers so their shared media pipeline releases the
+     * camera before StreamManager starts the replacement pipeline. */
+    gst_rtsp_server_client_filter(server, remove_client_cb, NULL);
     g_main_loop_unref(loop);
     g_object_unref(server);
     return 0;

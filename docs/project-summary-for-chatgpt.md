@@ -10,8 +10,8 @@
 
 最近修复过严重 RGA 边界问题：右边缘 ROI 曾被缩成 `48×352`，触发 Invalid argument 和系统 Bus error。当前 ROI 必须方形、偶数坐标、16 对齐、完全在帧内，边缘通过整体平移处理。
 
-FIRST_PERSON 固定空间目标，头姿只映射 J4/J5；实机极性、限位和退出回中尚未验收。云端缺真实抓包。KWS 已接 USB 麦克风，但 5 分钟产生 32 次事件，当前不得开放语音开关机。性能测试退出还暴露出部分清理后 socket 残留风险。
+FIRST_PERSON 固定空间目标，头姿只映射 J4/J5；实机极性、限位和退出回中尚未验收。云端缺真实抓包。KWS 已接 USB 麦克风，但 5 分钟产生 32 次事件，当前不得开放语音开关机。正常 SIGINT/SIGTERM 的进程、端口和 socket 清理已复验；SIGKILL、内核崩溃或断电仍需依赖父进程死亡信号和下次启动清理。
 
-下一步优先级：隔离语音危险动作并标定 KWS；修复生命周期残留；做 20～30 分钟热稳态；低速验收 FIRST_PERSON/展开收起；抓真实云包；补 annotation 自动测试。不要把 Hand 单次推理或视觉 FPS 等同 UART 发令率。
+下一步优先级：隔离语音危险动作并标定 KWS；做 20～30 分钟热稳态；补初始化失败与 SIGKILL 后重启清理测试；低速验收 FIRST_PERSON/展开收起；抓真实云包；补 annotation 自动测试。不要把 Hand 单次推理或视觉 FPS 等同 UART 发令率。
 
 首读文件：`README.md`、`docs/HANDOFF.md`、`docs/MIGRATION.md`、`docs/VISION.md`、`docs/CONTROL.md`。

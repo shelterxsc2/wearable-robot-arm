@@ -79,7 +79,7 @@ Mode-specific control ───────────────────�
 | `imu2_i2c.c/h` | 板载 IMU2。|
 | `gst_rtmp.cpp/h` | 云端 RTMP 管线。|
 | `gst_rtsp.cpp/h` | 本地 RTSP 管线。|
-| `stream_manager.cpp/h` | 云端探测和流类型选择。|
+| `stream_manager.cpp/h`, `gst_unified.cpp/h` | 常驻采集/AI/H264 主干；动态切换 RTMP/RTSP 输出分支，目标失败时保留原分支。|
 | `ws_client.cpp/h` | 云端 WS 上报和下行。|
 | `bluetooth_spp.c/h` | HC-08 遥控。|
 
@@ -93,7 +93,7 @@ Mode-specific control ───────────────────�
 6. 默认保持机械臂收起并阻塞目标发送；显式开机后等待归位、重采 A-init，再开放 50 ms NRF 控制；
 7. 进入 GStreamer loop。
 
-RuleEngine/HandPipeline 启动失败或运行中退出会停止系统；VoiceKWS 失败只禁用语音。设计上 Ctrl+C、SIGTERM、推流失败和初始化失败共用逆序清理路径，但 2026-07-14 timeout/SIGINT 性能测试曾在部分清理后遗留 Rule/Hand socket，因此“完整回收”仍需修复并复验。sidecar 设置父进程死亡信号，避免长期孤儿进程。
+RuleEngine/HandPipeline 启动失败或运行中退出会停止系统；VoiceKWS 失败只禁用语音。Ctrl+C、SIGTERM、推流失败和初始化失败共用逆序清理路径。2026-07-14 已复验正常退出：主进程、三个 sidecar、VoiceKWS 的 `arecord`、8080/8554及三个 socket 均被回收。sidecar 设置父进程死亡信号以避免主进程异常消失后形成长期孤儿；SIGKILL、内核崩溃和断电仍不能保证 socket 文件等资源完成清理。
 
 展开/收起帧、A-init、`arm_power_control` 和 `g_uart_block_tx` 是安全链的一部分，不应为了调试视觉随意删除。`no-arm-test` 不是硬件锁，运行前仍需物理隔离。
 
@@ -124,7 +124,7 @@ RuleEngine/HandPipeline 启动失败或运行中退出会停止系统；VoiceKWS
 - PnP 修正仍是实验态；
 - 手势情景控制已接入（每 3 帧采样、连续 3 个有效结果）但缺机械实机验收；
 - KWS 当前阈值在 5 分钟现场测试产生 32 次事件，不能开放语音机械动作；
-- timeout/SIGINT 性能测试曾遗留 root-owned sidecar socket，生命周期清理需修复；
+- 正常 SIGINT/SIGTERM 清理已复验；SIGKILL/断电后的残留仍需在下次启动或运维检查中处理；
 - 完整系统没有关节反馈、动力学和碰撞闭环；
 - 多份历史设计文档描述旧参数，已加状态标记，当前数值以源码为准。
 

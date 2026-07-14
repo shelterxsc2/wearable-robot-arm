@@ -59,7 +59,7 @@ cd /home/elf/work/fourth
 mkdir -p build
 g++ -std=c++17 -O2 \
   src/main.cpp src/rga_npu.cpp src/gst_rtsp.cpp src/gst_rtmp.cpp \
-  src/stream_manager.cpp src/ctrl_server.cpp src/ws_client.cpp \
+  src/stream_manager.cpp src/gst_unified.cpp src/ctrl_server.cpp src/ws_client.cpp \
   src/control_router.cpp src/cloud_command.cpp src/cloud_report.cpp \
   src/arm_power_control.cpp src/first_person_control.cpp \
   src/gesture_control.cpp src/rule_mode_control.cpp src/gesture_overlay.cpp \
@@ -125,7 +125,7 @@ scenario-intro-mode/  旧 INTRO 快照，仅作历史对照，不是当前构建
 - VoiceKWS 为可降级 CPU sidecar，默认绑核 CPU 2、nice 10；退出不影响视觉主链。
 - 5 分钟现场测试产生 32 次 KWS 事件（含开机/关机）；完成阈值标定、唤醒/二次确认前，不得连接可展开机械臂运行语音控制。
 - `no-arm-test` 是分支/验收状态，不是编译期硬锁；主程序仍会打开 `/dev/ttyS9`，必须物理隔离机械臂或确认 H7 不可执行。
-- 性能测试的 timeout/SIGINT 路径曾留下 root-owned sidecar socket；退出后必须用 `pgrep`、`ss` 和 `/tmp/*.sock` 三项复核。
+- 正常 SIGINT/SIGTERM 会回收主程序、三个 sidecar、VoiceKWS 的 `arecord`、8080/8554和三个 socket；SIGKILL、内核崩溃或断电无法执行完整清理，重启前仍应以 `pgrep`、`ss` 和 `/tmp/*.sock` 复核。
 - 云端、REST、蓝牙、语音和手势共享接口语义，但最终设备命令必须经过端侧仲裁。
 - 不新增 STM32 桥；本机已经采集传感器并与机械臂通信。
 - 不要用仿真通过代替实机限位、极性、碰撞和通信时序验收。

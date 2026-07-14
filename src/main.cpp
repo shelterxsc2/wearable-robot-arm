@@ -59,7 +59,6 @@ static pthread_t g_nrf24_tid = 0;
 static int g_nrf24_enabled = 0;
 static pthread_t g_imu2_tid = 0;
 static int g_imu2_enabled = 0;
-static GMainLoop *g_loop = NULL;
 static volatile sig_atomic_t g_should_quit = 0;
 static volatile sig_atomic_t g_ws_ready = 0;
 static pthread_t g_handshake_tid = 0;
@@ -259,14 +258,7 @@ static gboolean check_quit_timer(gpointer user_data) {
     monitor_sidecar(&g_rule_engine_pid, "RuleEngine");
     monitor_sidecar(&g_hand_pipeline_pid, "HandPipeline");
     monitor_optional_sidecar(&g_voice_kws_pid, "VoiceKWS");
-    if (g_should_quit && g_loop) {
-        printf("\n[Main] Stopping...\n");
-        GMainLoop *loop = g_loop;
-        g_loop = NULL;
-        g_main_loop_quit(loop);
-        return G_SOURCE_REMOVE;
-    }
-    return G_SOURCE_CONTINUE;
+    return g_should_quit ? G_SOURCE_REMOVE : G_SOURCE_CONTINUE;
 }
 
 /* ========== WebSocket 云端交互线程（来自历史备份） ========== */
@@ -427,6 +419,10 @@ static void shutdown_runtime(RuntimeState *state, bool send_exit_frame)
     printf("\n[Main] Cleaning up...\n");
     g_should_quit = 1;
     g_running = 0;
+
+    /* Release camera/encoder before tearing down NPU/RGA dependencies. */
+    stream_manager_stop();
+    printf("[Main] Stream manager stopped\n");
 
     if (state->ws_started) {
         pthread_join(state->ws_tid, NULL);
@@ -695,24 +691,23 @@ int main(int argc, char *argv[]) {
     // 9. 探测云服务器并选择推流模式
     gst_init(&argc, &argv);
 
-    /* 在主循环线程中注册安全退出检查器（信号处理函数中不能直接调用 g_main_loop_quit） */
-    g_timeout_add(100, check_quit_timer, NULL);
-
     StreamType stream_type = STREAM_TYPE_RTSP;
 
     printf("\n[Main] Probing RTMP server (%s)...\n", RTMP_URL);
     if (!g_should_quit && probe_rtmp_server(RTMP_URL, 3000)) {
         stream_type = STREAM_TYPE_RTMP;
         printf("[Main] RTMP server is UP. Will push RTMP + WebSocket.\n");
-        if (pthread_create(&state.ws_tid, NULL, ws_worker_thread, NULL) == 0) {
-            state.ws_started = true;
-            printf("[Main] WebSocket reporter started -> %s\n", WS_URL);
-        } else {
-            fprintf(stderr, "[Main] WebSocket thread start failed\n");
-        }
     } else {
         stream_type = STREAM_TYPE_RTSP;
-        printf("[Main] RTMP server is DOWN. Will fallback to local RTSP (no WebSocket).\n");
+        printf("[Main] RTMP server is DOWN. Will fallback to local RTSP.\n");
+    }
+
+    /* Keep the cloud control session alive so REST can later switch local -> cloud. */
+    if (pthread_create(&state.ws_tid, NULL, ws_worker_thread, NULL) == 0) {
+        state.ws_started = true;
+        printf("[Main] WebSocket reporter started -> %s\n", WS_URL);
+    } else {
+        fprintf(stderr, "[Main] WebSocket thread start failed\n");
     }
 
     /* RTMP 模式：等待 WS 注册成功后再启动推流，避免服务器丢弃未注册设备的 RTMP 数据 */
@@ -730,31 +725,27 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // NRF24 IMU 控制：用 GLib 定时器每 50ms 独立运行，不依赖视频帧
-    g_timeout_add(50, [](gpointer) -> gboolean {
-        if (!g_running) return G_SOURCE_REMOVE;
-        arm_power_tick();
-        if (arm_power_is_on() && !arm_power_shutdown_in_progress()) {
-            nrf24_control_update();
-        }
-        return G_SOURCE_CONTINUE;
-    }, NULL);
+    // NRF24 IMU 控制在常驻 main 循环运行，不受推流重启影响。
     printf("[Main] NRF24 control timer started (50ms)\n");
 
     printf("[Main] Starting %s stream...\n",
            (stream_type == STREAM_TYPE_RTMP) ? "RTMP" : "RTSP");
     printf("[Main] Press Ctrl+C to stop\n\n");
 
-    int stream_ret = 0;
-    if (!g_should_quit) {
-        stream_ret = start_stream(VIDEO_DEVICE, RTMP_URL, stream_type, &g_loop);
-    }
-    /* start_stream 返回时内部已 unref loop，防止 sigint_handler 对已释放指针调用 quit */
-    g_loop = NULL;
-
+    int stream_ret = stream_manager_init(VIDEO_DEVICE, RTMP_URL);
+    if (stream_ret == 0 && !g_should_quit)
+        stream_ret = stream_manager_start(stream_type);
     if (stream_ret != 0) {
         fprintf(stderr, "[Main] Stream failed\n");
         exit_code = 1;
+    } else {
+        while (!g_should_quit) {
+            check_quit_timer(NULL);
+            arm_power_tick();
+            if (arm_power_is_on() && !arm_power_shutdown_in_progress())
+                nrf24_control_update();
+            usleep(50000);
+        }
     }
     shutdown_runtime(&state, state.uart_initialized);
     if (g_should_quit && exit_code == 0) return 0;

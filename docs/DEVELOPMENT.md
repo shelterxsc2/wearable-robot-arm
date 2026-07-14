@@ -46,7 +46,11 @@ git diff --check
 
 ## 5. 生命周期验证
 
-主程序负责三个 sidecar 生命周期，不应手工另开生产实例。至少验证正常 SIGINT、timeout 和初始化失败：日志到达 `Shutdown complete`；`pgrep`、8080/8554 和三个 socket 均无残留。2026-07-14 性能测试曾在部分清理后遗留 root-owned Rule/Hand socket，这是当前待修问题。
+主程序负责三个 sidecar 生命周期，不应手工另开生产实例。正常 SIGINT/SIGTERM、初始化失败和内部停止路径统一进入 `shutdown_runtime()`：先停止共享推流主干，再依次 join WebSocket、REST、语音控制、NRF/IMU/UART，最后对 Hand、RuleEngine、VoiceKWS 发送 SIGTERM；3 秒内未退出则发送 SIGKILL并 `waitpid`。VoiceKWS 的 `finally` 同时终止其 `arecord` 子进程。2026-07-14 实测日志到达 `Shutdown complete` 后，`build/cc`、三个 sidecar、`arecord`、8080/8554和三个 Unix socket 均无残留。
+
+上述保证只适用于主程序能够执行清理代码的退出。主进程遭 SIGKILL、内核崩溃或断电时，三个 sidecar 会因 `PR_SET_PDEATHSIG(SIGTERM)` 收到终止信号，但主程序无法 join、关闭端口或统一 unlink socket；重启入口会清理旧 socket，但退出后仍应检查。外部 RTSP 播放器、systemd/BlueZ、wpa_supplicant 等并非主程序创建的进程，不在清理范围内。
+
+推流由常驻 `StreamManager` 线程持有。摄像头、解码、AI、OSD 和 H264 编码主干不随 `POST /stream?mode=cloud|local|auto` 重启；接口先建立目标网络输出分支，成功后再移除旧分支。切换测试必须确认 `/dev/video21` 始终只有共享主干占用、8554 监听不会残留，且 main/NRF/UART/Hand/KWS 与视觉帧持续运行。
 
 ## 6. RGA Bus error 处理
 

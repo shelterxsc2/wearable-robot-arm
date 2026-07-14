@@ -5,6 +5,7 @@
 #include "stream_manager.h"
 #include "gst_rtsp.h"
 #include "gst_rtmp.h"
+#include "gst_unified.h"
 #include <cstdio>
 #include <cstring>
 #include <unistd.h>
@@ -15,8 +16,94 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <string>
 
-static StreamType g_current_type = STREAM_TYPE_RTSP;
+static std::atomic<StreamType> g_current_type{STREAM_TYPE_RTSP};
+
+namespace {
+std::mutex manager_mutex;
+std::condition_variable manager_cv;
+std::string manager_device;
+std::string manager_rtmp_url;
+pthread_t manager_thread{};
+bool manager_thread_active = false;
+bool manager_starting = false;
+bool manager_running = false;
+bool manager_stopping = false;
+int manager_last_result = -1;
+GMainLoop *manager_loop = NULL;
+
+void *stream_worker(void *)
+{
+    StreamType type;
+    std::string device;
+    std::string url;
+    {
+        std::lock_guard<std::mutex> lock(manager_mutex);
+        type = g_current_type.load();
+        device = manager_device;
+        url = manager_rtmp_url;
+    }
+
+    GMainLoop *loop = NULL;
+    int ret = start_unified_stream(device.c_str(), url.c_str(), type, &loop);
+    {
+        std::lock_guard<std::mutex> lock(manager_mutex);
+        manager_loop = NULL;
+        manager_running = false;
+        manager_starting = false;
+        manager_last_result = ret;
+    }
+    manager_cv.notify_all();
+    return NULL;
+}
+
+int start_locked(StreamType type, std::unique_lock<std::mutex> &lock)
+{
+    g_current_type = type;
+    manager_loop = NULL;
+    manager_last_result = -1;
+    manager_starting = true;
+    manager_running = false;
+    manager_stopping = false;
+    if (pthread_create(&manager_thread, NULL, stream_worker, NULL) != 0) {
+        manager_starting = false;
+        return -1;
+    }
+    manager_thread_active = true;
+
+    /* start_stream publishes its loop only after the pipeline/server exists. */
+    manager_cv.wait(lock, [] { return manager_loop != NULL || !manager_starting; });
+    bool ready = manager_loop != NULL;
+    if (ready) {
+        manager_running = true;
+        manager_starting = false;
+        return 0;
+    }
+    return -1;
+}
+
+void stop_locked(std::unique_lock<std::mutex> &lock)
+{
+    if (!manager_thread_active) return;
+    manager_stopping = true;
+    GMainLoop *loop = manager_loop;
+    if (loop) g_main_loop_quit(loop);
+    pthread_t tid = manager_thread;
+    lock.unlock();
+    pthread_join(tid, NULL);
+    lock.lock();
+    manager_thread_active = false;
+    manager_loop = NULL;
+    manager_running = false;
+    manager_starting = false;
+    manager_stopping = false;
+}
+}
 
 /* 从 RTMP URL 解析 host 和 port */
 static int parse_rtmp_url(const char *url, char *host, size_t host_len, int *port)
@@ -123,5 +210,83 @@ int start_stream(const char *device, const char *rtmp_url, StreamType type, GMai
 
 StreamType get_current_stream_type(void)
 {
-    return g_current_type;
+    return g_current_type.load();
+}
+
+int stream_manager_init(const char *device, const char *rtmp_url)
+{
+    if (!device || !*device || !rtmp_url || !*rtmp_url) return -1;
+    std::lock_guard<std::mutex> lock(manager_mutex);
+    if (manager_thread_active) return -1;
+    manager_device = device;
+    manager_rtmp_url = rtmp_url;
+    return 0;
+}
+
+int stream_manager_start(StreamType type)
+{
+    std::unique_lock<std::mutex> lock(manager_mutex);
+    if (manager_thread_active || manager_device.empty()) return -1;
+    int ret = start_locked(type, lock);
+    if (ret != 0 && manager_thread_active) stop_locked(lock);
+    return ret;
+}
+
+int stream_manager_switch(const char *mode, int *changed)
+{
+    if (changed) *changed = 0;
+    if (!mode) return -1;
+
+    StreamType target;
+    if (strcmp(mode, "local") == 0) target = STREAM_TYPE_RTSP;
+    else if (strcmp(mode, "cloud") == 0) {
+        std::string url;
+        { std::lock_guard<std::mutex> lock(manager_mutex); url = manager_rtmp_url; }
+        if (!probe_rtmp_server(url.c_str(), 3000)) return -2;
+        target = STREAM_TYPE_RTMP;
+    } else if (strcmp(mode, "auto") == 0) {
+        std::string url;
+        { std::lock_guard<std::mutex> lock(manager_mutex); url = manager_rtmp_url; }
+        target = probe_rtmp_server(url.c_str(), 3000) ? STREAM_TYPE_RTMP : STREAM_TYPE_RTSP;
+    } else return -1;
+
+    std::unique_lock<std::mutex> lock(manager_mutex);
+    if (!manager_thread_active || !manager_running) return -3;
+    StreamType old = g_current_type.load();
+    if (old == target) return 0;
+    lock.unlock();
+    int ret = unified_stream_switch(target);
+    lock.lock();
+    if (ret != 0) return -2; /* old branch is retained until target is ready */
+    g_current_type = target;
+    if (changed) *changed = 1;
+    return 0;
+}
+
+void stream_manager_stop(void)
+{
+    std::unique_lock<std::mutex> lock(manager_mutex);
+    stop_locked(lock);
+}
+
+int stream_manager_is_running(void)
+{
+    std::lock_guard<std::mutex> lock(manager_mutex);
+    return manager_running ? 1 : 0;
+}
+
+const char *stream_manager_state_name(void)
+{
+    std::lock_guard<std::mutex> lock(manager_mutex);
+    if (manager_stopping) return "stopping";
+    if (manager_starting) return "starting";
+    if (!manager_running) return "unavailable";
+    return g_current_type.load() == STREAM_TYPE_RTMP ? "streaming_cloud" : "streaming_local";
+}
+
+void stream_manager_notify_loop_ready(GMainLoop *loop)
+{
+    std::lock_guard<std::mutex> lock(manager_mutex);
+    manager_loop = loop;
+    manager_cv.notify_all();
 }

@@ -4,6 +4,7 @@
  * Pipeline: v4l2src(MJPEG) → mppjpegdec → rotate 180° → identity → memcpy(NV12) → process_frame → appsrc → mpph264enc → flvmux → rtmpsink
  */
 #include "gst_rtmp.h"
+#include "stream_manager.h"
 #include "rga_npu.h"
 #include <cstdio>
 #include <cstdlib>
@@ -211,6 +212,7 @@ int start_rtmp_stream(const char *device, const char *rtmp_url, GMainLoop **loop
 
     GMainLoop *loop = g_main_loop_new(NULL, FALSE);
     *loop_ptr = loop;
+    stream_manager_notify_loop_ready(loop);
     g_loop = loop;
     g_main_loop_run(loop);
 
@@ -218,12 +220,10 @@ int start_rtmp_stream(const char *device, const char *rtmp_url, GMainLoop **loop
     gst_element_send_event(pipeline, gst_event_new_flush_start());
     gst_element_send_event(pipeline, gst_event_new_flush_stop(TRUE));
 
-    g_thread_new("rtmp-stop", [](gpointer data) -> gpointer {
-        GstElement *p = GST_ELEMENT(data);
-        gst_element_set_state(p, GST_STATE_NULL);
-        gst_object_unref(p);
-        return NULL;
-    }, pipeline);
+    /* A restart must not race the old pipeline for the camera/MPP encoder. */
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_element_get_state(pipeline, NULL, NULL, 3 * GST_SECOND);
+    gst_object_unref(pipeline);
 
     g_loop = NULL;
     g_main_loop_unref(loop);

@@ -24,6 +24,7 @@
 #define RESP_OK     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
 #define RESP_BAD    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
 #define RESP_NOTF   "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+#define RESP_UNAVAIL "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
 
 static int g_srv_fd = -1;
 static pthread_t g_srv_tid = 0;
@@ -79,7 +80,8 @@ static void handle_client(int client)
 
     printf("[Ctrl] %s %s\n", method, path);
 
-    if (strcmp(method, "GET") == 0 && strcmp(path, "/status") == 0) {
+    if (strcmp(method, "GET") == 0 && strncmp(path, "/status", 7) == 0 &&
+        (path[7] == '\0' || path[7] == '?')) {
         /* 返回系统状态 */
         PoseMode mode = get_pose_mode();
         StreamType st = get_current_stream_type();
@@ -106,6 +108,49 @@ static void handle_client(int client)
                  arm_power_shutdown_in_progress() ? "true" : "false");
         send_json(client, RESP_OK, json);
     }
+    else if ((strcmp(method, "GET") == 0 || strcmp(method, "POST") == 0) &&
+             strncmp(path, "/stream", 7) == 0 &&
+             (path[7] == '\0' || path[7] == '?')) {
+        StreamType current = get_current_stream_type();
+        const char *current_name = current == STREAM_TYPE_RTMP ? "cloud" : "local";
+        char requested[16] = "";
+        if (get_query_param(path, "mode", requested, sizeof(requested)) != 0) {
+            char json[160];
+            snprintf(json, sizeof(json),
+                     "{\"ok\":true,\"mode\":\"%s\",\"state\":\"%s\","
+                     "\"running\":%s}\n",
+                     current_name, stream_manager_state_name(),
+                     stream_manager_is_running() ? "true" : "false");
+            send_json(client, RESP_OK, json);
+        } else if (strcmp(requested, "auto") != 0 &&
+                   strcmp(requested, "cloud") != 0 &&
+                   strcmp(requested, "local") != 0) {
+            send_json(client, RESP_BAD,
+                      "{\"ok\":false,\"error\":\"mode must be auto, cloud or local\"}\n");
+        } else {
+            int changed = 0;
+            int result = stream_manager_switch(requested, &changed);
+            if (result == 0) {
+                StreamType active = get_current_stream_type();
+                const char *active_name = active == STREAM_TYPE_RTMP ? "cloud" : "local";
+                char json[224];
+                snprintf(json, sizeof(json),
+                         "{\"ok\":true,\"mode\":\"%s\",\"state\":\"%s\","
+                         "\"running\":true,\"changed\":%s}\n",
+                         active_name, stream_manager_state_name(),
+                         changed ? "true" : "false");
+                send_json(client, RESP_OK, json);
+            } else {
+                const char *error = result == -1 ? "invalid stream mode" :
+                                    result == -3 ? "stream manager is not running" :
+                                    result == -4 ? "switch and rollback failed" :
+                                                   "target stream unavailable; previous stream restored";
+                char json[224];
+                snprintf(json, sizeof(json), "{\"ok\":false,\"error\":\"%s\"}\n", error);
+                send_json(client, RESP_UNAVAIL, json);
+            }
+        }
+    }
     else if (strcmp(method, "POST") == 0 && strncmp(path, "/mode", 5) == 0) {
         char type_val[32] = "";
         if (get_query_param(path, "type", type_val, sizeof(type_val)) == 0) {
@@ -124,8 +169,9 @@ static void handle_client(int client)
     }
     else if (strcmp(method, "POST") == 0 && strncmp(path, "/profile", 8) == 0) {
         char value[16] = "";
-        if (get_query_param(path, "id", value, sizeof(value)) != 0)
-            get_query_param(path, "profile", value, sizeof(value));
+        if (get_query_param(path, "idx", value, sizeof(value)) != 0 &&
+            get_query_param(path, "id", value, sizeof(value)) != 0)
+            (void)get_query_param(path, "profile", value, sizeof(value));
         int profile = -1;
         if (strcmp(value, "0") == 0 || strcmp(value, "mid_l3_40") == 0) profile = 0;
         if (strcmp(value, "1") == 0 || strcmp(value, "far_l3_55") == 0) profile = 1;
@@ -136,6 +182,27 @@ static void handle_client(int client)
             send_json(client, RESP_OK, json);
         } else {
             send_json(client, RESP_BAD, "{\"ok\":false,\"error\":\"invalid profile\"}\n");
+        }
+    }
+    else if (strcmp(method, "POST") == 0 && strncmp(path, "/power", 6) == 0) {
+        char action[16] = "";
+        if (get_query_param(path, "action", action, sizeof(action)) != 0) {
+            send_json(client, RESP_BAD, "{\"ok\":false,\"error\":\"invalid action\"}\n");
+        } else {
+            int result = -1;
+            if (strcmp(action, "on") == 0) result = arm_power_on();
+            else if (strcmp(action, "off") == 0) result = arm_power_off_safe();
+            else {
+                send_json(client, RESP_BAD,
+                          "{\"ok\":false,\"error\":\"invalid action\"}\n");
+                close(client);
+                return;
+            }
+            char json[128];
+            snprintf(json, sizeof(json), "{\"ok\":%s,\"arm_powered\":%s}\n",
+                     result == 0 ? "true" : "false",
+                     arm_power_is_on() ? "true" : "false");
+            send_json(client, RESP_OK, json);
         }
     }
     else if (strcmp(method, "POST") == 0 && strncmp(path, "/target", 7) == 0) {
@@ -236,6 +303,13 @@ static void handle_client(int client)
             } else if (strcmp(action, "nrf24_reset") == 0) {
                 /* 通过全局状态触发 NRF24 重新初始化（实际效果有限，仅做演示） */
                 send_json(client, RESP_OK, "{\"ok\":true,\"action\":\"nrf24_reset\"}\n");
+            } else if (strcmp(action, "toggle_pitch_sign") == 0) {
+                int sign = toggle_head_pitch_sign();
+                char json[128];
+                snprintf(json, sizeof(json),
+                         "{\"ok\":true,\"action\":\"toggle_pitch_sign\","
+                         "\"head_pitch_sign\":%d}\n", sign);
+                send_json(client, RESP_OK, json);
             } else {
                 send_json(client, RESP_BAD, "{\"ok\":false,\"error\":\"unknown action\"}\n");
             }

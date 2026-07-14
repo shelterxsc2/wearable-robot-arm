@@ -23,7 +23,7 @@
 - 分支：`no-arm-test`，GitHub `origin/no-arm-test`。
 - 已推送提交：`e995dc8`；原历史基线仍为 `025f3b3`。
 - `build/cc` 已在 2026-07-14 重编译成功；只有旧代码的 ignored-return/narrowing 警告。
-- RuleEngine 与 HandPipeline 是必需 sidecar；VoiceKWS 可降级。性能测试退出时曾只完成部分清理并遗留 root-owned socket，需修复并重新验证正常 SIGINT、timeout 和初始化失败三条路径。
+- RuleEngine 与 HandPipeline 是必需 sidecar；VoiceKWS 可降级。正常 SIGINT/SIGTERM 已复验可回收三个 sidecar、VoiceKWS 的 `arecord`、端口和 socket；SIGKILL、内核崩溃或断电不承诺文件级清理。
 - Python sidecar 通过 `py_compile`；FIRST_PERSON C++ 纯逻辑和 Python 回放有测试，但实机综合测试不能由这些测试替代。
 
 提交前必须执行 `git status --short`，逐项确认模型、大文件、备份和用户原有修改，禁止盲目 `git add -A`。
@@ -83,7 +83,7 @@
 | 云端协议 | 兼容解析已写 | 用真实下行抓包覆盖所有类型、范围、错误包和重连。|
 | annotation | 状态已统一且原画模式恢复未绘制帧 | 补各模式自动测试和云端一致性验证。|
 | 语音 KWS | 12 词与控制已接；5 分钟出现 32 次事件 | 当前禁止实机开关机；提高阈值、加入唤醒/二次确认并建立噪声语料。|
-| 生命周期 | 进程和端口可退出 | 修复部分清理后遗留 socket，证明日志到 `Shutdown complete`。|
+| 生命周期 | 正常退出已到达 `Shutdown complete`，进程、端口和 socket 无残留 | 继续覆盖初始化失败与 SIGKILL 后重启清理。|
 | 情景模式扩展 | INTRO/INTERVIEW 基线 | 逐模式状态机迁移、回放、实机验收；禁止一次性大合并。|
 | 控制闭环 | 视觉修正为实验态 | 优化 PnP 多帧门槛/积分策略；若需要完整闭环，增加下位机反馈。|
 | 仿真 | 语义和 S-curve 部分覆盖 | 增加真实云包、传感器噪声、串口时序；动力学/碰撞需独立方案。|
@@ -91,7 +91,7 @@
 ## 6. 推荐下一步顺序
 
 1. 禁用或隔离语音开关机动作，完成 KWS 阈值、唤醒/二次确认和噪声误触发测试。
-2. 修复 SIGINT/timeout 的 sidecar socket 残留，再做 10～30 分钟视觉压力测试。
+2. 做 10～30 分钟视觉压力测试，并补初始化失败与 SIGKILL 后重启清理测试。
 3. 记录每秒视觉 FPS、Body/Face/Hand 时延、队列覆盖次数、RGA 错误、CPU/NPU 温度；不能只看平均 8 ms。
 4. 低速验收 FIRST_PERSON 和退出 FACE 的回中动作。
 5. 抓取真实云端下行包，固定协议样例并增加回放测试。

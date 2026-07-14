@@ -30,6 +30,16 @@ int probe_rtmp_server(const char *rtmp_url, int timeout_ms);
  */
 int start_stream(const char *device, const char *rtmp_url, StreamType type, GMainLoop **loop_ptr);
 
+/* Long-lived manager. The worker owns the active GMainLoop and serializes
+ * stop/release/start so camera and encoder resources are never double-owned. */
+int stream_manager_init(const char *device, const char *rtmp_url);
+int stream_manager_start(StreamType type);
+int stream_manager_switch(const char *mode, int *changed);
+void stream_manager_stop(void);
+int stream_manager_is_running(void);
+const char *stream_manager_state_name(void);
+void stream_manager_notify_loop_ready(GMainLoop *loop);
+
 /**
  * @brief 获取当前推流类型
  */

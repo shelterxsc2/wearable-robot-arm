@@ -55,13 +55,16 @@ STM32 目标帧为五个 int16 小端值加 flag，共 11 字节。`flag=0x00` �
 ## 6. 接口概览
 
 - `GET /status`
+- `GET /stream`（查询当前推流状态）
+- `GET|POST /stream?mode=auto|cloud|local`（运行时切换；失败自动恢复原管线）
 - `POST /mode?type=face|body|intro|interview|first_person`
-- `POST /profile?id=0|1`
+- `POST /profile?idx=0|1`（兼容 `id`、`profile`）
+- `POST /power?action=on|off`
 - `POST /target?x=...&y=...&z=...`
 - `POST /annotation?enabled=true|false`
 - `POST /calib?mode=0..5`
 - `POST /servo?k1=...&k2=...`
-- `POST /cmd?action=rebaseline|head_center|nrf24_reset`
+- `POST /cmd?action=rebaseline|head_center|toggle_pitch_sign|nrf24_reset`
 
 云端适配类型见 `cloud_command.cpp`。参数范围和响应格式最终以 `ctrl_server.cpp` / `cloud_command.cpp` 为准。
 
