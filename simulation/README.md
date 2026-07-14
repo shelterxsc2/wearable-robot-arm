@@ -1,48 +1,65 @@
-# Simulation 文件夹说明
+# simulation：无硬件回放与 S-curve 研究
 
-## 重要前提
-**`cmd.txt` 中的 VOFA 数据来自旧版/次新版下位机代码，非当前 `8efeb36`。**
+> 当前状态：部分覆盖。这里的“通过”不能证明机械臂实机安全，也不能证明视觉帧率。
 
-这意味着：
-- VOFA 中观察到的"频繁打断、加速度方波、急停晃动"等现象，是旧版行为的记录
-- 当前版 `8efeb36` 的改进（cmd_type 分支、runtime safe 等）是在这些数据之后加入的
-- 因此：用旧版数据验证新版逻辑时，只能做**定性对比**（趋势是否改善），不能做**定量拟合**（数值是否匹配）
+## 1. 两类仿真
 
-## 文件清单
+### 控制语义回放
 
-| 文件 | 说明 |
-|------|------|
-| `vofa_parser.py` | 解析 `../cmd.txt` 中的 VOFA 文本转义数据，提取 s,v,a 时间序列 |
-| `stm32_scurve_sim.py` | 下位机 S-curve 仿真器，复现 `Speed_Plan_Update` 完整状态机，支持 old/mid/current 三版本切换 |
+`control_replay.py` 读取 JSONL 事件，模拟模式、FIRST_PERSON 固定目标和头姿到 J4/J5 的结果。它用于验证从 trial0 吸收的控制语义没有破坏基础映射。
 
-## 下位机仿真方法概述
+```bash
+python3 simulation/control_replay.py simulation/example_first_person.jsonl
+python3 -m unittest tests.test_control_replay
+```
 
-`stm32_scurve_sim.py` 的核心是逐周期（dt=1ms）复现下位机代码：
+### STM32 S-curve 对比
 
-1. **事件驱动**：模拟 UART 接收新指令的时刻，触发 `state = init`
-2. **完整状态机**：idle → init → phase1→2→3→3_end→4→5→6→7，每个相位的积分公式与下位机 C 代码逐行对应
-3. **版本差异**：
-   - `old`：无条件 `init→phase1`，无 runtime safe，无 cmd_type 分支
-   - `mid`：推测次新版行为——强制制动检查，无分层决策，无条件降速
-   - `current`：`8efeb36` 完整逻辑——120% clamp + 制动距离迭代 + 0.6f 智能跳转 + phase5 runtime safe
-4. **简化跟踪**：用一阶惯性模型模拟电机实际位置跟随规划轨迹（`actual += (plan - actual) * 0.05`）
+`stm32_scurve_sim.py` 按 1 ms 周期复现旧/mid/current 三种规划逻辑，用于研究新目标打断、制动和短距离行为。相关 `analyze_*`、`compare_*`、`check_*` 和图片是历史分析工具/产物。
 
-## 用法示例
+重要：部分 VOFA 数据来自旧版或次新版下位机，而不是当前 H7 固件。它们只能做趋势对比，不能作为当前固件的定量拟合依据。
+
+## 2. 文件索引
+
+| 文件 | 作用 | 当前建议 |
+|---|---|---|
+| `control_replay.py` | FIRST_PERSON/模式语义回放 | 当前回归入口。|
+| `example_first_person.jsonl` | 示例事件 | 可扩充云端/蓝牙样例。|
+| `stm32_scurve_sim.py` | old/mid/current S-curve | 控制研究；需核对固件版本。|
+| `vofa_parser.py` | 解析历史 VOFA 文本 | 历史数据工具。|
+| `compare_versions*.py` | 多版本绘图比较 | 研究脚本，部分参数可能过期。|
+| `analyze_*`, `check_*` | 针对具体日志的分析 | 使用前阅读脚本输入假设。|
+| `jitter_sim.py` | 抖动/死区研究 | 概念验证。|
+
+`jitter_sim.py` 目前仍硬编码旧 `/home/elf/work/twice/simulation` 导入路径，因此不满足独立运行要求；它被保留为历史研究脚本。继续使用前应改为本目录相对导入并增加测试。`scenario-intro-mode/` 中的旧绝对路径同理，但该目录已归档。
+
+## 3. S-curve 示例
 
 ```python
 from stm32_scurve_sim import simulate_events
 
-# 模拟：长距离运动后收到微调指令
 events = [
-    (0.0, 1.50, 0x01),   # 长距离启动
-    (6.0, 1.52, 0x01),   # idle 后微调
+    (0.0, 1.50, 0x01),
+    (6.0, 1.52, 0x01),
 ]
-result = simulate_events(events, version='current', dt=0.001)
-# result 包含 t, target, s, v, a, state 数组
+result = simulate_events(events, version="current", dt=0.001)
 ```
 
-## 待办
+运行前应在实验记录中注明：使用的上位机提交、H7 固件提交、版本参数和输入日志来源。
 
-- [ ] 用户上传上位机仿真 Python 文件
-- [ ] 对比上位机与下位机仿真方法的一致性
-- [ ] 用两套仿真联合运行，验证参数鲁棒性
+## 4. 明确不覆盖
+
+- 摄像头、RGA、RKNN 和推流 FPS；
+- NRF24/IMU2 噪声、丢包和姿态标定；
+- UART 字节级时序与 H7 实际握手；
+- 电机/减速器真实动力学、柔性、负载和碰撞；
+- 云端网络延迟、乱序和重连；
+- 手势误识别和多来源控制冲突。
+
+## 5. 推荐扩展
+
+1. 保存真实云端下行 JSONL 并加入 parser 回放。
+2. 给 control router 增加来源冲突、租约和超时测试。
+3. 加入手势 stable/release/cooldown 的纯状态机测试后，再考虑接控制。
+4. 将当前 H7 固件参数以版本化配置导入 S-curve 仿真。
+5. 如要研究安全空间，另建带关节限位和碰撞模型的仿真，不在现有一维 S-curve 上过度推断。

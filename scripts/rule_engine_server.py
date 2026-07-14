@@ -17,11 +17,12 @@ import socket
 import os
 import sys
 import traceback
+from pathlib import Path
 import numpy as np
 from rknnlite.api import RKNNLite
 
 SOCK_PATH = "/tmp/rule_engine.sock"
-MODEL_PATH = "/home/elf/work/twice/models/rule_engine_v2.rknn"
+MODEL_PATH = str(Path(__file__).resolve().parent.parent / "models" / "rule_engine_v2.rknn")
 
 INPUT_FMT = "44f20f7q"
 INPUT_SIZE = struct.calcsize(INPUT_FMT)   # 312

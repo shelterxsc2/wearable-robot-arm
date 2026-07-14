@@ -30,6 +30,8 @@ static int g_uart_fd = -1;
 static pthread_t g_recv_thread;
 static std::atomic<int> g_recv_running{0};
 static uart_pose_callback_t g_pose_cb = NULL;
+/* All producers share one physical UART writer. */
+static pthread_mutex_t g_uart_tx_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* 运动完成状态: 1=完成/空闲, 0=运动中 */
 volatile int g_uart_move_complete = 0;
@@ -235,10 +237,10 @@ void uart_cleanup(void)
 
 int uart_send_raw(const uint8_t* data, size_t len)
 {
-    if (g_uart_fd < 0) return -1;
-
-    // 握手延时期间禁止发送（FF验证帧已在此前发出）
-    if (g_uart_block_tx) {
+    if (!data || len == 0) return -1;
+    pthread_mutex_lock(&g_uart_tx_mutex);
+    if (g_uart_fd < 0 || g_uart_block_tx) {
+        pthread_mutex_unlock(&g_uart_tx_mutex);
         return -1;
     }
 
@@ -251,11 +253,32 @@ int uart_send_raw(const uint8_t* data, size_t len)
     ssize_t w = write(g_uart_fd, data, len);
     if ((size_t)w != len) {
         fprintf(stderr, "[UART] write failed: %zd/%zu (%s)\n", w, len, strerror(errno));
+        pthread_mutex_unlock(&g_uart_tx_mutex);
         return -1;
     }
     tcdrain(g_uart_fd);  /* 等待发送完成 */
+    pthread_mutex_unlock(&g_uart_tx_mutex);
     return 0;
 }
+
+static int uart_send_power_pattern(uint8_t first)
+{
+    uint8_t frame[10];
+    uint8_t second = first == 0xFF ? 0xAA : 0xFF;
+    for (int i = 0; i < 10; ++i) frame[i] = (i % 2 == 0) ? first : second;
+    pthread_mutex_lock(&g_uart_tx_mutex);
+    if (g_uart_fd < 0) {
+        pthread_mutex_unlock(&g_uart_tx_mutex);
+        return -1;
+    }
+    ssize_t written = write(g_uart_fd, frame, sizeof(frame));
+    if (written == (ssize_t)sizeof(frame)) tcdrain(g_uart_fd);
+    pthread_mutex_unlock(&g_uart_tx_mutex);
+    return written == (ssize_t)sizeof(frame) ? 0 : -1;
+}
+
+int uart_send_power_on(void) { return uart_send_power_pattern(0xFF); }
+int uart_send_power_off(void) { return uart_send_power_pattern(0xAA); }
 
 int uart_recv_raw(uint8_t* buf, size_t max_len, int timeout_ms)
 {

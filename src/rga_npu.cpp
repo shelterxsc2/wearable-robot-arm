@@ -5,6 +5,10 @@
 #include "uart_comm.h"
 #include "nrf24_linux.h"
 #include "imu2_i2c.h"
+#include "first_person_control.h"
+#include "gesture_overlay.h"
+#include "control_router.h"
+#include "rule_mode_control.h"
 #include <rknn_api.h>
 #include <cstddef>
 #include <im2d.h>
@@ -32,10 +36,12 @@
 #define NMS_THRESHOLD       0.45f
 #define MAX_DETECTIONS      10
 #define KPT_CONF_THRESHOLD  0.30f
-#define RULE_MODEL_PATH     "./models/mode_rule_engine_fp16.rknn"
 
 // ========== 全局变量 ==========
 static std::atomic<PoseMode> g_mode{MODE_FACE};
+static std::atomic<float> g_first_person_x_cm{-20.0f};
+static std::atomic<float> g_first_person_y_cm{30.0f};
+static std::atomic<float> g_first_person_z_cm{20.0f};
 static std::atomic<int> g_intro_reset_request{1};
 static std::atomic<int> g_interview_reset_request{1};
 
@@ -70,6 +76,7 @@ static int64_t g_rule_c_hold = 0;      // output[3] center_hold
 static int64_t g_rule_n_hold = 0;      // output[4] neutral_hold
 static int64_t g_rule_r_miss = 0;      // output[5] right_keep_miss
 static int64_t g_rule_l_miss = 0;      // output[6] left_keep_miss
+static RuleModeControlState g_rule_mode_control;
 
 static int g_frame_count = 0;
 static int npu_initialized = 0;
@@ -464,6 +471,71 @@ typedef struct {
     float score;
     Keypoint kps[MAX_KEYPOINTS];
 } PoseDetection;
+
+static std::vector<GestureHandRoi> gesture_hand_rois(
+    const std::vector<PoseDetection>& detections, int img_w, int img_h)
+{
+    std::vector<GestureHandRoi> out;
+    if (detections.empty()) return out;
+    const PoseDetection& det = detections[0];
+    const int wrists[2] = {9, 10};
+    const int elbows[2] = {7, 8};
+    const int shoulders[2] = {5, 6};
+    float body_w = std::max(1.0f, det.x2 - det.x1);
+    float shoulder_ref = body_w * 0.36f;
+    const Keypoint& ls = det.kps[5];
+    const Keypoint& rs = det.kps[6];
+    if (ls.visibility > KPT_CONF_THRESHOLD && rs.visibility > KPT_CONF_THRESHOLD) {
+        float sx = ls.x - rs.x, sy = ls.y - rs.y;
+        float sd = std::sqrt(sx * sx + sy * sy);
+        if (sd > 8.0f && sd < img_w * 0.85f) shoulder_ref = sd;
+    }
+    for (int side = 0; side < 2; ++side) {
+        const Keypoint& wrist = det.kps[wrists[side]];
+        const Keypoint& elbow = det.kps[elbows[side]];
+        const Keypoint& shoulder = det.kps[shoulders[side]];
+        // Trial0 gesture commands are deliberately gated by a visible raised
+        // hand. Image y grows downwards, so wrist.y < shoulder.y means raised.
+        if (wrist.visibility <= 0.75f || elbow.visibility <= KPT_CONF_THRESHOLD ||
+            shoulder.visibility <= KPT_CONF_THRESHOLD || wrist.y >= shoulder.y) continue;
+        float dx = wrist.x - elbow.x, dy = wrist.y - elbow.y;
+        float forearm = std::sqrt(dx * dx + dy * dy);
+        if (forearm < 1.0f || forearm > body_w * 1.20f) continue;
+        float expected = shoulder_ref * 0.95f;
+        float effective = forearm + std::max(0.0f, expected - forearm) * 0.90f;
+        float cx = wrist.x + dx / forearm * effective * 0.35f;
+        float cy = wrist.y + dy / forearm * effective * 0.35f;
+        // Keep the crop square at frame edges.  Shrinking width/height
+        // independently creates invalid NV12 RGA crops (for example 48x352).
+        int max_side = std::min(360, std::min(img_w, img_h));
+        max_side = (max_side / 16) * 16;
+        if (max_side < 96) continue;
+        int size = std::max(96, std::min(max_side, (int)(effective * 1.80f)));
+        size = (size / 16) * 16;
+        int x = (int)std::lround(cx) - size / 2;
+        int y = (int)std::lround(cy) - size / 2;
+        x = std::max(0, std::min(x, img_w - size));
+        y = std::max(0, std::min(y, img_h - size));
+        x &= ~1;
+        y &= ~1;
+        out.push_back({x, y, size, size, side});
+    }
+    if (out.size() == 2) {
+        const GestureHandRoi& a = out[0];
+        const GestureHandRoi& b = out[1];
+        bool overlap = !(a.x + a.width < b.x || b.x + b.width < a.x ||
+                         a.y + a.height < b.y || b.y + b.height < a.y);
+        if (overlap) out.clear();
+    }
+    return out;
+}
+
+static void update_gesture_rois(const std::vector<PoseDetection>& detections,
+                                int img_w, int img_h)
+{
+    std::vector<GestureHandRoi> rois = gesture_hand_rois(detections, img_w, img_h);
+    gesture_overlay_set_hand_rois(rois.empty() ? nullptr : rois.data(), (int)rois.size());
+}
 
 // ========== One Euro Filter + Face Tracker ==========
 #ifndef M_PI
@@ -1136,6 +1208,9 @@ static inline void axisProjectionYawPitch(const cv::Mat& R,
 /* A-inverse R_init 捕获标志 */
 volatile int g_r_init_set = 0;
 volatile int g_head_center_request = 1;
+static std::atomic<int> g_nrf_rebaseline_request{0};
+
+void request_nrf_rebaseline(void) { g_nrf_rebaseline_request.store(1); }
 
 /* 独立的 NRF24 IMU 控制链路：俯仰控制（仿照偏航控制架构） */
 void nrf24_control_update(void)
@@ -1191,6 +1266,22 @@ void nrf24_control_update(void)
     /* PnP 视觉零飘修正：累积修正矩阵 */
     static const float KI_PNP = 0.04f;
     static cv::Mat R_bias_total;
+
+    if (g_nrf_rebaseline_request.exchange(0)) {
+        R_init.release();
+        R_imu2_init.release();
+        R_head_center_rel.release();
+        R_rel_latest.release();
+        R_bias_total.release();
+        yaw_baseline_set = false;
+        pitch_baseline_set = false;
+        head_center_set = false;
+        predictor.reset();
+        predictor_yaw.reset();
+        g_r_init_set = 0;
+        g_head_center_request = 1;
+        std::printf("[NRF] control baseline reset requested\n");
+    }
 
     /* A-init 触发信号由握手线程控制 (g_wait_a_init) */
 
@@ -1903,6 +1994,42 @@ void nrf24_control_update(void)
 
     float pitch_control_deg = (float)g_head_pitch_control_sign.load() * vec_pitch;
     float yaw_control_deg = vec_yaw;
+
+    /* FIRST_PERSON keeps the arm framing point fixed and moves only J4/J5.
+     * It deliberately bypasses the spatial endpoint predictor used by FACE. */
+    static bool fp_control_active = false;
+    if (mode != MODE_FIRST_PERSON) fp_control_active = false;
+    if (mode == MODE_FIRST_PERSON) {
+        static uint64_t fp_last_cmd_us = 0;
+        static float fp_last_j4 = 10.0f;
+        static float fp_last_j5 = 180.0f;
+        const float FP_SERVO_DEADBAND_DEG = 2.0f;
+        const uint64_t FP_MIN_PERIOD_US = 150000;
+
+        FirstPersonServoTarget fp =
+            first_person_map_head(yaw_control_deg, pitch_control_deg);
+        float j4 = fp.j4_deg;
+        float j5 = fp.j5_deg;
+
+        bool changed = !fp_control_active ||
+                       std::fabs(j4 - fp_last_j4) >= FP_SERVO_DEADBAND_DEG ||
+                       std::fabs(j5 - fp_last_j5) >= FP_SERVO_DEADBAND_DEG;
+        if (changed && now_us - fp_last_cmd_us >= FP_MIN_PERIOD_US) {
+            float x = g_first_person_x_cm.load();
+            float y = g_first_person_y_cm.load();
+            float z = g_first_person_z_cm.load();
+            if (uart_send_arm_target(x, y, z, j5, j4, 0x01) == 0) {
+                fp_last_j4 = j4;
+                fp_last_j5 = j5;
+                fp_last_cmd_us = now_us;
+                fp_control_active = true;
+                printf("[FIRST-PERSON-CMD] x=%.1f y=%.1f z=%.1f j5=%.1f j4=%.1f "
+                       "vec_yaw=%+.2f vec_pitch=%+.2f\n",
+                       x, y, z, j5, j4, yaw_control_deg, pitch_control_deg);
+            }
+        }
+        return;
+    }
 
     /* 基准标定（A-inverse 后初始姿态已归零，标量 baseline 不再需要） */
     if (!pitch_baseline_set) {
@@ -3914,8 +4041,131 @@ static int init_rule_engine(void) {
     return 0;
 }
 
+static void run_rule_engine(const PoseDetection& det,
+                            bool face_landmarks_valid,
+                            int img_lm_x, int img_lm_y,
+                            int img_rm_x, int img_rm_y,
+                            int img_chin_x, int img_chin_y,
+                            uint8_t *nv12, int width, int height)
+{
+    static uint64_t last_reconnect_try_us = 0;
+    if (g_rule_sock < 0) {
+        uint64_t now = get_us();
+        if (now - last_reconnect_try_us < 1000000ULL) return;
+        last_reconnect_try_us = now;
+        if (init_rule_engine() != 0) return;
+    }
+
+    float kpts_20[20][2]{};
+    float valid_mask[20]{};
+    // Match the existing RKNN model's observer-view left/right convention.
+    static const int LR_PAIRS[8][2] = {
+        {1,2}, {3,4}, {5,6}, {7,8}, {9,10}, {11,12}, {13,14}, {15,16}
+    };
+    for (int i = 0; i < 17; ++i) {
+        int coco_idx = i;
+        for (int p = 0; p < 8; ++p) {
+            if (LR_PAIRS[p][0] == i) { coco_idx = LR_PAIRS[p][1]; break; }
+            if (LR_PAIRS[p][1] == i) { coco_idx = LR_PAIRS[p][0]; break; }
+        }
+        if (det.kps[coco_idx].visibility > KPT_CONF_THRESHOLD) {
+            kpts_20[i][0] = det.kps[coco_idx].x;
+            kpts_20[i][1] = det.kps[coco_idx].y;
+            valid_mask[i] = 1.0f;
+        }
+    }
+    if (face_landmarks_valid) {
+        kpts_20[17][0] = (float)img_lm_x;   kpts_20[17][1] = (float)img_lm_y;
+        kpts_20[18][0] = (float)img_rm_x;   kpts_20[18][1] = (float)img_rm_y;
+        kpts_20[19][0] = (float)img_chin_x; kpts_20[19][1] = (float)img_chin_y;
+        valid_mask[17] = valid_mask[18] = valid_mask[19] = 1.0f;
+    }
+
+    float kpts_flat[40];
+    for (int i = 0; i < 20; ++i) {
+        kpts_flat[i * 2] = kpts_20[i][0];
+        kpts_flat[i * 2 + 1] = kpts_20[i][1];
+    }
+    float bbox[4] = {det.x1, det.y1, det.x2, det.y2};
+    int64_t state_fb[7] = {
+        g_rule_state, g_rule_r_hold, g_rule_l_hold,
+        g_rule_c_hold, g_rule_n_hold, g_rule_r_miss, g_rule_l_miss
+    };
+    unsigned int expected_generation = control_get_mode_generation();
+
+    for (int retry = 0; retry < 2; ++retry) {
+        if (g_rule_sock < 0 && init_rule_engine() != 0) break;
+
+        bool send_ok = true;
+        ssize_t n = send(g_rule_sock, kpts_flat, sizeof(kpts_flat),
+                         MSG_MORE | MSG_NOSIGNAL);
+        if (n != (ssize_t)sizeof(kpts_flat)) send_ok = false;
+        n = send(g_rule_sock, bbox, sizeof(bbox), MSG_MORE | MSG_NOSIGNAL);
+        if (n != (ssize_t)sizeof(bbox)) send_ok = false;
+        n = send(g_rule_sock, valid_mask, sizeof(valid_mask),
+                 MSG_MORE | MSG_NOSIGNAL);
+        if (n != (ssize_t)sizeof(valid_mask)) send_ok = false;
+        n = send(g_rule_sock, state_fb, sizeof(state_fb), MSG_NOSIGNAL);
+        if (n != (ssize_t)sizeof(state_fb)) send_ok = false;
+
+        if (send_ok) {
+            int64_t result[7];
+            ssize_t total = 0;
+            while (total < (ssize_t)sizeof(result)) {
+                n = recv(g_rule_sock, ((char *)result) + total,
+                         sizeof(result) - (size_t)total, 0);
+                if (n <= 0) break;
+                total += n;
+            }
+            if (total == (ssize_t)sizeof(result)) {
+                g_rule_state  = result[0];
+                g_rule_r_hold = result[1];
+                g_rule_l_hold = result[2];
+                g_rule_c_hold = result[3];
+                g_rule_n_hold = result[4];
+                g_rule_r_miss = result[5];
+                g_rule_l_miss = result[6];
+
+                RuleModeAction action = rule_mode_control_update(
+                    &g_rule_mode_control, (int)g_rule_state);
+                if (action != RULE_MODE_ACTION_NONE) {
+                    PoseMode target = action == RULE_MODE_ACTION_INTRO
+                                          ? MODE_INTRO : MODE_INTERVIEW;
+                    int ret = control_request_mode_if_generation(
+                        target, CONTROL_SOURCE_RULE_ENGINE, expected_generation);
+                    printf("[RuleCmd] %s result=%s\n",
+                           rule_mode_action_name(action),
+                           ret == 0 ? "applied" :
+                           (ret == 1 ? "stale" : "rejected"));
+                }
+
+                // Show the applied system mode, not the recurrent model's raw
+                // state. RuleEngine 1/2 -> 0 deliberately does not exit a
+                // scenario; only the confirmed ILoveYou action returns FACE.
+                PoseMode applied_mode = get_pose_mode();
+                const char *applied_mode_name = pose_mode_name(applied_mode);
+                cv::Mat y_mat(height, width, CV_8UC1, nv12);
+                cv::putText(y_mat,
+                            cv::format("Mode: %s", applied_mode_name),
+                            cv::Point(10, height - 20),
+                            cv::FONT_HERSHEY_SIMPLEX, 1.2,
+                            cv::Scalar(255), 2);
+                return;
+            }
+            printf("[RuleEngine] recv failed (%zd/%zu), reconnecting...\n",
+                   total, sizeof(result));
+        } else {
+            printf("[RuleEngine] send failed, reconnecting...\n");
+        }
+
+        close(g_rule_sock);
+        g_rule_sock = -1;
+    }
+}
+
 int init_npu() {
     printf("\n========== NPU Init ==========\n");
+    rule_mode_control_reset(&g_rule_mode_control);
 
     if (init_single_model(FACE_LM_MODEL_PATH, &face_lm_ctx, &face_lm_output_attr[0], &face_lm_output_mem[0], "FaceLM") != 0)
         return -1;
@@ -3950,6 +4200,11 @@ int init_npu() {
         return -1;
     }
 
+    if (gesture_overlay_init() != 0) {
+        printf("[WARN] Gesture overlay worker init failed; visual control will continue\n");
+    } else {
+        printf("[NPU] Gesture overlay/control worker started\n");
+    }
     printf("[NPU] Init OK (FaceLM + Body loaded)\n\n");
     npu_initialized = 1;
     return 0;
@@ -4009,6 +4264,7 @@ static void process_frame_face(uint8_t *nv12, int width, int height) {
     if (!display_dets.empty()) {
         draw_detections(nv12, width, height, display_dets, 17);
     }
+    update_gesture_rois(display_dets, width, height);
 
     if (display_dets.empty()) {
         // 无人/丢失则返回，但仍记录统计
@@ -4289,114 +4545,9 @@ static void process_frame_face(uint8_t *nv12, int width, int height) {
     }
 
 rule_engine_phase:
-
-    // ===== RuleEngine: 20 关键点手势状态推理 (Python Socket 服务) =====
-    if (g_rule_sock >= 0) {
-        float kpts_20[20][2];
-        float valid_mask[20];
-        // COCO → Observer 视角：交换 left/right 成对点
-        static const int LR_PAIRS[8][2] = {
-            {1,2}, {3,4}, {5,6}, {7,8}, {9,10}, {11,12}, {13,14}, {15,16}
-        };
-        for (int i = 0; i < 17; i++) {
-            int coco_idx = i;
-            for (int p = 0; p < 8; p++) {
-                if (LR_PAIRS[p][0] == i) { coco_idx = LR_PAIRS[p][1]; break; }
-                if (LR_PAIRS[p][1] == i) { coco_idx = LR_PAIRS[p][0]; break; }
-            }
-            if (display_dets[0].kps[coco_idx].visibility > KPT_CONF_THRESHOLD) {
-                kpts_20[i][0] = display_dets[0].kps[coco_idx].x;
-                kpts_20[i][1] = display_dets[0].kps[coco_idx].y;
-                valid_mask[i] = 1.0f;
-            } else {
-                kpts_20[i][0] = 0.0f;
-                kpts_20[i][1] = 0.0f;
-                valid_mask[i] = 0.0f;
-            }
-        }
-        if (!skip_face_lm) {
-            kpts_20[17][0] = (float)img_lm_x; kpts_20[17][1] = (float)img_lm_y;
-            kpts_20[18][0] = (float)img_rm_x; kpts_20[18][1] = (float)img_rm_y;
-            kpts_20[19][0] = (float)img_chin_x; kpts_20[19][1] = (float)img_chin_y;
-            valid_mask[17] = valid_mask[18] = valid_mask[19] = 1.0f;
-        } else {
-            kpts_20[17][0] = kpts_20[17][1] = 0.0f;
-            kpts_20[18][0] = kpts_20[18][1] = 0.0f;
-            kpts_20[19][0] = kpts_20[19][1] = 0.0f;
-            valid_mask[17] = valid_mask[18] = valid_mask[19] = 0.0f;
-        }
-
-        // flatten kpts: interleaved [x0,y0, x1,y1, ..., x19,y19] for reshape(1,20,2)
-        float kpts_flat[40];
-        for (int i = 0; i < 20; i++) {
-            kpts_flat[i * 2]     = kpts_20[i][0];
-            kpts_flat[i * 2 + 1] = kpts_20[i][1];
-        }
-
-        // bbox [x1, y1, x2, y2] for rule_engine_v2.rknn
-        float bbox[4] = {
-            display_dets[0].x1,
-            display_dets[0].y1,
-            display_dets[0].x2,
-            display_dets[0].y2
-        };
-
-        int64_t state_fb[7] = {
-            g_rule_state, g_rule_r_hold, g_rule_l_hold,
-            g_rule_c_hold, g_rule_n_hold, g_rule_r_miss, g_rule_l_miss
-        };
-
-        // v2 protocol: 44f(kpts+bbox) + 20f(valid_mask) + 7q(state_fb) = 312 bytes
-        for (int retry = 0; retry < 2; retry++) {
-            if (g_rule_sock < 0 && init_rule_engine() != 0) break;
-
-            bool send_ok = true;
-            ssize_t n = send(g_rule_sock, kpts_flat, sizeof(kpts_flat), MSG_MORE | MSG_NOSIGNAL);
-            if (n != sizeof(kpts_flat)) send_ok = false;
-            n = send(g_rule_sock, bbox, sizeof(bbox), MSG_MORE | MSG_NOSIGNAL);
-            if (n != sizeof(bbox)) send_ok = false;
-            n = send(g_rule_sock, valid_mask, sizeof(valid_mask), MSG_MORE | MSG_NOSIGNAL);
-            if (n != sizeof(valid_mask)) send_ok = false;
-            n = send(g_rule_sock, state_fb, sizeof(state_fb), MSG_NOSIGNAL);
-            if (n != sizeof(state_fb)) send_ok = false;
-
-            if (send_ok) {
-                int64_t result[7];
-                ssize_t total = 0;
-                while (total < (ssize_t)sizeof(result)) {
-                    n = recv(g_rule_sock, ((char*)result) + total, sizeof(result) - total, 0);
-                    if (n <= 0) break;
-                    total += n;
-                }
-                if (total == sizeof(result)) {
-                    g_rule_state  = result[0];
-                    g_rule_r_hold = result[1];
-                    g_rule_l_hold = result[2];
-                    g_rule_c_hold = result[3];
-                    g_rule_n_hold = result[4];
-                    g_rule_r_miss = result[5];
-                    g_rule_l_miss = result[6];
-
-                    // 画面左下角打印 state
-                    const char* state_names[] = {"Idle", "Mode1", "Mode2"};
-                    int s = (int)g_rule_state;
-                    if (s < 0 || s > 2) s = 0;
-                    cv::Mat y_mat(height, width, CV_8UC1, nv12);
-                    cv::putText(y_mat, cv::format("State: %s", state_names[s]),
-                                cv::Point(10, height - 20),
-                                cv::FONT_HERSHEY_SIMPLEX, 1.2, cv::Scalar(255), 2);
-                    break;  // success
-                } else {
-                    printf("[RuleEngine] recv failed (%zd/%zu), reconnecting...\n", total, sizeof(result));
-                }
-            } else {
-                printf("[RuleEngine] send failed, reconnecting...\n");
-            }
-
-            // close and retry
-            close(g_rule_sock); g_rule_sock = -1;
-        }
-    }
+    run_rule_engine(*best_det, !skip_face_lm,
+                    img_lm_x, img_lm_y, img_rm_x, img_rm_y,
+                    img_chin_x, img_chin_y, nv12, width, height);
 
     // 记录统计
     int idx = g_stat_idx;
@@ -4409,7 +4560,7 @@ rule_engine_phase:
     g_stat[idx].encode_push_us    = g_next_encode_push_us; g_next_encode_push_us = 0;
     g_stat[idx].total_us          = t7 - t0;
     g_stat_idx = (g_stat_idx + 1) % STAT_WINDOW;
-    /* if (++g_stat_count % STAT_WINDOW == 0) print_pipeline_stats(); */
+    if (++g_stat_count % STAT_WINDOW == 0) print_pipeline_stats();
 }
 
 static void process_frame_body(uint8_t *nv12, int width, int height) {
@@ -4472,6 +4623,17 @@ static void process_frame_body(uint8_t *nv12, int width, int height) {
         draw_detections(nv12, width, height, display_dets, 17);
         // BODY模式不画3D人脸姿态
     }
+    if (mode == MODE_INTRO || mode == MODE_INTERVIEW) {
+        update_gesture_rois(display_dets, width, height);
+        // Keep the recurrent RuleEngine feedback alive in scenario modes, as
+        // trial0 does. Body-only inference is sufficient here; returning to
+        // FACE remains an explicit ILoveYou gesture action.
+        if (!detections.empty()) {
+            run_rule_engine(detections[0], false,
+                            0, 0, 0, 0, 0, 0,
+                            nv12, width, height);
+        }
+    }
     if (mode == MODE_INTRO) {
         update_intro_control(nv12, width, height, display_dets);
     } else if (mode == MODE_INTERVIEW) {
@@ -4490,23 +4652,35 @@ static void process_frame_body(uint8_t *nv12, int width, int height) {
     g_stat[idx].encode_push_us    = g_next_encode_push_us; g_next_encode_push_us = 0;
     g_stat[idx].total_us          = t6 - t0;
     g_stat_idx = (g_stat_idx + 1) % STAT_WINDOW;
-    /* if (++g_stat_count % STAT_WINDOW == 0) print_pipeline_stats(); */
+    if (++g_stat_count % STAT_WINDOW == 0) print_pipeline_stats();
 }
 
 void process_frame(uint8_t *nv12, int width, int height) {
     g_frame_count++;
     if (!npu_initialized) return;
 
+    static std::vector<uint8_t> raw_frame;
+    bool annotation_enabled = control_get_annotation_enabled() != 0;
+    if (!annotation_enabled) {
+        raw_frame.assign(nv12, nv12 + (size_t)width * height * 3 / 2);
+    }
+    gesture_overlay_set_hand_rois(nullptr, 0);
     PoseMode mode = get_pose_mode();
     if (mode == MODE_FACE) {
         process_frame_face(nv12, width, height);
     } else {
         process_frame_body(nv12, width, height);
     }
+    gesture_overlay_submit_latest(nv12, width, height);
+    gesture_overlay_draw(nv12, width, height);
+    if (!annotation_enabled && raw_frame.size() == (size_t)width * height * 3 / 2) {
+        memcpy(nv12, raw_frame.data(), raw_frame.size());
+    }
 }
 
 // ========== 清理 ==========
 void cleanup_npu() {
+    gesture_overlay_shutdown();
     if (face_lm_output_mem[1]) rknn_destroy_mem(face_lm_ctx, face_lm_output_mem[1]);
     if (face_lm_output_mem[0]) rknn_destroy_mem(face_lm_ctx, face_lm_output_mem[0]);
     if (body_output_mem) rknn_destroy_mem(body_ctx, body_output_mem);
@@ -4518,6 +4692,7 @@ void cleanup_npu() {
         close(g_rule_sock);
         g_rule_sock = -1;
     }
+    rule_mode_control_reset(&g_rule_mode_control);
 
     pose_filter_init = false;
     have_prev_pose = false;
@@ -4556,12 +4731,22 @@ static void send_face_home_from_scenario(void) {
     }
 }
 
+int send_face_home_pose(void) {
+    const ArmKinematicsProfile& profile = current_arm_profile();
+    return uart_send_arm_target(0.0f, profile.l4 + profile.l3,
+                                profile.l2 + profile.l1,
+                                clampf(profile.servo2_baseline, 0.0f, 270.0f),
+                                clampf(profile.servo1_baseline, -90.0f, 90.0f),
+                                0x01);
+}
+
 // ========== Mode控制 ==========
 void set_pose_mode(PoseMode mode) {
     PoseMode old_mode = g_mode.load();
     bool exiting_scenario_to_face =
         mode == MODE_FACE &&
-        (old_mode == MODE_INTRO || old_mode == MODE_INTERVIEW);
+        (old_mode == MODE_INTRO || old_mode == MODE_INTERVIEW ||
+         old_mode == MODE_FIRST_PERSON);
     if (exiting_scenario_to_face) {
         send_face_home_from_scenario();
     }
@@ -4571,6 +4756,15 @@ void set_pose_mode(PoseMode mode) {
         g_intro_reset_request.store(1);
     } else if (mode == MODE_INTERVIEW && old_mode != MODE_INTERVIEW) {
         g_interview_reset_request.store(1);
+    } else if (mode == MODE_FIRST_PERSON && old_mode != MODE_FIRST_PERSON) {
+        float x = g_first_person_x_cm.load();
+        float y = g_first_person_y_cm.load();
+        float z = g_first_person_z_cm.load();
+        if (uart_send_arm_target(x, y, z, 180.0f, 10.0f, 0x01) == 0) {
+            printf("[FirstPerson] initial pose x=%.1f y=%.1f z=%.1f J5=180.0 J4=10.0\n",
+                   x, y, z);
+        }
+        g_head_center_request = 1;
     } else if (exiting_scenario_to_face) {
         g_head_center_request = 1;
         printf("[ModeHome] requested head IMU center recapture for FACE\n");
@@ -4587,7 +4781,20 @@ const char* pose_mode_name(PoseMode mode) {
     if (mode == MODE_BODY) return "BODY";
     if (mode == MODE_INTRO) return "INTRO";
     if (mode == MODE_INTERVIEW) return "INTERVIEW";
+    if (mode == MODE_FIRST_PERSON) return "FIRST_PERSON";
     return "UNKNOWN";
+}
+
+void set_first_person_target(float x, float y, float z) {
+    g_first_person_x_cm.store(x);
+    g_first_person_y_cm.store(y);
+    g_first_person_z_cm.store(z);
+}
+
+void get_first_person_target(float *x, float *y, float *z) {
+    if (x) *x = g_first_person_x_cm.load();
+    if (y) *y = g_first_person_y_cm.load();
+    if (z) *z = g_first_person_z_cm.load();
 }
 
 void set_arm_profile(int profile) {

@@ -212,6 +212,66 @@ int ws_send_text(int sock, const char *text) {
     return 0;
 }
 
+int ws_recv_text(int sock, char *text, int capacity) {
+    static int state_sock = -1;
+    static unsigned char pending[8192];
+    static size_t used = 0;
+    if (sock < 0 || !text || capacity < 2) return -1;
+    if (state_sock != sock) { state_sock = sock; used = 0; }
+
+    if (used == sizeof(pending)) {
+        used = 0;
+        return -1;
+    }
+
+    ssize_t n = recv(sock, pending + used, sizeof(pending) - used, MSG_DONTWAIT);
+    if (n == 0) return -1;
+    if (n > 0) used += (size_t)n;
+    else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return -1;
+    if (used < 2) return 0;
+
+    size_t pos = 2;
+    unsigned int opcode = pending[0] & 0x0f;
+    int masked = (pending[1] & 0x80) != 0;
+    unsigned long long payload_len = pending[1] & 0x7f;
+    if (payload_len == 126) {
+        if (used < 4) return 0;
+        payload_len = ((unsigned long long)pending[2] << 8) | pending[3];
+        pos = 4;
+    } else if (payload_len == 127) {
+        if (used < 10) return 0;
+        payload_len = 0;
+        for (int i = 0; i < 8; ++i) payload_len = (payload_len << 8) | pending[2 + i];
+        pos = 10;
+    }
+    unsigned char mask[4] = {0, 0, 0, 0};
+    if (masked) {
+        if (used < pos + 4) return 0;
+        memcpy(mask, pending + pos, 4);
+        pos += 4;
+    }
+    if (payload_len > sizeof(pending)) { used = 0; return -1; }
+    if (used < pos + payload_len) return 0;
+    size_t frame_len = pos + (size_t)payload_len;
+
+    if (opcode == 0x8) { used = 0; return -1; }
+    if (opcode != 0x1) {
+        memmove(pending, pending + frame_len, used - frame_len);
+        used -= frame_len;
+        return 0;
+    }
+    size_t out_len = (size_t)payload_len;
+    if (out_len >= (size_t)capacity) out_len = (size_t)capacity - 1;
+    for (size_t i = 0; i < out_len; ++i) {
+        unsigned char value = pending[pos + i];
+        text[i] = (char)(masked ? (value ^ mask[i % 4]) : value);
+    }
+    text[out_len] = '\0';
+    memmove(pending, pending + frame_len, used - frame_len);
+    used -= frame_len;
+    return (int)out_len;
+}
+
 void ws_close(int sock) {
     if (sock >= 0) close(sock);
 }

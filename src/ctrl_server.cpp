@@ -4,6 +4,8 @@
  * 不依赖外部 HTTP 库，基于标准 socket 实现
  */
 #include "ctrl_server.h"
+#include "control_router.h"
+#include "arm_power_control.h"
 #include "rga_npu.h"
 #include "uart_comm.h"
 #include "nrf24_linux.h"
@@ -81,38 +83,85 @@ static void handle_client(int client)
         /* 返回系统状态 */
         PoseMode mode = get_pose_mode();
         StreamType st = get_current_stream_type();
-        char json[512];
+        float fp_x = 0.0f, fp_y = 0.0f, fp_z = 0.0f;
+        get_first_person_target(&fp_x, &fp_y, &fp_z);
+        char json[768];
         snprintf(json, sizeof(json),
                  "{\"pose_mode\":\"%s\",\"stream_type\":\"%s\","
-                 "\"uart_move_complete\":%d,\"head_stationary\":%d,\"arm_stable\":%d}"
+                 "\"arm_profile\":\"%s\",\"mode_generation\":%u,"
+                 "\"annotation\":%s,\"first_person_target\":[%.1f,%.1f,%.1f],"
+                 "\"uart_move_complete\":%d,\"head_stationary\":%d,\"arm_stable\":%d,"
+                 "\"arm_powered\":%s,\"shutdown_pending\":%s}"
                  "\n",
                  pose_mode_name(mode),
                  (st == STREAM_TYPE_RTMP) ? "rtmp" : "rtsp",
+                 arm_profile_name(get_arm_profile()),
+                 control_get_mode_generation(),
+                 control_get_annotation_enabled() ? "true" : "false",
+                 fp_x, fp_y, fp_z,
                  g_uart_move_complete,
                  g_head_stationary,
-                 g_arm_stable);
+                 g_arm_stable,
+                 arm_power_is_on() ? "true" : "false",
+                 arm_power_shutdown_in_progress() ? "true" : "false");
         send_json(client, RESP_OK, json);
     }
     else if (strcmp(method, "POST") == 0 && strncmp(path, "/mode", 5) == 0) {
         char type_val[32] = "";
         if (get_query_param(path, "type", type_val, sizeof(type_val)) == 0) {
-            if (strcmp(type_val, "face") == 0) {
-                set_pose_mode(MODE_FACE);
-                send_json(client, RESP_OK, "{\"ok\":true,\"mode\":\"face\"}\n");
-            } else if (strcmp(type_val, "body") == 0) {
-                set_pose_mode(MODE_BODY);
-                send_json(client, RESP_OK, "{\"ok\":true,\"mode\":\"body\"}\n");
-            } else if (strcmp(type_val, "intro") == 0) {
-                set_pose_mode(MODE_INTRO);
-                send_json(client, RESP_OK, "{\"ok\":true,\"mode\":\"intro\"}\n");
-            } else if (strcmp(type_val, "interview") == 0) {
-                set_pose_mode(MODE_INTERVIEW);
-                send_json(client, RESP_OK, "{\"ok\":true,\"mode\":\"interview\"}\n");
-            } else {
+            PoseMode mode;
+            if (control_mode_from_string(type_val, &mode) != 0 ||
+                control_request_mode(mode, CONTROL_SOURCE_REST) != 0) {
                 send_json(client, RESP_BAD, "{\"ok\":false,\"error\":\"invalid type\"}\n");
+            } else {
+                char json[128];
+                snprintf(json, sizeof(json), "{\"ok\":true,\"mode\":\"%s\"}\n", type_val);
+                send_json(client, RESP_OK, json);
             }
         } else {
             send_json(client, RESP_BAD, "{\"ok\":false,\"error\":\"missing type\"}\n");
+        }
+    }
+    else if (strcmp(method, "POST") == 0 && strncmp(path, "/profile", 8) == 0) {
+        char value[16] = "";
+        if (get_query_param(path, "id", value, sizeof(value)) != 0)
+            get_query_param(path, "profile", value, sizeof(value));
+        int profile = -1;
+        if (strcmp(value, "0") == 0 || strcmp(value, "mid_l3_40") == 0) profile = 0;
+        if (strcmp(value, "1") == 0 || strcmp(value, "far_l3_55") == 0) profile = 1;
+        if (control_request_profile(profile, CONTROL_SOURCE_REST) == 0) {
+            char json[160];
+            snprintf(json, sizeof(json), "{\"ok\":true,\"profile\":\"%s\"}\n",
+                     arm_profile_name(profile));
+            send_json(client, RESP_OK, json);
+        } else {
+            send_json(client, RESP_BAD, "{\"ok\":false,\"error\":\"invalid profile\"}\n");
+        }
+    }
+    else if (strcmp(method, "POST") == 0 && strncmp(path, "/target", 7) == 0) {
+        char sx[24] = "", sy[24] = "", sz[24] = "";
+        if (get_query_param(path, "x", sx, sizeof(sx)) == 0 &&
+            get_query_param(path, "y", sy, sizeof(sy)) == 0 &&
+            get_query_param(path, "z", sz, sizeof(sz)) == 0 &&
+            control_request_first_person_target((float)atof(sx), (float)atof(sy),
+                                                (float)atof(sz), CONTROL_SOURCE_REST) == 0) {
+            send_json(client, RESP_OK, "{\"ok\":true,\"target\":\"first_person\"}\n");
+        } else {
+            send_json(client, RESP_BAD, "{\"ok\":false,\"error\":\"invalid target\"}\n");
+        }
+    }
+    else if (strcmp(method, "POST") == 0 && strncmp(path, "/annotation", 11) == 0) {
+        char enabled[16] = "";
+        if (get_query_param(path, "enabled", enabled, sizeof(enabled)) == 0 &&
+            (strcmp(enabled, "0") == 0 || strcmp(enabled, "1") == 0 ||
+             strcmp(enabled, "true") == 0 || strcmp(enabled, "false") == 0)) {
+            int on = strcmp(enabled, "0") != 0 && strcmp(enabled, "false") != 0;
+            control_set_annotation_enabled(on, CONTROL_SOURCE_REST);
+            send_json(client, RESP_OK,
+                      on ? "{\"ok\":true,\"annotation\":true}\n" :
+                           "{\"ok\":true,\"annotation\":false}\n");
+        } else {
+            send_json(client, RESP_BAD, "{\"ok\":false,\"error\":\"invalid enabled\"}\n");
         }
     }
     else if (strcmp(method, "POST") == 0 && strncmp(path, "/calib", 6) == 0) {

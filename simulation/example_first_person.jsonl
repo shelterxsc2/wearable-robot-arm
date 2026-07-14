@@ -1,0 +1,6 @@
+{"type":"mode","mode":"first_person","source":"cloud"}
+{"type":"target","x":-17,"y":35,"z":20}
+{"type":"head","yaw":5,"pitch":6}
+{"type":"head","yaw":120,"pitch":-200}
+{"type":"mode","mode":"face","source":"gesture"}
+{"type":"head","yaw":5,"pitch":6}

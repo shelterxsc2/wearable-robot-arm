@@ -1,108 +1,131 @@
-# ELF2 (RK3588) 可穿戴机械臂上位机系统
+# fourth 项目架构
 
-## 一、当前快照
+> 当前代码快照：2026-07-13。迁移来源和未完成验收见 `MIGRATION.md` 与 `HANDOFF.md`。
 
-当前分支为 `imu-victor-hat`，标签语义为 `imu-pnp-fuse1.0`。活跃主控路径是：
+## 1. 系统目标
 
-```
-NRF24 无线 IMU → A-inverse 姿态解耦 → 8 状态运动预测
-    → 球坐标目标 + J4/J5 舵机映射
-    → UART 11 字节帧(flag=0x00/0x01) → STM32
-```
+在 RK3588 上将视觉、头部/腰部姿态、云端/本地命令和机械臂 H7 控制组合成单一上位机，同时保持实时推流和可扩展情景模式。
 
-视觉链路仍在运行：Body YOLO-Pose + Face Landmark 468 + 12 点 PnP + OSD/推流。与旧记录不同，PnP 结果现在已经接入 IMU 控制线程，用于静止态 yaw 零飘修正；但该修正仍是实验态。
+## 2. 硬件边界
 
-## 二、硬件与通信
+| 设备 | 职责 |
+|---|---|
+| RK3588 ELF2 | 本项目运行平台；视觉、控制语义、通信和推流。|
+| STM32H723 | 逆运动学、S-curve、电机/舵机执行。|
+| USB Camera | 1920×1080 视频输入。|
+| NRF24 头部 IMU | 头姿/角速度输入。|
+| 板载 IMU2 | 双 IMU 相对姿态参考。|
+| `/dev/ttyS9` | RK3588 到 H7 的机械臂通信。|
 
-- **上位机**：RK3588 (ELF2)，负责 NRF24 接收、运动预测、NPU/RGA 推理、RTMP/RTSP 推流、WebSocket 心跳、端侧 HTTP API、UART 下发。
-- **下位机**：STM32H723，负责逆运动学、S-curve 轨迹规划、电机和舵机驱动。
-- **摄像头**：Realtek USB Camera (`/dev/video21`)，当前管线按 YUY2 1920x1080@30fps 处理。
-- **无线 IMU**：NRF24L01+ + 陀螺仪，22B payload，包含角度帧和角速度帧。
-- **UART**：`/dev/ttyS9` @ 115200，主控下发 11 字节裸帧：`x,y,z,k1,k2` 五个 int16 小端 + 1 字节 flag。
-- **flag**：`0x00` 表示预测坐标，`0x01` 表示确定/静止态坐标。
+本项目不需要额外 STM32 bridge。
 
-## 三、已完成模块
+## 3. 运行时架构
 
-### NRF24 IMU 控制链路
+```text
+REST ───────┐
+Cloud WS ───┤
+Bluetooth ──┼→ control_router → mode/profile/target/annotation
+Voice future┤
+Gesture ────┘
 
-- `nrf24_linux.c/h`：spidev + sysfs GPIO 驱动，4MHz SPI，5ms 轮询 RX 状态，解析角度帧 `0x55 0x53` 和角速度帧 `0x55 0x52`。
-- RX 线程维护 `wy/wz/wx` 历史、角度历史和 A-init 所需的 5 帧平均。
-- `nrf24_control_update()` 由 GLib 50ms 定时器驱动，独立于视觉帧率。
-- A-inverse 使用 `R_rel = R_current * R_init.t()`，避免简单欧拉角相减带来的初始安装姿态耦合。
-- Pitch/Yaw 双轴各自运行状态机和终点预测器。
-- 运动学已改为参数化球坐标：
-  - 当前默认 profile `far_l3_55`：`l1=11.08`, `l2=6.92`, `l3=55`, `l4=28`, `k=1.6`
-  - 保留旧 profile `mid_l3_40`：`l1=8`, `l2=5`, `l3=40`, `l4=28`, `k=1.6`，J4=55、抬头 -0.8、低头 -1.65、J5 yaw 0.4、position pitch sign=+1，用于后续远/中/近距离切换
-  - `tx = l3*sin(yaw)*cos(pitch)`
-  - `ty = l4 - l1*sin(pitch) + l3*cos(pitch)*cos(yaw)`
-  - `tz = l2 + l1*cos(k*pitch) + l3*sin(k*pitch)*cos(yaw)`
-- 舵机映射：
-  - J4：`servo1 = 65 + K*delta_pitch`，抬头侧 `K=+0.5`，低头侧 `K=+1.65`，限幅 `[-90, 90]`
-  - J5：`servo2 = 50 + 0.2*delta_yaw`，限幅 `[0, 270]`
+Camera → GStreamer → RGA/RKNN Body ─┬→ Face landmarks/PnP
+                                    ├→ INTRO/INTERVIEW observations
+                                    ├→ raised-wrist ROI → async Hand sidecar → gesture policy → control_router
+                                    └→ H264 → RTMP or RTSP
 
-### 握手和 UART
-
-- 主程序等待 UART RX 文本 `init success`。
-- 发送 `FF AA ...` 验证帧。
-- `g_uart_block_tx=1` 屏蔽普通 UART 发送 7 秒，等待下位机归位。
-- 7 秒后清除屏蔽，触发 A-init。
-- NRF24 RX 线程收集 5 帧 IMU 平均值并置 `g_r_init_set=1`。
-- 正常发令进入 `NORMAL`。
-- 退出时发送 `AA FF ...` 结束帧。
-
-### 视觉与 RuleEngine
-
-- `best.rknn`：Body YOLO-Pose，640x640，输出 17 个 COCO keypoints。
-- `face_landmark_468_fp16.rknn`：Face Landmark，192x192 ROI，输出 468 点。
-- PnP 使用 12 个 FaceMesh 稳定点，带重投影误差、镜像解和旋转跳变过滤。
-- 固定安装偏角通过 `R_mount = Ry(-14°) * Rx(-0.10rad)` 组合到 PnP 姿态。
-- 根据机械臂目标 yaw 查 `PNP_YAW_CALIBRATION` 表并插值补偿。
-- C++ 通过 Unix socket 调 Python `rule_engine_server.py`，协议为 312B 输入、56B 输出。
-
-### 推流、云端和端侧控制
-
-- 启动时探测 RTMP 服务器，连通则推 RTMP 并启动 WebSocket 心跳；不可达则回退本地 RTSP。
-- WebSocket 注册帧为 `{"type":"frame_ts"}`，心跳周期 100ms，上报 timestamp、elapsed、frame_count、device。
-- 端侧 HTTP API 监听 8080：
-  - `/status`
-  - `/mode?type=face/body`
-  - `/calib?mode=0/1/2/3/4`
-  - `/servo?k1=...&k2=...`
-  - `/cmd?action=rebaseline/nrf24_reset`
-
-## 四、编译命令
-
-```bash
-cd /home/elf/work/twice
-g++ -std=c++17 -O2 \
-  src/main.cpp src/rga_npu.cpp src/gst_rtsp.cpp src/gst_rtmp.cpp \
-  src/stream_manager.cpp src/ctrl_server.cpp src/ws_client.cpp \
-  src/uart_comm.cpp src/wifi.cpp \
-  src/nrf24_linux.c src/imu2_i2c.c src/bluetooth_spp.c \
-  -o build/cc \
-  $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtsp-server-1.0 dbus-1) \
-  -I/usr/include/opencv4 -lopencv_core -lopencv_imgproc -lopencv_calib3d \
-  -lrknnrt -lrga -lwpa_client -lpthread
+NRF24 + IMU2 → relative head pose/state machine ─┐
+Visual PnP correction ───────────────────────────┼→ target + J4/J5
+Mode-specific control ───────────────────────────┘
+                                                   ↓
+                                             uart_comm mutex
+                                                   ↓
+                                               STM32H723
 ```
 
-## 五、当前问题
+## 4. 线程/进程
 
-1. Body 模型仍是视觉链路主要瓶颈。
-2. `wx` 静止噪声仍会影响状态判断。
-3. 5° 发令阈值会让小角度动作延迟触发。
-4. 下位机短距减速使小位移响应偏慢。
-5. 上位机仍没有关节角/末端位姿反馈，本质上不是完整闭环。
-6. A-init 随机姿态下俯仰极性仍需继续上机验证。
-7. PnP 零飘修正当前是绝对值积分，`KI_PNP=0.05`，非误差积分。
-8. PnP 当前 `pnp_valid_cnt >= 1` 即触发修正，未做连续多帧一致性过滤。
-9. `/servo` 会直接发一次测试指令并写 `/tmp/servo_calib.txt`，但 mode=1/2 的周期标定发令仍使用固定舵机值，标定循环尚未完全闭合。
-10. 云端离散状态控制与端侧连续坐标控制语义仍未统一。
+- 主进程：初始化、GStreamer loop、控制和清理。
+- GStreamer 回调：同步主视觉推理和 OSD。
+- NRF24 RX 线程：采集头部 IMU。
+- IMU2 线程：100 Hz 板载姿态采样。
+- GLib 50 ms timer：`nrf24_control_update()`。
+- HTTP server 线程：端侧 REST。
+- WebSocket worker：注册、心跳和下行命令。
+- Bluetooth worker：三字节遥控协议。
+- Python RuleEngine 子进程：`/tmp/rule_engine.sock`。
+- Python HandPipeline 子进程：`/tmp/hand_pipeline.sock`。
+- Python VoiceKWS 可降级子进程：`/tmp/voice_kws.sock`，Sherpa-ONNX CPU 推理。
+- C++ gesture worker：从有界队列取 ROI，与 HandPipeline 通信。
+- C++ voice worker：阻塞读取新鲜关键词事件并调用统一控制路由。
 
-## 六、下一步
+## 5. 模块地图
 
-- PnP 修正策略改为误差积分或带限幅的稳定校正。
-- PnP 有效帧改为连续多帧一致性过滤。
-- 补齐 `/servo` 与 mode=1/2 标定循环的实际联动。
-- J4/J5 上机标定，确认极性、基线和机械限位。
-- 下位机回传关节角或末端位姿，形成可观测闭环。
-- 参数热加载和日志回放，减少反复编译调参。
+| 模块 | 责任 |
+|---|---|
+| `main.cpp` | 初始化顺序、sidecar 生命周期、硬件、服务器和推流。|
+| `rga_npu.cpp/h` | Body/Face/PnP、场景视觉、NRF 控制核心和模式状态。|
+| `gesture_overlay.cpp/h` | 手部 ROI 异步队列、socket client、左右手 OSD和控制接入。|
+| `gesture_control.cpp/h` | 手势到模式/profile 的纯决策状态机。|
+| `rule_mode_control.cpp/h` | RuleEngine `0→1/0→2` 到 INTRO/INTERVIEW 的边沿决策。|
+| `control_router.cpp/h` | 多来源统一语义入口。|
+| `cloud_command.cpp/h` | 云端 JSON 兼容适配。|
+| `voice_control.cpp/h` | 语音事件新鲜度检查、模式词映射和路由接入。|
+| `arm_power_control.cpp/h` | trial0 对等展开/安全收起、确认窗口及 NRF 发令门控。|
+| `cloud_report.cpp/h` | 语音动作产生的 zoom/view/track/annotation/record 上行队列。|
+| `first_person_control.cpp/h` | FIRST_PERSON 纯映射。|
+| `ctrl_server.cpp/h` | HTTP API。|
+| `uart_comm.cpp/h` | H7 物理通信和写互斥。|
+| `nrf24_linux.c/h` | NRF24 驱动、解帧和历史。|
+| `imu2_i2c.c/h` | 板载 IMU2。|
+| `gst_rtmp.cpp/h` | 云端 RTMP 管线。|
+| `gst_rtsp.cpp/h` | 本地 RTSP 管线。|
+| `stream_manager.cpp/h` | 云端探测和流类型选择。|
+| `ws_client.cpp/h` | 云端 WS 上报和下行。|
+| `bluetooth_spp.c/h` | HC-08 遥控。|
+
+## 6. 启动顺序
+
+1. 安装 SIGINT/SIGTERM 处理器，清理临时状态，设置 CPU 性能模式和网络；
+2. 并行 fork RuleEngine 与 HandPipeline，等待两个 socket 实际就绪；
+3. 初始化 Body、Face、RGA 和手势 worker；
+4. 初始化蓝牙、UART、HTTP、NRF24、IMU2；
+5. 探测 RTMP，失败则 RTSP；
+6. 启动 H7 握手和 50 ms NRF 控制定时器；
+7. 进入 GStreamer loop。
+
+任一 sidecar 启动失败或运行中退出都会触发统一关闭。Ctrl+C、SIGTERM、推流失败和初始化失败共用同一逆序清理路径；主进程关闭时会停止并回收 sidecar、线程、socket 和监听端口。sidecar 还设置父进程死亡信号，主进程被强制杀死时不会长期变成孤儿。
+
+H7 握手、A-init 和 `g_uart_block_tx` 是安全链的一部分，不应为了调试视觉随意删除。
+
+## 7. 模式与控制
+
+模式为 FACE、BODY、INTRO、INTERVIEW、FIRST_PERSON。详细输入、发令周期和接入方向见 `CONTROL.md`。
+
+视觉约 13～15 FPS 是观察更新速率；机械命令由死区和最小时间间隔节流。INTRO/INTERVIEW 目前约 700 ms 级发令限制，FIRST_PERSON 150 ms，普通头控还依赖运动状态。
+
+## 8. 数据与模型
+
+- `models/best.rknn`：Body YOLO-Pose；
+- `models/face_landmark_468_fp16.rknn`：Face 468；
+- `models/rule_engine_v2.rknn`：当前运行的 7 维反馈 RuleEngine；
+- `models/mode_rule_engine_fp16.rknn`：历史遗留模型，当前构建不加载；
+- `models/hand/*`：hand detector、landmark、embedder、canned classifier；
+- `models/sherpa-onnx-*`、`models/silero_vad.onnx`：离线中文 KWS 与软 VAD；
+- `calib/`：相机内参与畸变；
+- `/tmp/*.sock`：两个 sidecar socket；
+- `/tmp/calib_mode.txt`、`/tmp/servo_calib.txt`：临时标定控制；
+- `/tmp/cmd`：UART RX 调试记录。
+
+## 9. 当前技术债
+
+- `rga_npu.cpp` 同时承载视觉和大量控制逻辑，后续应按模块拆分，但需先建立回归测试；
+- control router 缺少真正的来源优先级/租约；
+- 云端协议缺真实包固定测试；
+- PnP 修正仍是实验态；
+- 手势情景控制已接入（每 3 帧采样、连续 3 个有效结果）但缺准确率、误触发和机械实机验收；
+- 完整系统没有关节反馈、动力学和碰撞闭环；
+- 多份历史设计文档描述旧参数，已加状态标记，当前数值以源码为准。
+
+## 10. 构建与测试
+
+构建命令见根 `README.md`；交接验收和推荐顺序见 `HANDOFF.md`；视觉细节见 `VISION.md`；仿真边界见 `../simulation/README.md`。

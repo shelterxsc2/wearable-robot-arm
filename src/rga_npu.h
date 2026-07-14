@@ -11,7 +11,8 @@ typedef enum {
     MODE_FACE = 0,
     MODE_BODY = 1,
     MODE_INTRO = 2,
-    MODE_INTERVIEW = 3
+    MODE_INTERVIEW = 3,
+    MODE_FIRST_PERSON = 4
 } PoseMode;
 
 int init_npu();
@@ -30,6 +31,10 @@ const char* arm_profile_name(int profile);
 int toggle_head_pitch_sign(void);
 int get_head_pitch_sign(void);
 
+/* FIRST_PERSON keeps J1~J3 at a framing point and maps head yaw/pitch to J5/J4. */
+void set_first_person_target(float x, float y, float z);
+void get_first_person_target(float *x, float *y, float *z);
+
 /* USB YUYV -> NV12 (via RGA hardware) */
 int convert_yuyv_to_nv12(uint8_t *src, uint8_t *dst, int width, int height);
 
@@ -42,6 +47,8 @@ void report_gst_encode_us(uint64_t us);
 
 /* NRF24 IMU 独立控制链路（不依赖视觉帧） */
 void nrf24_control_update(void);
+void request_nrf_rebaseline(void);
+int send_face_home_pose(void);
 
 /* A-inverse R_init 捕获标志: 1=已捕获 */
 extern volatile int g_r_init_set;

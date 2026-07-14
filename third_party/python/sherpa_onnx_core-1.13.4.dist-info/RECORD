@@ -1,0 +1,14 @@
+sherpa_onnx/__main__.py,sha256=9mZormj34VT8j7x2H766JDOKS6Qd7LLBnFUb4m6QUW8,1206
+sherpa_onnx/__pycache__/__main__.cpython-310.pyc,,
+sherpa_onnx/__pycache__/_info.cpython-310.pyc,,
+sherpa_onnx/_info.py,sha256=UII-ogyqK28D77gkKGJ34izZLQq_iUwAZ3kuRBOUPsw,611
+sherpa_onnx/include/sherpa-onnx/c-api/c-api.h,sha256=WH4QOcxO4kIWlJTzwLpbrswiSCNBFo2I1X25ZeHnf6k,166476
+sherpa_onnx/include/sherpa-onnx/c-api/cxx-api.h,sha256=cG4sTvH2Tulitm33Rr_4jWBy1wHvXTFRewYCQsgRYHI,66240
+sherpa_onnx/lib/libonnxruntime.so,sha256=F-ar2zysVI_tPTUeCEZdSRtLr4RiLQcNxEnCbqVxoOo,33951528
+sherpa_onnx/lib/libsherpa-onnx-c-api.so,sha256=-yWxKGWXGY-czJTsiD_PJtykSA983daD9zBdK0uAlf8,4544944
+sherpa_onnx/lib/libsherpa-onnx-cxx-api.so,sha256=VpaMTwjEVyjP0jrtpbe79QMCwDKLjhQnBKzeJCU6Ydc,281128
+sherpa_onnx_core-1.13.4.dist-info/INSTALLER,sha256=zuuue4knoyJ-UwPPXg8fezS7VCrXJQrAP7zeNuwvFQg,4
+sherpa_onnx_core-1.13.4.dist-info/METADATA,sha256=7sh4xMAiYF1OEkmaYJwByb-3wrCIrDmyhjFXBOEhLL4,628
+sherpa_onnx_core-1.13.4.dist-info/RECORD,,
+sherpa_onnx_core-1.13.4.dist-info/WHEEL,sha256=tLmZZm90CPbEdtCP3ADxOaKzOjtnXZlGJ2AVknhfAnY,109
+sherpa_onnx_core-1.13.4.dist-info/top_level.txt,sha256=ErNIs96YHtSuqi0sdtG1f68oYeCqrKIMzDqAobB2Sow,12

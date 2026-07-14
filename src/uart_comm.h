@@ -68,6 +68,8 @@ void uart_stop_receiver(void);
  * 原始发送 (调试用)
  */
 int uart_send_raw(const uint8_t* data, size_t len);
+int uart_send_power_on(void);
+int uart_send_power_off(void);
 
 /**
  * 原始接收, 带超时 (调试用)

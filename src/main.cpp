@@ -15,12 +15,18 @@
 #include <gst/gst.h>
 #include <pthread.h>
 #include <ctime>
+#include <cerrno>
+#include <sys/prctl.h>
 
 #include "wifi.h"
 #include "rga_npu.h"
 #include "stream_manager.h"
 #include "ctrl_server.h"
 #include "ws_client.h"
+#include "cloud_command.h"
+#include "voice_control.h"
+#include "arm_power_control.h"
+#include "cloud_report.h"
 #include "bluetooth_spp.h"
 #include "uart_comm.h"
 #include "nrf24_linux.h"
@@ -29,13 +35,11 @@
 #include <sys/wait.h>
 
 static pid_t g_rule_engine_pid = -1;
-static void stop_rule_engine(void) {
-    if (g_rule_engine_pid > 0) {
-        kill(g_rule_engine_pid, SIGTERM);
-        waitpid(g_rule_engine_pid, NULL, 0);
-        g_rule_engine_pid = -1;
-    }
-}
+static pid_t g_hand_pipeline_pid = -1;
+static pid_t g_voice_kws_pid = -1;
+static const char *RULE_SOCKET_PATH = "/tmp/rule_engine.sock";
+static const char *HAND_SOCKET_PATH = "/tmp/hand_pipeline.sock";
+static const char *VOICE_SOCKET_PATH = "/tmp/voice_kws.sock";
 
 /* ========== 云服务器配置（来自历史备份） ========== */
 #define DEVICE_ID           "device-003"
@@ -50,7 +54,7 @@ static void stop_rule_engine(void) {
 #define CPU_FREQ_TARGET     1608000
 #define CTRL_SERVER_PORT    8080
 
-static gboolean g_running = TRUE;
+static volatile sig_atomic_t g_running = 1;
 static pthread_t g_nrf24_tid = 0;
 static int g_nrf24_enabled = 0;
 static pthread_t g_imu2_tid = 0;
@@ -58,6 +62,97 @@ static int g_imu2_enabled = 0;
 static GMainLoop *g_loop = NULL;
 static volatile sig_atomic_t g_should_quit = 0;
 static volatile sig_atomic_t g_ws_ready = 0;
+static pthread_t g_handshake_tid = 0;
+static int g_handshake_started = 0;
+
+struct RuntimeState {
+    bool rule_started = false;
+    bool hand_started = false;
+    bool voice_started = false;
+    bool voice_control_started = false;
+    bool arm_power_initialized = false;
+    bool npu_initialized = false;
+    bool rga_initialized = false;
+    bool bluetooth_initialized = false;
+    bool bluetooth_started = false;
+    bool uart_initialized = false;
+    bool ctrl_started = false;
+    bool ws_started = false;
+    pthread_t ws_tid = 0;
+};
+
+static pid_t start_sidecar(const char *name, char *const argv[])
+{
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "[Main] Failed to fork %s: %s\n", name, strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {
+        // Do not leave an NPU-owning orphan if the parent is killed abruptly.
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        if (getppid() == 1) _exit(1);
+        execvp(argv[0], argv);
+        fprintf(stderr, "[Main] Failed to exec %s: %s\n", name, strerror(errno));
+        _exit(127);
+    }
+    printf("[Main] %s process started PID=%d\n", name, pid);
+    return pid;
+}
+
+static bool child_is_alive(pid_t pid)
+{
+    if (pid <= 0) return false;
+    int status = 0;
+    pid_t ret = waitpid(pid, &status, WNOHANG);
+    return ret == 0;
+}
+
+static bool wait_for_sidecars(int timeout_ms)
+{
+    int waited_ms = 0;
+    while (!g_should_quit && waited_ms < timeout_ms) {
+        bool rule_ready = access(RULE_SOCKET_PATH, F_OK) == 0;
+        bool hand_ready = access(HAND_SOCKET_PATH, F_OK) == 0;
+        if (rule_ready && hand_ready) return true;
+        if (!child_is_alive(g_rule_engine_pid) ||
+            !child_is_alive(g_hand_pipeline_pid)) {
+            fprintf(stderr, "[Main] A sidecar exited during startup\n");
+            return false;
+        }
+        usleep(100000);
+        waited_ms += 100;
+    }
+    fprintf(stderr, "[Main] Sidecar readiness timeout after %d ms\n", timeout_ms);
+    return false;
+}
+
+static void stop_child(pid_t *pid, const char *name, const char *socket_path)
+{
+    if (!pid || *pid <= 0) {
+        if (socket_path) unlink(socket_path);
+        return;
+    }
+
+    int status = 0;
+    pid_t ret = waitpid(*pid, &status, WNOHANG);
+    if (ret == 0) {
+        kill(*pid, SIGTERM);
+        for (int i = 0; i < 30; ++i) {
+            ret = waitpid(*pid, &status, WNOHANG);
+            if (ret == *pid || (ret < 0 && errno == ECHILD)) break;
+            usleep(100000);
+        }
+        if (ret == 0) {
+            fprintf(stderr, "[Main] %s did not stop after 3s; sending SIGKILL\n", name);
+            kill(*pid, SIGKILL);
+            while (waitpid(*pid, &status, 0) < 0 && errno == EINTR) {}
+        }
+    }
+    printf("[Main] %s stopped\n", name);
+    *pid = -1;
+    if (socket_path) unlink(socket_path);
+}
 
 /* 上位机-下位机握手状态: 0=wait_init, 1=a_init, 2=send_ff, 3=wait_homing, 4=normal */
 volatile int g_host_state = 0;
@@ -129,12 +224,41 @@ static void setup_static_ip_fallback(void) {
 static void sigint_handler(int sig) {
     (void)sig;
     g_should_quit = 1;
-    g_running = FALSE;
+    g_running = 0;
+}
+
+static void monitor_sidecar(pid_t *pid, const char *name)
+{
+    if (!pid || *pid <= 0 || g_should_quit) return;
+    int status = 0;
+    pid_t ret = waitpid(*pid, &status, WNOHANG);
+    if (ret == *pid) {
+        fprintf(stderr, "[Main] %s exited unexpectedly status=%d; stopping system\n",
+                name, status);
+        *pid = -1;
+        g_should_quit = 1;
+        g_running = 0;
+    }
+}
+
+static void monitor_optional_sidecar(pid_t *pid, const char *name)
+{
+    if (!pid || *pid <= 0 || g_should_quit) return;
+    int status = 0;
+    pid_t ret = waitpid(*pid, &status, WNOHANG);
+    if (ret == *pid) {
+        fprintf(stderr, "[Main] Optional %s exited status=%d; continuing without it\n",
+                name, status);
+        *pid = -1;
+    }
 }
 
 /* 在主循环线程中安全地检查并退出 */
 static gboolean check_quit_timer(gpointer user_data) {
     (void)user_data;
+    monitor_sidecar(&g_rule_engine_pid, "RuleEngine");
+    monitor_sidecar(&g_hand_pipeline_pid, "HandPipeline");
+    monitor_optional_sidecar(&g_voice_kws_pid, "VoiceKWS");
     if (g_should_quit && g_loop) {
         printf("\n[Main] Stopping...\n");
         GMainLoop *loop = g_loop;
@@ -154,7 +278,7 @@ static void *ws_worker_thread(void *arg) {
     double reconnect_delay = 2.0;
     time_t start_time = time(NULL);
     int registered = 0;
-    char discard[2048];
+    char cloud_message[4096];
 
     while (g_running) {
         if (sock < 0) {
@@ -198,23 +322,31 @@ static void *ws_worker_thread(void *arg) {
         if (!g_running) break;
 
         /* 非阻塞接收服务器消息（控制指令），并检测连接是否存活 */
-        ssize_t n = recv(sock, discard, sizeof(discard), 0);
-        if (n == 0) {
+        int n = ws_recv_text(sock, cloud_message, sizeof(cloud_message));
+        if (n < 0) {
             printf("[WS] Server closed connection\n");
             ws_close(sock);
             sock = -1;
             registered = 0;
             continue;
-        } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            printf("[WS] Recv error: %s\n", strerror(errno));
-            ws_close(sock);
-            sock = -1;
-            registered = 0;
-            continue;
+        } else if (n > 0) {
+            int handled = control_handle_cloud_json(cloud_message);
+            printf("[WS] Cloud command %s: %s\n",
+                   handled > 0 ? "handled" : (handled < 0 ? "invalid" : "ignored"),
+                   cloud_message);
         }
 
         /* 发送心跳（带 data） */
         if (registered) {
+            char report[1024];
+            while (cloud_report_take(report, sizeof(report)) > 0) {
+                if (ws_send_text(sock, report) < 0) {
+                    printf("[WS] Control report send failed, reconnecting...\n");
+                    ws_close(sock); sock = -1; registered = 0;
+                    break;
+                }
+            }
+            if (!registered) continue;
             guint64 fc = get_rtmp_frame_count();
 
             time_t now = time(NULL);
@@ -253,9 +385,10 @@ static void* handshake_thread(void* arg) {
 
     // 1. 阻塞等待 init success
     printf("[Handshake] Waiting for init success...\n");
-    while (!g_uart_init_success) {
+    while (g_running && !g_uart_init_success) {
         usleep(10000);  // 10ms
     }
+    if (!g_running) return NULL;
     printf("[Handshake] Init success received.\n");
 
     // 2. 发 FF 验证帧
@@ -267,16 +400,18 @@ static void* handshake_thread(void* arg) {
     printf("[Handshake] Waiting 7s for homing...\n");
     extern volatile int g_uart_block_tx;
     g_uart_block_tx = 1;
-    usleep(7000000);
+    for (int i = 0; i < 70 && g_running; ++i) usleep(100000);
     g_uart_block_tx = 0;
+    if (!g_running) return NULL;
     printf("[Handshake] 7s homing wait done.\n");
 
     // 4. A-init：等 RX 线程收集 5 帧 IMU 算平均
     g_wait_a_init = 1;
     printf("[Handshake] Waiting for 5 IMU frames avg for A-init...\n");
-    while (!g_r_init_set) {
+    while (g_running && !g_r_init_set) {
         usleep(10000);
     }
+    if (!g_running) return NULL;
     printf("[Handshake] A-init (R_init) captured.\n");
 
     // 5. 进入 NORMAL，开始允许 UART-Tx
@@ -286,9 +421,91 @@ static void* handshake_thread(void* arg) {
     return NULL;
 }
 
+static void shutdown_runtime(RuntimeState *state, bool send_exit_frame)
+{
+    if (!state) return;
+    printf("\n[Main] Cleaning up...\n");
+    g_should_quit = 1;
+    g_running = 0;
+
+    if (state->ws_started) {
+        pthread_join(state->ws_tid, NULL);
+        state->ws_started = false;
+        printf("[Main] WebSocket reporter stopped\n");
+    }
+    if (state->arm_power_initialized) {
+        arm_power_shutdown();
+        state->arm_power_initialized = false;
+    }
+
+    if (state->ctrl_started) {
+        ctrl_server_stop();
+        state->ctrl_started = false;
+    }
+    if (state->bluetooth_initialized) {
+        bluetooth_spp_cleanup();
+        state->bluetooth_started = false;
+        state->bluetooth_initialized = false;
+    }
+    if (state->voice_control_started) {
+        voice_control_stop();
+        state->voice_control_started = false;
+        printf("[Main] Voice control worker stopped\n");
+    }
+    if (state->npu_initialized) {
+        cleanup_npu();
+        state->npu_initialized = false;
+    }
+    if (g_nrf24_enabled) {
+        nrf24_rx_thread_stop();
+        pthread_join(g_nrf24_tid, NULL);
+        g_nrf24_tid = 0;
+        g_nrf24_enabled = 0;
+        nrf24_linux_deinit();
+        printf("[Main] NRF24 stopped\n");
+    }
+    if (g_imu2_enabled) {
+        imu2_i2c_thread_stop();
+        g_imu2_tid = 0;
+        g_imu2_enabled = 0;
+        imu2_i2c_deinit();
+        printf("[Main] IMU2 I2C stopped\n");
+    }
+
+    if (state->uart_initialized) {
+        (void)send_exit_frame;
+        uart_cleanup();
+        state->uart_initialized = false;
+    }
+    if (state->rga_initialized) {
+        cleanup_rga();
+        state->rga_initialized = false;
+    }
+
+    stop_child(&g_hand_pipeline_pid, "HandPipeline", HAND_SOCKET_PATH);
+    stop_child(&g_rule_engine_pid, "RuleEngine", RULE_SOCKET_PATH);
+    stop_child(&g_voice_kws_pid, "VoiceKWS", VOICE_SOCKET_PATH);
+    state->hand_started = false;
+    state->rule_started = false;
+    state->voice_started = false;
+    printf("[Main] Shutdown complete\n");
+}
+
 int main(int argc, char *argv[]) {
     // 取消 stdout 缓冲，确保日志实时落盘
     setbuf(stdout, NULL);
+    setbuf(stderr, NULL);
+
+    // Install handlers before any initialization that may block or spawn.
+    struct sigaction sa{};
+    sa.sa_handler = sigint_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    RuntimeState state;
+    int exit_code = 0;
 
     /* 临时标定模式不跨进程保留，避免上次 mode=3 导致重启后行为异常。 */
     remove("/tmp/calib_mode.txt");
@@ -324,41 +541,96 @@ int main(int argc, char *argv[]) {
         wifi_print_ip(WIFI_IFNAME, ip_str, sizeof(ip_str));
     }
 
-    // 3. 启动 RuleEngine Python 服务
-    printf("\n[Main] Starting RuleEngine Python service...\n");
-    pid_t pid = fork();
-    if (pid == 0) {
-        execlp("python3", "python3",
-               "/home/elf/work/twice/scripts/rule_engine_server.py",
-               (char*)NULL);
-        _exit(1);
-    } else if (pid > 0) {
-        g_rule_engine_pid = pid;
-        sleep(2);
-        printf("[Main] RuleEngine service PID=%d\n", pid);
+    if (g_should_quit) {
+        shutdown_runtime(&state, false);
+        return 130;
+    }
+
+    // 3. Start both NPU sidecars in parallel and wait for actual sockets,
+    // instead of relying on fixed sleeps.
+    unlink(RULE_SOCKET_PATH);
+    unlink(HAND_SOCKET_PATH);
+    printf("\n[Main] Starting sidecar services...\n");
+    char *rule_argv[] = {
+        const_cast<char *>("python3"),
+        const_cast<char *>("scripts/rule_engine_server.py"), nullptr
+    };
+    char *hand_argv[] = {
+        const_cast<char *>("python3"),
+        const_cast<char *>("scripts/hand_pipeline_server.py"),
+        const_cast<char *>("--mode"), const_cast<char *>("roi_gesture"),
+        const_cast<char *>("--quiet"), nullptr
+    };
+    g_rule_engine_pid = start_sidecar("RuleEngine", rule_argv);
+    state.rule_started = g_rule_engine_pid > 0;
+    g_hand_pipeline_pid = start_sidecar("HandPipeline", hand_argv);
+    state.hand_started = g_hand_pipeline_pid > 0;
+    if (!state.rule_started || !state.hand_started || !wait_for_sidecars(20000)) {
+        fprintf(stderr, "[Main] Sidecar startup failed; aborting initialization\n");
+        shutdown_runtime(&state, false);
+        return g_should_quit ? 130 : 1;
+    }
+    printf("[Main] All sidecars ready\n");
+
+    // Voice KWS is deliberately optional: microphone/model failures must not
+    // take down vision or mechanical control. The worker reconnects whenever
+    // the sidecar socket becomes available.
+    unlink(VOICE_SOCKET_PATH);
+    char *voice_argv[] = {
+        const_cast<char *>("taskset"), const_cast<char *>("-c"),
+        const_cast<char *>("2"), const_cast<char *>("nice"),
+        const_cast<char *>("-n"), const_cast<char *>("10"),
+        const_cast<char *>("python3"),
+        const_cast<char *>("scripts/voice_kws_server.py"),
+        const_cast<char *>("--config"),
+        const_cast<char *>("config/voice_kws.json"), nullptr
+    };
+    bool voice_disabled = getenv("VOICE_KWS_DISABLE") != nullptr;
+    if (!voice_disabled) {
+        g_voice_kws_pid = start_sidecar("VoiceKWS", voice_argv);
+        state.voice_started = g_voice_kws_pid > 0;
+        if (voice_control_start(VOICE_SOCKET_PATH) == 0) {
+            state.voice_control_started = true;
+            printf("[Main] Voice control worker started (optional sidecar)\n");
+        } else {
+            fprintf(stderr, "[Main] Voice control worker failed to start; continuing\n");
+        }
     } else {
-        fprintf(stderr, "[Main] Failed to fork RuleEngine service\n");
+        printf("[Main] VoiceKWS disabled by VOICE_KWS_DISABLE (benchmark baseline)\n");
     }
 
     // 4. 初始化NPU
     printf("\n[Main] Initializing NPU...\n");
     if (init_npu() != 0) {
         fprintf(stderr, "[Main] NPU initialization failed\n");
-        return 1;
+        shutdown_runtime(&state, false);
+        return g_should_quit ? 130 : 1;
+    }
+    state.npu_initialized = true;
+    if (g_should_quit) {
+        shutdown_runtime(&state, false);
+        return 130;
     }
 
     // 4. 初始化RGA
     printf("\n[Main] Initializing RGA...\n");
     if (init_rga() != 0) {
         fprintf(stderr, "[Main] RGA initialization failed\n");
-        cleanup_npu();
-        return 1;
+        shutdown_runtime(&state, false);
+        return g_should_quit ? 130 : 1;
+    }
+    state.rga_initialized = true;
+    if (g_should_quit) {
+        shutdown_runtime(&state, false);
+        return 130;
     }
 
     // 5. 蓝牙 BLE 遥控器
     printf("\n[Main] Initializing Bluetooth remote...\n");
     if (bluetooth_spp_init() == 0) {
+        state.bluetooth_initialized = true;
         if (bluetooth_spp_start() == 0) {
+            state.bluetooth_started = true;
             printf("[Main] Bluetooth remote client started\n");
         } else {
             fprintf(stderr, "[Main] Bluetooth remote start failed, continuing without it\n");
@@ -366,21 +638,32 @@ int main(int argc, char *argv[]) {
     } else {
         fprintf(stderr, "[Main] Bluetooth remote init failed, continuing without it\n");
     }
+    if (g_should_quit) {
+        shutdown_runtime(&state, false);
+        return 130;
+    }
 
     // 6. 初始化 UART
     printf("\n[Main] Initializing UART...\n");
     if (uart_init("/dev/ttyS9", 115200) != 0) {
         fprintf(stderr, "[Main] UART init failed, continuing without motor control\n");
     } else {
-        uart_start_receiver(NULL);
-        printf("[Main] UART ready @ /dev/ttyS9 115200\n");
+        state.uart_initialized = true;
+        if (uart_start_receiver(NULL) == 0) {
+            printf("[Main] UART ready @ /dev/ttyS9 115200\n");
+            arm_power_init();
+            state.arm_power_initialized = true;
+            printf("[Main] Arm remains retracted until an explicit power-on command\n");
+        } else {
+            fprintf(stderr, "[Main] UART receiver start failed\n");
+        }
     }
 
     // 7. 启动端侧控制服务器
     printf("\n[Main] Starting control server on port %d...\n", CTRL_SERVER_PORT);
     if (ctrl_server_start(CTRL_SERVER_PORT) != 0) {
         fprintf(stderr, "[Main] Control server start failed, continuing without it\n");
-    }
+    } else state.ctrl_started = true;
 
     // 8. 启动NRF24接收线程
     printf("\n[Main] Mode: FACE (default)\n");
@@ -410,24 +693,19 @@ int main(int argc, char *argv[]) {
     }
 
     // 9. 探测云服务器并选择推流模式
-    signal(SIGINT, sigint_handler);
-    signal(SIGTERM, sigint_handler);
-
     gst_init(&argc, &argv);
 
     /* 在主循环线程中注册安全退出检查器（信号处理函数中不能直接调用 g_main_loop_quit） */
     g_timeout_add(100, check_quit_timer, NULL);
 
     StreamType stream_type = STREAM_TYPE_RTSP;
-    pthread_t ws_tid = 0;
-    int ws_started = 0;
 
     printf("\n[Main] Probing RTMP server (%s)...\n", RTMP_URL);
-    if (probe_rtmp_server(RTMP_URL, 3000)) {
+    if (!g_should_quit && probe_rtmp_server(RTMP_URL, 3000)) {
         stream_type = STREAM_TYPE_RTMP;
         printf("[Main] RTMP server is UP. Will push RTMP + WebSocket.\n");
-        if (pthread_create(&ws_tid, NULL, ws_worker_thread, NULL) == 0) {
-            ws_started = 1;
+        if (pthread_create(&state.ws_tid, NULL, ws_worker_thread, NULL) == 0) {
+            state.ws_started = true;
             printf("[Main] WebSocket reporter started -> %s\n", WS_URL);
         } else {
             fprintf(stderr, "[Main] WebSocket thread start failed\n");
@@ -438,7 +716,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* RTMP 模式：等待 WS 注册成功后再启动推流，避免服务器丢弃未注册设备的 RTMP 数据 */
-    if (stream_type == STREAM_TYPE_RTMP && ws_started) {
+    if (stream_type == STREAM_TYPE_RTMP && state.ws_started) {
         printf("[Main] Waiting for WS registration before starting RTMP stream...\n");
         int wait_ms = 0;
         while (!g_ws_ready && wait_ms < 10000 && !g_should_quit) {
@@ -452,17 +730,13 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // 上位机-下位机握手：阻塞线程，init success → 等 move complete → A-init → 发 FF → NORMAL
-    pthread_t handshake_tid;
-    if (pthread_create(&handshake_tid, NULL, handshake_thread, NULL) == 0) {
-        printf("[Main] Host handshake thread started\n");
-    } else {
-        fprintf(stderr, "[Main] Failed to start handshake thread\n");
-    }
-
     // NRF24 IMU 控制：用 GLib 定时器每 50ms 独立运行，不依赖视频帧
     g_timeout_add(50, [](gpointer) -> gboolean {
-        nrf24_control_update();
+        if (!g_running) return G_SOURCE_REMOVE;
+        arm_power_tick();
+        if (arm_power_is_on() && !arm_power_shutdown_in_progress()) {
+            nrf24_control_update();
+        }
         return G_SOURCE_CONTINUE;
     }, NULL);
     printf("[Main] NRF24 control timer started (50ms)\n");
@@ -471,51 +745,18 @@ int main(int argc, char *argv[]) {
            (stream_type == STREAM_TYPE_RTMP) ? "RTMP" : "RTSP");
     printf("[Main] Press Ctrl+C to stop\n\n");
 
-    int stream_ret = start_stream(VIDEO_DEVICE, RTMP_URL, stream_type, &g_loop);
+    int stream_ret = 0;
+    if (!g_should_quit) {
+        stream_ret = start_stream(VIDEO_DEVICE, RTMP_URL, stream_type, &g_loop);
+    }
     /* start_stream 返回时内部已 unref loop，防止 sigint_handler 对已释放指针调用 quit */
     g_loop = NULL;
 
     if (stream_ret != 0) {
         fprintf(stderr, "[Main] Stream failed\n");
-        g_running = FALSE;
-        if (ws_started) pthread_join(ws_tid, NULL);
-        bluetooth_spp_stop();
-        bluetooth_spp_cleanup();
-        cleanup_npu();
-        cleanup_rga();
-        ctrl_server_stop();
-        stop_rule_engine();
-        return 1;
+        exit_code = 1;
     }
-
-    printf("\n[Main] Cleaning up...\n");
-
-    /* 发送结束帧给下位机 */
-    uint8_t exit_frame[10] = {0xAA, 0xFF, 0xAA, 0xFF, 0xAA, 0xFF, 0xAA, 0xFF, 0xAA, 0xFF};
-    uart_send_raw(exit_frame, 10);
-    printf("[Main] Exit frame sent to MCU\n");
-    usleep(50000);  /* 等 50ms 确保帧发出去 */
-
-    g_running = FALSE;
-    if (ws_started) pthread_join(ws_tid, NULL);
-    if (g_nrf24_enabled) {
-        nrf24_rx_thread_stop();
-        pthread_join(g_nrf24_tid, NULL);
-        nrf24_linux_deinit();
-        printf("[Main] NRF24 stopped\n");
-    }
-    if (g_imu2_enabled) {
-        imu2_i2c_thread_stop();
-        imu2_i2c_deinit();
-        printf("[Main] IMU2 I2C stopped\n");
-    }
-    uart_cleanup();
-    bluetooth_spp_stop();
-    bluetooth_spp_cleanup();
-    ctrl_server_stop();
-    cleanup_npu();
-    cleanup_rga();
-    stop_rule_engine();
-    printf("[Main] Shutdown complete\n");
-    return 0;
+    shutdown_runtime(&state, state.uart_initialized);
+    if (g_should_quit && exit_code == 0) return 0;
+    return exit_code;
 }

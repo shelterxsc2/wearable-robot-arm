@@ -10,6 +10,7 @@
  */
 #include "bluetooth_spp.h"
 #include "rga_npu.h"
+#include "control_router.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,8 @@
 #define BT24_MAC        "F8:2E:0C:E3:99:C8"
 #define BT24_CHR_UUID   "0000ffe1-0000-1000-8000-00805f9b34fb"
 #define BT_BUF_SIZE     256
+#define BT_DBUS_CALL_TIMEOUT_MS 2000
+#define BT_CONNECT_TIMEOUT_MS  3000
 
 static volatile int     g_bt_running = 0;
 static pthread_t        g_client_thread;
@@ -78,7 +81,7 @@ static int str_ieq(const char *a, const char *b)
  * 三字节遥控协议:
  *   55 00 00       idle
  *   55 01 00/01    arm profile: 00=L3-40, 01=L3-55
- *   55 02 00/01/02/03 scene: 00=FACE, 01=INTRO, 02=INTERVIEW, 03=BODY
+ *   55 02 00/01/02/03/04 scene: FACE/INTRO/INTERVIEW/BODY/FIRST_PERSON
  *   55 03 xx       toggle IMU pitch sign
  * ============================================================ */
 static void handle_remote_frame(uint8_t cmd, uint8_t value)
@@ -105,10 +108,10 @@ static void handle_remote_frame(uint8_t cmd, uint8_t value)
     switch (cmd) {
         case 0x01:
             if (value == 0x00) {
-                set_arm_profile(0);
+                control_request_profile(0, CONTROL_SOURCE_BLUETOOTH);
                 printf("[BT] Remote profile -> near L3=40\n");
             } else if (value == 0x01) {
-                set_arm_profile(1);
+                control_request_profile(1, CONTROL_SOURCE_BLUETOOTH);
                 printf("[BT] Remote profile -> mid L3=55\n");
             } else {
                 printf("[BT] Remote profile value 0x%02X ignored\n", value);
@@ -117,17 +120,20 @@ static void handle_remote_frame(uint8_t cmd, uint8_t value)
 
         case 0x02:
             if (value == 0x00) {
-                set_pose_mode(MODE_FACE);
+                control_request_mode(MODE_FACE, CONTROL_SOURCE_BLUETOOTH);
                 printf("[BT] Remote scene -> face\n");
             } else if (value == 0x01) {
-                set_pose_mode(MODE_INTRO);
+                control_request_mode(MODE_INTRO, CONTROL_SOURCE_BLUETOOTH);
                 printf("[BT] Remote scene -> intro\n");
             } else if (value == 0x02) {
-                set_pose_mode(MODE_INTERVIEW);
+                control_request_mode(MODE_INTERVIEW, CONTROL_SOURCE_BLUETOOTH);
                 printf("[BT] Remote scene -> interview\n");
             } else if (value == 0x03) {
-                set_pose_mode(MODE_BODY);
+                control_request_mode(MODE_BODY, CONTROL_SOURCE_BLUETOOTH);
                 printf("[BT] Remote scene -> body\n");
+            } else if (value == 0x04) {
+                control_request_mode(MODE_FIRST_PERSON, CONTROL_SOURCE_BLUETOOTH);
+                printf("[BT] Remote scene -> first_person\n");
             } else {
                 printf("[BT] Remote scene value 0x%02X ignored\n", value);
             }
@@ -275,7 +281,7 @@ static int get_property_bool(const char *obj_path, const char *iface, const char
         DBUS_TYPE_STRING, &prop,
         DBUS_TYPE_INVALID);
 
-    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, 5000, &err);
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, BT_DBUS_CALL_TIMEOUT_MS, &err);
     dbus_message_unref(msg);
     if (!reply || dbus_error_is_set(&err)) {
         if (dbus_error_is_set(&err)) dbus_error_free(&err);
@@ -299,7 +305,7 @@ static int get_property_bool(const char *obj_path, const char *iface, const char
 static int wait_property(const char *obj_path, const char *iface, const char *prop,
                          dbus_bool_t expected, int timeout_ms)
 {
-    for (int i = 0; i < timeout_ms / 100; i++) {
+    for (int i = 0; i < timeout_ms / 100 && g_bt_running; i++) {
         if (get_property_bool(obj_path, iface, prop) == (expected ? 1 : 0))
             return 0;
         usleep(100000);
@@ -318,7 +324,7 @@ static int find_characteristic_path(const char *uuid, char *out_path, size_t out
         "org.freedesktop.DBus.ObjectManager", "GetManagedObjects");
     if (!msg) return -1;
 
-    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, 5000, &err);
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, BT_DBUS_CALL_TIMEOUT_MS, &err);
     dbus_message_unref(msg);
     if (!reply || dbus_error_is_set(&err)) {
         if (dbus_error_is_set(&err)) dbus_error_free(&err);
@@ -411,7 +417,7 @@ static int device_exists(const char *device_path)
         "org.bluez", "/",
         "org.freedesktop.DBus.ObjectManager", "GetManagedObjects");
     if (!msg) return 0;
-    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, 5000, &err);
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, BT_DBUS_CALL_TIMEOUT_MS, &err);
     dbus_message_unref(msg);
     if (!reply || dbus_error_is_set(&err)) {
         if (dbus_error_is_set(&err)) dbus_error_free(&err);
@@ -452,7 +458,7 @@ static int ble_start_discovery(void)
         "org.bluez", "/org/bluez/hci0",
         "org.bluez.Adapter1", "StartDiscovery");
     if (!msg) return -1;
-    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, 5000, &err);
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, BT_DBUS_CALL_TIMEOUT_MS, &err);
     dbus_message_unref(msg);
     if (!reply || dbus_error_is_set(&err)) {
         if (dbus_error_is_set(&err)) dbus_error_free(&err);
@@ -471,7 +477,7 @@ static int ble_stop_discovery(void)
         "org.bluez", "/org/bluez/hci0",
         "org.bluez.Adapter1", "StopDiscovery");
     if (!msg) return -1;
-    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, 5000, &err);
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, BT_DBUS_CALL_TIMEOUT_MS, &err);
     dbus_message_unref(msg);
     if (!reply || dbus_error_is_set(&err)) {
         if (dbus_error_is_set(&err)) dbus_error_free(&err);
@@ -504,7 +510,7 @@ static int ble_connect_device(void)
             return -1;
         }
         int found = 0;
-        for (int i = 0; i < 150; i++) {
+        for (int i = 0; i < 150 && g_bt_running; i++) {
             if (device_exists(g_device_path)) {
                 found = 1;
                 break;
@@ -525,7 +531,8 @@ static int ble_connect_device(void)
         "org.bluez.Device1", "Connect");
     if (!msg) return -1;
 
-    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, 15000, &err);
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(
+        g_dbus_conn, msg, BT_CONNECT_TIMEOUT_MS, &err);
     dbus_message_unref(msg);
     if (!reply) {
         if (dbus_error_is_set(&err)) {
@@ -576,7 +583,7 @@ static int ble_start_notify(void)
         "org.bluez.GattCharacteristic1", "StartNotify");
     if (!msg) return -1;
 
-    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, 5000, &err);
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, BT_DBUS_CALL_TIMEOUT_MS, &err);
     dbus_message_unref(msg);
     if (!reply || dbus_error_is_set(&err)) {
         if (dbus_error_is_set(&err)) {
@@ -604,7 +611,7 @@ static int ble_stop_notify(void)
         "org.bluez.GattCharacteristic1", "StopNotify");
     if (!msg) return -1;
 
-    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, 5000, &err);
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, BT_DBUS_CALL_TIMEOUT_MS, &err);
     dbus_message_unref(msg);
     if (!reply || dbus_error_is_set(&err)) {
         if (dbus_error_is_set(&err)) dbus_error_free(&err);
@@ -617,7 +624,7 @@ static int ble_stop_notify(void)
 
 static void ble_disconnect(void)
 {
-    if (strlen(g_device_path) == 0) return;
+    if (strlen(g_device_path) == 0 || !g_bt_connected) return;
 
     DBusError err;
     dbus_error_init(&err);
@@ -627,12 +634,13 @@ static void ble_disconnect(void)
         "org.bluez.Device1", "Disconnect");
     if (!msg) return;
 
-    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, 5000, &err);
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, BT_DBUS_CALL_TIMEOUT_MS, &err);
     dbus_message_unref(msg);
     if (reply) dbus_message_unref(reply);
     if (dbus_error_is_set(&err)) dbus_error_free(&err);
 
     g_char_path[0] = '\0';
+    g_bt_connected = 0;
 }
 
 static int ble_is_connected(void)
@@ -660,7 +668,7 @@ static int ble_read_data(uint8_t *buf, int max_len)
     dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "{sv}", &dict);
     dbus_message_iter_close_container(&args, &dict);
 
-    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, 5000, &err);
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, BT_DBUS_CALL_TIMEOUT_MS, &err);
     dbus_message_unref(msg);
     if (!reply || dbus_error_is_set(&err)) {
         if (dbus_error_is_set(&err)) {
@@ -718,7 +726,7 @@ static int ble_write_data(const uint8_t *data, int len)
     dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "{sv}", &dict_iter);
     dbus_message_iter_close_container(&args, &dict_iter);
 
-    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, 5000, &err);
+    DBusMessage *reply = dbus_connection_send_with_reply_and_block(g_dbus_conn, msg, BT_DBUS_CALL_TIMEOUT_MS, &err);
     dbus_message_unref(msg);
     if (!reply || dbus_error_is_set(&err)) {
         if (dbus_error_is_set(&err)) {
@@ -747,7 +755,7 @@ static void *client_thread_func(void *arg)
             g_notify_enabled = 0;
             if (ble_connect_device() != 0) {
                 printf("[BT] Connection failed, retry in 5s...\n");
-                sleep(5);
+                for (int i = 0; i < 50 && g_bt_running; ++i) usleep(100000);
                 continue;
             }
 
@@ -874,16 +882,18 @@ int bluetooth_spp_start(void)
 
 void bluetooth_spp_stop(void)
 {
-    if (!g_bt_running) return;
-    printf("[BT] Stopping...\n");
-    g_bt_running = 0;
+    int was_running = g_bt_running;
+    if (was_running) {
+        printf("[BT] Stopping...\n");
+        g_bt_running = 0;
 
-    /* 唤醒可能在等待的主线程 */
-    pthread_mutex_lock(&g_conn_mutex);
-    pthread_cond_broadcast(&g_conn_cond);
-    pthread_mutex_unlock(&g_conn_mutex);
+        /* 唤醒可能在等待的主线程 */
+        pthread_mutex_lock(&g_conn_mutex);
+        pthread_cond_broadcast(&g_conn_cond);
+        pthread_mutex_unlock(&g_conn_mutex);
 
-    pthread_join(g_client_thread, NULL);
+        pthread_join(g_client_thread, NULL);
+    }
     if (g_notify_enabled) ble_stop_notify();
     ble_disconnect();
 
@@ -896,7 +906,7 @@ void bluetooth_spp_stop(void)
         g_dbus_conn = NULL;
     }
 
-    printf("[BT] Stopped\n");
+    if (was_running) printf("[BT] Stopped\n");
 }
 
 void bluetooth_spp_cleanup(void)

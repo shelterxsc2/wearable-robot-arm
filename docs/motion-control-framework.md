@@ -1,5 +1,7 @@
 # 人脸跟踪机械臂运动与控制框架
 
+> 文档状态：历史设计/理论参考。它记录控制思想和参数演进，不完整描述 2026-07-13 的 `fourth` 迁移代码。当前模式、接口和实际常量以 `HANDOFF.md`、`CONTROL.md` 与源码为准；不要直接照抄本文伪代码或参数。
+
 > **状态**: 本文档为理论框架，当前已**部分实现**。8 状态机、终点预测器、自适应发令策略已代码化。概率预测模型（5.1~5.4）尚未实现。当前源码已使用 11 字节 UART flag 协议、球坐标运动学和 J4/J5 动态舵机映射；本文中的旧常数和示例代码仅作方案背景。
 
 ## 一、背景与核心矛盾
@@ -290,7 +292,7 @@ while (g_nrf24_running) {
     if (valid) {
         // 更新角加速度循环缓冲区
         g_nrf24_state.gy_ast_buf[...] = wz - prev_wz;
-        
+
         // 更新共享状态
         g_nrf24_state.gy_wz = wz;
         g_nrf24_state.gy_yaw = yaw;
@@ -334,15 +336,15 @@ struct Predictor {
 Predictor predict(float yaw, float wz, float ast, MotionState state, float dt)
 {
     Predictor p;
-    
+
     // 基础版：速度不确定性球体
     p.center = yaw + wz * dt;
     p.radius = fabsf(wz) * dt * 0.3f;
-    
+
     // Plus版：加速度拉伸
     p.stretch = 0.5f * ast * dt * dt;
     float k = 0.0f;
-    
+
     // Ultra Plus版：状态调制
     switch (state) {
         case STATE_ACCEL:       k = 1.5f; break;
@@ -351,10 +353,10 @@ Predictor predict(float yaw, float wz, float ast, MotionState state, float dt)
         case STATE_DECEL:       k = -1.0f; break;
         case STATE_STOP:        k = 0.0f; p.radius = 0; break;
     }
-    
+
     p.center += k * p.stretch;
     p.confidence = 1.0f / (1.0f + p.radius / 10.0f);
-    
+
     return p;
 }
 ```
@@ -367,41 +369,41 @@ void nrf24_control_update(void)
     static uint64_t last_cmd_us = 0;
     static float last_cmd_center = 0.0f;
     static MotionState prev_state = STATE_STOP;
-    
+
     // 读取共享状态（加锁）
     float wz, yaw;
     float ast[5];
     int ast_cnt;
     // ... 从 g_nrf24_state 复制 ...
-    
+
     // 状态机
     MotionState state = next_motion_state(prev_state, wz, ast, ast_cnt);
     prev_state = state;
-    
+
     // 自适应预测窗口
     float dt = 0.4f;  // 默认 400ms
     // 根据预测位移调整 dt...
-    
+
     // 概率预测
     Predictor pred = predict(yaw, wz, ast[ast_cnt-1], state, dt);
-    
+
     // 发指令决策
     bool center_moved = fabsf(pred.center - last_cmd_center) > 5.0f;
     bool confident = pred.confidence > 0.5f;
     bool state_ok = (state != STATE_JITTER);
     bool interval_ok = (now_us - last_cmd_us >= 200000);  // 200ms
-    
+
     if (center_moved && confident && state_ok && interval_ok) {
         // 目标位置生成
         float target_x = ...;  // 基于 pred.center 计算
         float target_y = ...;
         float target_z = 40.0f;
-        
+
         uart_send_arm_target(target_x, target_y, target_z, 50.0f, 145.0f, 0x00);
-        
+
         last_cmd_center = pred.center;
         last_cmd_us = now_us;
-        
+
         printf("[NRF-CMD] state=%s pred=%.2f±%.2f conf=%.2f\n",
                state_name(state), pred.center, pred.radius, pred.confidence);
     } else {

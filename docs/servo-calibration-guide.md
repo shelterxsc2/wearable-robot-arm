@@ -1,8 +1,10 @@
 # J4 舵机标定操作手册（方案 A）
 
-> **目标**: 确定 `baseline_roll`、`baseline_servo1`、`K_SERVO` 三个参数  
-> **工具**: 运行中的机械臂 + 上位机程序 + NRF24 IMU  
-> **时间**: 约 5~10 分钟  
+> 文档状态：历史标定操作参考。开始实机前先阅读 `HANDOFF.md` 与 `CONTROL.md`，确认当前 profile、模式、机械限位和急停；本文记录的 baseline/K 值不自动代表当前 `fourth` 源码。
+
+> **目标**: 确定 `baseline_roll`、`baseline_servo1`、`K_SERVO` 三个参数
+> **工具**: 运行中的机械臂 + 上位机程序 + NRF24 IMU
+> **时间**: 约 5~10 分钟
 > **风险**: 低（舵机范围小，不会撞机械结构）
 
 > **当前代码同步（2026-07-01）**：正常控制已改为 Pitch/Yaw 动态舵机映射，J4 当前公式为 `servo1 = 55 + K * delta_pitch`，抬头侧 `K=-0.8`，低头侧 `K=-1.65`，J5 为 `servo2 = 50 + 0.4 * delta_yaw`。本文仍可作为 J4 基线、极性和比例系数的上机标定流程参考。注意 `/servo` 端点会直接发一次测试指令并写 `/tmp/servo_calib.txt`，但 mode=1/2 的周期标定循环当前仍发送固定舵机值，尚未完全使用该文件中的 `calib_servo1`。

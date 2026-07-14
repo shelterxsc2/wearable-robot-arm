@@ -1,7 +1,7 @@
 /**
  * gst_rtmp.cpp - RTMP 云端推流 (ELF2 RK3588)
  * 基于 identity handoff 架构（和备份版本一致）
- * Pipeline: v4l2src(MJPEG) → mppjpegdec → identity → memcpy(NV12) → process_frame → appsrc → mpph264enc → flvmux → rtmpsink
+ * Pipeline: v4l2src(MJPEG) → mppjpegdec → rotate 180° → identity → memcpy(NV12) → process_frame → appsrc → mpph264enc → flvmux → rtmpsink
  */
 #include "gst_rtmp.h"
 #include "rga_npu.h"
@@ -137,6 +137,8 @@ int start_rtmp_stream(const char *device, const char *rtmp_url, GMainLoop **loop
         "! image/jpeg,width=1920,height=1080,framerate=30/1 "
         "! mppjpegdec "
         "! video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 "
+        "! videoflip video-direction=180 "
+        "! video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 "
         "! identity name=myid ! fakesink sync=false "
         /* 视频编码 + 推流分支 */
         "appsrc name=mysrc caps=video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 "
@@ -149,7 +151,7 @@ int start_rtmp_stream(const char *device, const char *rtmp_url, GMainLoop **loop
         device, rtmp_url);
 
     g_print("[RTMP] Starting stream to: %s\n", rtmp_url);
-    g_print("[RTMP] Pipeline: MJPEG → mppjpegdec → NV12 → AI → H264 → FLV → RTMP\n");
+    g_print("[RTMP] Pipeline: MJPEG → mppjpegdec → rotate 180° → NV12 → AI → H264 → FLV → RTMP\n");
 
     GError *error = NULL;
     GstElement *pipeline = gst_parse_launch(pipeline_str, &error);

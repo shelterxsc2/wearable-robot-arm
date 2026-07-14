@@ -240,12 +240,16 @@ static void media_configure_cb(GstRTSPMediaFactory *factory, GstRTSPMedia *media
 int start_rtsp_server(const char *device, GMainLoop **loop_ptr) {
     gst_init(NULL, NULL);
     
-    // USB Camera3 pipeline: MJPEG -> mppjpegdec -> NV12 -> appsink, AI draws on NV12, appsrc feeds encoder
+    // Camera is mounted upside down. Rotate the decoded NV12 frame before AI so
+    // inference, hand ROI coordinates, overlays and the encoded stream all use
+    // the same upright coordinate system.
     gchar *media_launch = g_strdup_printf(
         "( "
         "v4l2src device=%s min-buffers=2 io-mode=auto "
         "! image/jpeg,width=1920,height=1080,framerate=30/1 "
         "! mppjpegdec "
+        "! video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 "
+        "! videoflip video-direction=180 "
         "! video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 "
         "! tee name=t "
         "t. ! queue max-size-buffers=1 leaky=downstream ! fakesink "
@@ -260,7 +264,7 @@ int start_rtsp_server(const char *device, GMainLoop **loop_ptr) {
         device);
 
     g_print("[RTSP] Starting server...\n");
-    g_print("[RTSP] Pipeline configured for MJPEG 1080p30 + AI overlay\n");
+    g_print("[RTSP] Pipeline configured for MJPEG 1080p30 + 180-degree rotation + AI overlay\n");
 
     GstRTSPServer *server = gst_rtsp_server_new();
     if (!server) {
