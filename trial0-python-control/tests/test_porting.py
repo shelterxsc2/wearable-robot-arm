@@ -2,6 +2,7 @@
 """Unit tests for upstream porting changes (non-STM32)."""
 from __future__ import annotations
 
+import math
 import os
 import struct
 import sys
@@ -203,6 +204,49 @@ class TestScenarioModes(unittest.TestCase):
         self.assertIsNotNone(cmd)
         self.assertEqual(cmd["servo1"], FIRST_PERSON_BASE_J4_DEG + 6.0)
 
+    def test_first_person_discrete_axes_use_physical_directions(self):
+        ctrl = Nrf24Controller()
+        forward = ctrl.set_first_person_discrete_target(1, 0, 0)
+        self.assertEqual(forward["x"], FIRST_PERSON_BASE_X_CM)
+        self.assertEqual(forward["y"], FIRST_PERSON_BASE_Y_CM + 3.0)
+        self.assertEqual(forward["z"], FIRST_PERSON_BASE_Z_CM)
+
+        left = ctrl.set_first_person_discrete_target(0, 1, 0)
+        self.assertEqual(left["x"], FIRST_PERSON_BASE_X_CM - 3.0)
+        self.assertEqual(left["y"], FIRST_PERSON_BASE_Y_CM)
+        self.assertEqual(left["z"], FIRST_PERSON_BASE_Z_CM)
+
+        up = ctrl.set_first_person_discrete_target(0, 0, 1)
+        self.assertEqual(up["x"], FIRST_PERSON_BASE_X_CM)
+        self.assertEqual(up["y"], FIRST_PERSON_BASE_Y_CM)
+        self.assertEqual(up["z"], FIRST_PERSON_BASE_Z_CM + 3.0)
+        self.assertEqual(up["servo1"], FIRST_PERSON_BASE_J4_DEG + 3.0)
+
+        down = ctrl.set_first_person_discrete_target(0, 0, -1)
+        self.assertEqual(down["servo1"], FIRST_PERSON_BASE_J4_DEG - 3.0)
+
+        ctrl._update_first_person_control(vec_yaw=0.0, vec_pitch=2.0, now_us=1_000_000)
+        up_with_head_pitch = ctrl.set_first_person_discrete_target(0, 0, 1)
+        self.assertEqual(up_with_head_pitch["servo1"], FIRST_PERSON_BASE_J4_DEG + 3.0 - 2.0)
+
+    def test_all_first_person_gears_are_unique_and_inside_ik_reach(self):
+        ctrl = Nrf24Controller()
+        points = set()
+        for forward in range(-5, 6):
+            for left in range(-5, 6):
+                for up in range(-5, 6):
+                    cmd = ctrl.set_first_person_discrete_target(forward, left, up)
+                    point = (cmd["x"], cmd["y"], cmd["z"])
+                    self.assertNotIn(point, points)
+                    points.add(point)
+                    # H7 converts cm to m, subtracts 10 cm from Y, and uses
+                    # two 45 cm links connected 31 cm above its origin.
+                    radius = math.hypot(cmd["x"] / 100.0, cmd["y"] / 100.0 - 0.10)
+                    reach = math.hypot(radius, cmd["z"] / 100.0 - 0.31)
+                    self.assertGreater(reach, 0.0)
+                    self.assertLessEqual(reach, 0.90)
+        self.assertEqual(len(points), 11 ** 3)
+
     def test_intro_control_basic(self):
         ctrl = Nrf24Controller()
         ctrl.set_pose_mode("intro")
@@ -302,7 +346,31 @@ class TestBleRemote(unittest.TestCase):
         listener.feed_test_frame(0x01, 0x01)  # suppressed
         listener.feed_test_frame(0x02, 0x01)  # mode intro
         listener.feed_test_frame(0x03, 0x00)  # toggle pitch sign
-        self.assertEqual(calls, ["/profile?idx=1", "/mode?type=intro", "/cmd?action=toggle_pitch_sign"])
+        listener.feed_test_frame(0x04, 0x00)  # power on, no lock
+        listener.feed_test_frame(0x04, 0x01)  # power off, no lock
+        listener.feed_test_frame(0x05, 0x00)  # unlock
+        self.assertEqual(calls, [
+            "/profile?idx=1&source=remote",
+            "/mode?type=intro&source=remote",
+            "/cmd?action=toggle_pitch_sign&source=remote",
+            "/power?action=on",
+            "/power?action=off",
+            "/cmd?action=remote_unlock",
+        ])
+
+    def test_remote_lock_blocks_other_sources(self):
+        thread = ElfControlThread(
+            StubNrf24ImuSource(), StubImu2Source(), StubUartArmSink(), ctrl_port=0
+        )
+        self.assertTrue(thread.set_mode("intro", source="remote"))
+        self.assertTrue(thread.is_remote_locked())
+        self.assertFalse(thread.set_mode("interview", source="vision"))
+        self.assertEqual(thread.get_mode(), "intro")
+        self.assertFalse(thread.set_arm_profile(ARM_PROFILE_MID_L3_40, source="voice"))
+        self.assertTrue(thread.set_mode("interview", source="remote"))
+        self.assertEqual(thread.get_mode(), "interview")
+        thread.unlock_remote_control()
+        self.assertTrue(thread.set_mode("face", source="vision"))
 
 
 if __name__ == "__main__":

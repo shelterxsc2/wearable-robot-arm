@@ -74,7 +74,9 @@ from camera_demo_elf_pipeline import (
     estimate_face_roi,
     estimate_hand_roi,
 )
-from elf_control_chain import make_elf_control_thread
+from elf_control_chain import (
+    make_elf_control_thread,
+)
 from system_init import init_bluetooth_hci, start_ble_remote, start_wifi_thread
 from lowlatency_streamer import (
     LowLatencyStreamer,
@@ -86,7 +88,6 @@ from lowlatency_streamer import (
 
 # Feed rule/mode inference transitions into arm control.
 ENABLE_RULE_MODE_CONTROL = True
-
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -568,6 +569,7 @@ class PostprocessorThread(threading.Thread):
     def _infer_rule_for_body_only(self, body_dets):
         if not body_dets:
             return None
+
         try:
             return self.rule_engine_state.infer(
                 self.pipeline, body_dets[0], None, self.img_w
@@ -575,21 +577,24 @@ class PostprocessorThread(threading.Thread):
         except Exception as e:
             print(f"[RuleEngine] scenario inference failed: {e}")
             return None
-
     def _handle_rule_mode_transition(self, curr_mode: int) -> None:
         prev_mode = self._prev_rule_mode
         self._prev_rule_mode = curr_mode
         if not ENABLE_RULE_MODE_CONTROL or prev_mode is None or self.elf_thread is None:
             return
+        if getattr(self.elf_thread, "is_remote_locked", lambda: False)():
+            return
 
         try:
+            target_mode = None
             if prev_mode == 0 and curr_mode == 1:
-                self.elf_thread.set_mode("intro")
-                print("[RuleCmd] mode0 -> mode1: intro")
+                target_mode = "intro"      # right hand raised
             elif prev_mode == 0 and curr_mode == 2:
-                self.elf_thread.set_mode("interview")
-                print("[RuleCmd] mode0 -> mode2: interview")
-            # mode2 -> mode0 does not automatically return to face mode.
+                target_mode = "interview"  # left hand raised
+            if target_mode is None:
+                return
+            if self.elf_thread.set_mode(target_mode, source="vision"):
+                print(f"[RuleCmd] mode0 -> mode{curr_mode}: {target_mode}")
         except Exception as e:
             print(f"[RuleCmd] transition {prev_mode}->{curr_mode} failed: {e}")
 
@@ -604,14 +609,10 @@ class PostprocessorThread(threading.Thread):
         ]
         hand_colors = [(255, 0, 0), (0, 255, 255)]
         for idx, roi in enumerate(hand_rois):
-            if not self._is_hand_above_shoulder(kps, idx):
-                continue
-            if roi is None:
+            if not self._is_hand_above_shoulder(kps, idx) or roi is None:
                 continue
             hand_result = detect_hand_landmarks(self.pipeline, frame, roi)
-            if hand_result is None:
-                continue
-            if hand_result["presence"] < HAND_CROP_MIN_PRESENCE:
+            if hand_result is None or hand_result["presence"] < HAND_CROP_MIN_PRESENCE:
                 continue
             draw_hand_landmarks(display, hand_result, color=hand_colors[idx])
             gesture = hand_result.get("gesture_label", "-")
@@ -621,9 +622,6 @@ class PostprocessorThread(threading.Thread):
                     display, f"Scenario hand: {gesture}", (10, 62),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
                 )
-            else:
-                # Scenario modes only accept OK as an escape-to-face command.
-                continue
 
     @staticmethod
     def _is_hand_above_shoulder(kps, hand_idx: int) -> bool:
@@ -830,9 +828,10 @@ def _report_third_person_before_view_mode(elf_thread, ll_streamer) -> None:
 
 def _set_mode_and_report_view(elf_thread, ll_streamer, mode: str, view_mode: int) -> None:
     _report_third_person_before_view_mode(elf_thread, ll_streamer)
-    elf_thread.set_mode(mode)
-    if ll_streamer is not None:
+    ok = elf_thread.set_mode(mode)
+    if ok and ll_streamer is not None:
         ll_streamer.report_view_mode(int(view_mode))
+    return bool(ok)
 
 
 def _profile_to_zoom(profile_idx: int) -> int:

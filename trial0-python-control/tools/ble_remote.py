@@ -18,7 +18,10 @@ Protocol
     CMD 0x02 VAL 0x01     scene = INTRO
     CMD 0x02 VAL 0x02     scene = INTERVIEW
     CMD 0x02 VAL 0x03     scene = BODY
-    CMD 0x03 VAL any      toggle head pitch sign
+    CMD 0x03 VAL any      toggle head pitch sign (locks remote control)
+    CMD 0x04 VAL 0x00     arm power on (does not lock)
+    CMD 0x04 VAL 0x01     arm power off (does not lock)
+    CMD 0x05 VAL 0x00     release remote-control lock
 
 Dependencies
 ------------
@@ -102,10 +105,10 @@ class BleRemoteListener:
         if cmd == 0x01:
             if val == 0x00:
                 print("[BLE-Remote] profile -> mid_l3_40")
-                self._http_post("/profile?idx=0")
+                self._http_post("/profile?idx=0&source=remote")
             elif val == 0x01:
                 print("[BLE-Remote] profile -> far_l3_55")
-                self._http_post("/profile?idx=1")
+                self._http_post("/profile?idx=1&source=remote")
             else:
                 print(f"[BLE-Remote] profile value 0x{val:02X} ignored")
 
@@ -119,13 +122,28 @@ class BleRemoteListener:
             mode = modes.get(val)
             if mode:
                 print(f"[BLE-Remote] scene -> {mode}")
-                self._http_post(f"/mode?type={mode}")
+                self._http_post(f"/mode?type={mode}&source=remote")
             else:
                 print(f"[BLE-Remote] scene value 0x{val:02X} ignored")
 
         elif cmd == 0x03:
             print("[BLE-Remote] toggle pitch sign")
-            self._http_post("/cmd?action=toggle_pitch_sign")
+            self._http_post("/cmd?action=toggle_pitch_sign&source=remote")
+
+        elif cmd == 0x04:
+            if val == 0x00:
+                print("[BLE-Remote] arm power on")
+                self._http_post("/power?action=on")
+            elif val == 0x01:
+                print("[BLE-Remote] arm power off")
+                self._http_post("/power?action=off")
+            else:
+                print(f"[BLE-Remote] power value 0x{val:02X} ignored")
+
+        elif cmd == 0x05 and val == 0x00:
+            print("[BLE-Remote] unlock multimodal control")
+            self._http_post("/cmd?action=remote_unlock")
+            self._active_non_idle = False
 
         else:
             print(f"[BLE-Remote] unknown command cmd=0x{cmd:02X} val=0x{val:02X}")

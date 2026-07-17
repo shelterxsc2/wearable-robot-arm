@@ -119,7 +119,12 @@ FIRST_PERSON_MIN_Y_CM = 15.0
 FIRST_PERSON_MAX_Y_CM = 55.0
 FIRST_PERSON_MIN_Z_CM = 5.0
 FIRST_PERSON_MAX_Z_CM = 35.0
+FIRST_PERSON_FORWARD_STEP_CM = 3.0
+FIRST_PERSON_LEFT_STEP_CM = 3.0
+FIRST_PERSON_UP_STEP_CM = 3.0
 FIRST_PERSON_BASE_J4_DEG = 10.0
+# Linear wrist-pitch compensation for the L3 endpoint height vector.
+FIRST_PERSON_J4_DEG_PER_Z_CM = 1.0
 FIRST_PERSON_BASE_J5_DEG = 180.0
 FIRST_PERSON_YAW_GAIN = 1.0
 FIRST_PERSON_PITCH_GAIN = 1.0
@@ -177,7 +182,8 @@ PNP_PITCH_CALIB_L3_40 = [
 ]
 PNP_PITCH_CALIB_L3_55 = [
     (-30.0, -4.9463), (-15.0, 1.0454), (0.0, -2.3915),
-    (15.0, -2.1471), (30.0, -5.5954),
+    # Previous values: (15.0, -2.1471), (30.0, -5.5954)
+    (15.0, 13.4265), (30.0, 17.1709),
 ]
 
 
@@ -250,10 +256,21 @@ ARM_PROFILES = [
 ]
 
 
-YAW_AXIS = np.array([+0.007, +0.017, -1.000], dtype=np.float32)
+YAW_AXIS = np.array([-0.033060, +0.019434, -0.999264], dtype=np.float32)
 YAW_AXIS /= np.linalg.norm(YAW_AXIS)
-PITCH_AXIS = np.array([-0.256, -0.967, +0.016], dtype=np.float32)
+PITCH_AXIS = np.array([+0.686274, +0.727293, -0.008561], dtype=np.float32)
 PITCH_AXIS /= np.linalg.norm(PITCH_AXIS)
+
+# False pitch measured while turning the head horizontally with the current
+# projection axes. Values outside the measured yaw range are clamped.
+PITCH_BIAS_BY_YAW = [
+    (-53.646, +6.517),
+    (-35.332, +4.707),
+    (-18.719, +1.818),
+    (0.000, 0.000),
+    (+28.276, -1.214),
+    (+46.974, -1.611),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +467,12 @@ def interp_table(table: List[Tuple[float, float]], x: float) -> float:
             ratio = (x - xs[i]) / (xs[i + 1] - xs[i])
             return ys[i] + ratio * (ys[i + 1] - ys[i])
     return ys[-1]
+
+
+def axisProjectionYawPitchCompensated(R: np.ndarray) -> Tuple[float, float]:
+    yaw_deg, pitch_deg = axisProjectionYawPitch(R)
+    pitch_bias_deg = interp_table(PITCH_BIAS_BY_YAW, yaw_deg)
+    return yaw_deg, pitch_deg - pitch_bias_deg
 
 
 # ---------------------------------------------------------------------------
@@ -1056,7 +1079,7 @@ class ControlContext(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def set_arm_profile(self, idx: int):
+    def set_arm_profile(self, idx: int, source: str = "local"):
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -1083,7 +1106,13 @@ class ControlContext(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def set_mode(self, mode: str):
+    def set_mode(self, mode: str, source: str = "local"):
+        raise NotImplementedError
+
+    def unlock_remote_control(self):
+        raise NotImplementedError
+
+    def lock_remote_control(self):
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -1145,8 +1174,9 @@ def _make_handler(context: ControlContext):
             elif path.startswith("/mode"):
                 t = q.get("type", "")
                 if t in ("face", "body", "intro", "interview", "first_person"):
-                    context.set_mode(t)
-                    self._send_json(200, {"ok": True, "mode": context.get_mode()})
+                    source = q.get("source", "local")
+                    ok = context.set_mode(t, source=source)
+                    self._send_json(200, {"ok": bool(ok), "mode": context.get_mode()})
                 else:
                     self._send_json(400, {"ok": False, "error": "invalid type"})
             elif path.startswith("/profile"):
@@ -1158,8 +1188,9 @@ def _make_handler(context: ControlContext):
                 if idx < 0 or idx >= len(ARM_PROFILES):
                     self._send_json(400, {"ok": False, "error": "invalid profile idx"})
                     return
-                context.set_arm_profile(idx)
-                self._send_json(200, {"ok": True, "profile_idx": idx})
+                source = q.get("source", "local")
+                ok = context.set_arm_profile(idx, source=source)
+                self._send_json(200, {"ok": bool(ok), "profile_idx": idx})
             elif path.startswith("/power"):
                 action = q.get("action", "")
                 if action == "on":
@@ -1198,13 +1229,22 @@ def _make_handler(context: ControlContext):
                     self._send_json(400, {"ok": False, "error": "missing k1 or k2"})
             elif path.startswith("/cmd"):
                 action = q.get("action", "")
-                if action == "rebaseline":
+                source = q.get("source", "local")
+                if action == "remote_unlock":
+                    context.unlock_remote_control()
+                    self._send_json(200, {"ok": True, "remote_locked": False})
+                elif action == "remote_lock":
+                    context.lock_remote_control()
+                    self._send_json(200, {"ok": True, "remote_locked": True})
+                elif action == "rebaseline":
                     context.request_rebaseline()
                     self._send_json(200, {"ok": True, "action": "rebaseline"})
                 elif action == "head_center":
                     context.request_head_center()
                     self._send_json(200, {"ok": True, "action": "head_center"})
                 elif action == "toggle_pitch_sign":
+                    if source == "remote":
+                        context.lock_remote_control()
                     context.toggle_pitch_sign()
                     self._send_json(200, {"ok": True, "action": "toggle_pitch_sign"})
                 elif action == "nrf24_reset":
@@ -1359,6 +1399,7 @@ class Nrf24Controller:
             "target_x": FIRST_PERSON_BASE_X_CM,
             "target_y": FIRST_PERSON_BASE_Y_CM,
             "target_z": FIRST_PERSON_BASE_Z_CM,
+            "head_pitch": 0.0,
         }
 
         # Calibration state
@@ -1375,6 +1416,7 @@ class Nrf24Controller:
             "pnp_target_idx": -1,
             "pnp_phase": 0,  # 0=inactive, 1=prepare, 2=sample, 3=complete
             "pnp_phase_start_us": 0,
+            "pnp_last_sent_idx": -1,
             "grid_target_idx": -1,
             "grid_phase": 0,
             "grid_phase_start_us": 0,
@@ -1506,18 +1548,20 @@ class Nrf24Controller:
         is_yaw = csv_path.endswith("yaw_calib.csv")
         key = "pnp_yaw_accum" if is_yaw else "pnp_pitch_accum"
 
+        # A completed calibration remains stopped until mode 0 resets it.
+        if phase == 3:
+            return None
+
         if idx < 0:
             idx = 0
             phase = 1
             st["pnp_target_idx"] = idx
             st["pnp_phase"] = phase
             st["pnp_phase_start_us"] = now_us
+            st["pnp_last_sent_idx"] = -1
             st[key] = []
             print(f"[PnP-Calib] Moving arm through {'yaw' if is_yaw else 'pitch'} targets, "
                   f"{len(targets)} points")
-
-        if phase == 3:
-            return None
 
         target_deg = targets[idx]
         elapsed = now_us - st["pnp_phase_start_us"]
@@ -1534,17 +1578,22 @@ class Nrf24Controller:
             self._write_pnp_csv(csv_path, target_deg, avg, len(accum), is_yaw)
             idx += 1
             if idx >= len(targets):
-                phase = 3
-                st["pnp_phase"] = phase
-                st["pnp_target_idx"] = -1
-                print(f"[PnP-Calib] All targets complete")
-            else:
-                phase = 1
-                st["pnp_phase"] = phase
-                st["pnp_target_idx"] = idx
-                st["pnp_phase_start_us"] = now_us
-                print(f"[PnP-Calib] next target {targets[idx]:+d} PREPARE")
+                st["pnp_phase"] = 3
+                st["pnp_target_idx"] = len(targets)
+                print("[PnP-Calib] All targets complete")
+                return None
+            phase = 1
+            st["pnp_phase"] = phase
+            st["pnp_target_idx"] = idx
+            st["pnp_phase_start_us"] = now_us
+            print(f"[PnP-Calib] next target {targets[idx]:+d} PREPARE")
 
+        # Send exactly once on entry to each target; repeated sends restart the
+        # lower controller speed plan and can make the physical arm oscillate.
+        if st.get("pnp_last_sent_idx", -1) == idx:
+            return None
+        st["pnp_last_sent_idx"] = idx
+        target_deg = targets[idx]
         tx, ty, tz, servo2, servo1 = kinematics(target_deg, profile)
         self.arm_target_yaw = target_deg if is_yaw else 0.0
         self.arm_target_pitch = target_deg if not is_yaw else 0.0
@@ -1714,6 +1763,7 @@ class Nrf24Controller:
             if self._calib_state.get("pnp_target_idx", -1) >= 0:
                 self._calib_state["pnp_target_idx"] = -1
                 self._calib_state["pnp_phase"] = 0
+                self._calib_state["pnp_last_sent_idx"] = -1
             if self._calib_state.get("grid_target_idx", -1) >= 0:
                 self._calib_state["grid_target_idx"] = -1
                 self._calib_state["grid_phase"] = 0
@@ -1736,6 +1786,9 @@ class Nrf24Controller:
         st["target_x"] = clamp(float(x), FIRST_PERSON_MIN_X_CM, FIRST_PERSON_MAX_X_CM)
         st["target_y"] = clamp(float(y), FIRST_PERSON_MIN_Y_CM, FIRST_PERSON_MAX_Y_CM)
         st["target_z"] = clamp(float(z), FIRST_PERSON_MIN_Z_CM, FIRST_PERSON_MAX_Z_CM)
+        j4_base = FIRST_PERSON_BASE_J4_DEG + FIRST_PERSON_J4_DEG_PER_Z_CM * (st["target_z"] - FIRST_PERSON_BASE_Z_CM)
+        pitch_control_deg = self.head_pitch_control_sign * st.get("head_pitch", 0.0)
+        st["last_j4"] = clamp(j4_base - FIRST_PERSON_PITCH_GAIN * pitch_control_deg, -90.0, 90.0)
         print(
             f"[FirstPerson] target xyz set: x={st['target_x']:.1f} "
             f"y={st['target_y']:.1f} z={st['target_z']:.1f}"
@@ -1743,14 +1796,14 @@ class Nrf24Controller:
         return self._make_first_person_current_command()
 
     def set_first_person_discrete_target(self, x: int, y: int, z: int) -> Dict[str, Any]:
-        """Map cloud D-pad values (-5..5) to first-person camera coordinates."""
+        """Map cloud input: +x forward, +y left, +z up (each -5..5)."""
         xi = int(clamp(int(x), -5, 5))
         yi = int(clamp(int(y), -5, 5))
         zi = int(clamp(int(z), -5, 5))
         return self.set_first_person_target(
-            FIRST_PERSON_BASE_X_CM + xi * 3.0,
-            FIRST_PERSON_BASE_Y_CM + yi * 5.0,
-            FIRST_PERSON_BASE_Z_CM + zi * 3.0,
+            FIRST_PERSON_BASE_X_CM - yi * FIRST_PERSON_LEFT_STEP_CM,
+            FIRST_PERSON_BASE_Y_CM + xi * FIRST_PERSON_FORWARD_STEP_CM,
+            FIRST_PERSON_BASE_Z_CM + zi * FIRST_PERSON_UP_STEP_CM,
         )
 
     def _make_first_person_current_command(self) -> Dict[str, Any]:
@@ -1811,17 +1864,18 @@ class Nrf24Controller:
 
     def _make_first_person_initial_command(self) -> Dict[str, Any]:
         st = self._first_person_state
-        st["last_j4"] = FIRST_PERSON_BASE_J4_DEG
+        st.setdefault("target_z", FIRST_PERSON_BASE_Z_CM)
+        st["head_pitch"] = 0.0
+        st["last_j4"] = clamp(FIRST_PERSON_BASE_J4_DEG + FIRST_PERSON_J4_DEG_PER_Z_CM * (st["target_z"] - FIRST_PERSON_BASE_Z_CM), -90.0, 90.0)
         st["last_j5"] = FIRST_PERSON_BASE_J5_DEG
         st["last_send_us"] = 0
         st.setdefault("target_x", FIRST_PERSON_BASE_X_CM)
         st.setdefault("target_y", FIRST_PERSON_BASE_Y_CM)
-        st.setdefault("target_z", FIRST_PERSON_BASE_Z_CM)
         self.arm_target_yaw = 0.0
         self.arm_target_pitch = 0.0
         print(f"[FirstPerson] initial pose: x={st['target_x']:.1f} "
               f"y={st['target_y']:.1f} z={st['target_z']:.1f} "
-              f"J5={FIRST_PERSON_BASE_J5_DEG:.1f} J4={FIRST_PERSON_BASE_J4_DEG:.1f}")
+              f"J5={FIRST_PERSON_BASE_J5_DEG:.1f} J4={st['last_j4']:.1f}")
         return self._make_first_person_current_command()
 
     def _update_first_person_control(self, vec_yaw: float, vec_pitch: float,
@@ -1829,7 +1883,8 @@ class Nrf24Controller:
         st = self._first_person_state
         pitch_control_deg = self.head_pitch_control_sign * vec_pitch
         j5 = clamp(FIRST_PERSON_BASE_J5_DEG + FIRST_PERSON_YAW_GAIN * vec_yaw, 0.0, 270.0)
-        j4 = clamp(FIRST_PERSON_BASE_J4_DEG - FIRST_PERSON_PITCH_GAIN * pitch_control_deg, -90.0, 90.0)
+        j4_base = FIRST_PERSON_BASE_J4_DEG + FIRST_PERSON_J4_DEG_PER_Z_CM * (st.get("target_z", FIRST_PERSON_BASE_Z_CM) - FIRST_PERSON_BASE_Z_CM)
+        j4 = clamp(j4_base - FIRST_PERSON_PITCH_GAIN * pitch_control_deg, -90.0, 90.0)
         first = st.get("first", True)
         changed = (
             abs(j5 - st.get("last_j5", FIRST_PERSON_BASE_J5_DEG)) >= FIRST_PERSON_SERVO_DEADBAND_DEG
@@ -1843,6 +1898,7 @@ class Nrf24Controller:
         st["last_send_us"] = now_us
         st["last_j4"] = j4
         st["last_j5"] = j5
+        st["head_pitch"] = vec_pitch
         self.arm_target_yaw = vec_yaw
         self.arm_target_pitch = vec_pitch
         return {
@@ -2281,9 +2337,9 @@ class Nrf24Controller:
 
         if self.head_center_set and self.R_head_center_rel is not None:
             R_centered = self.R_head_center_rel.T @ R_rel
-            vec_yaw, vec_pitch = axisProjectionYawPitch(R_centered)
+            vec_yaw, vec_pitch = axisProjectionYawPitchCompensated(R_centered)
         else:
-            vec_yaw, vec_pitch = axisProjectionYawPitch(R_rel)
+            vec_yaw, vec_pitch = axisProjectionYawPitchCompensated(R_rel)
         return vec_yaw, vec_pitch
 
     def update(self, head_imu: Optional[Dict[str, Any]], imu2: Dict[str, Any],
@@ -2346,9 +2402,9 @@ class Nrf24Controller:
             rel_roll, rel_pitch, rel_yaw = matToEulerZYX(R_rel)
             if self.head_center_set and self.R_head_center_rel is not None:
                 R_centered = self.R_head_center_rel.T @ R_rel
-                vec_yaw, vec_pitch = axisProjectionYawPitch(R_centered)
+                vec_yaw, vec_pitch = axisProjectionYawPitchCompensated(R_centered)
             else:
-                vec_yaw, vec_pitch = axisProjectionYawPitch(R_rel)
+                vec_yaw, vec_pitch = axisProjectionYawPitchCompensated(R_rel)
 
         # ----- Relative angular rates from differentiated vec angles -----
         rel_pitch_rate = wy
@@ -2713,6 +2769,7 @@ class ElfControlThread(threading.Thread, ControlContext):
         self._auto_first_person_done = False
         self._shutdown_in_progress = False
         self._voice_power_off_deadline = 0.0
+        self._remote_control_locked = False
 
     def put_pnp_correction(self, yaw_correction: float, pitch_correction: float,
                            valid: bool = True):
@@ -2732,13 +2789,33 @@ class ElfControlThread(threading.Thread, ControlContext):
     def toggle_pitch_sign(self):
         self.controller.toggle_pitch_sign()
 
-    def set_arm_profile(self, idx: int):
+    def set_arm_profile(self, idx: int, source: str = "local") -> bool:
+        if self._remote_control_locked and source != "remote":
+            print(f"[RemoteLock] blocked profile change from {source}")
+            return False
         self.controller.set_arm_profile(idx)
+        if source == "remote":
+            self._remote_control_locked = True
+        return True
+
+    def lock_remote_control(self):
+        self._remote_control_locked = True
+        print("[RemoteLock] locked by remote")
+
+    def unlock_remote_control(self):
+        self._remote_control_locked = False
+        print("[RemoteLock] unlocked by remote")
+
+    def is_remote_locked(self) -> bool:
+        return self._remote_control_locked
 
     def set_calib_mode(self, mode: int):
         self.controller.set_calib_mode(mode)
 
     def set_first_person_discrete_target(self, x: int, y: int, z: int) -> bool:
+        if self._remote_control_locked:
+            print("[RemoteLock] blocked first-person target")
+            return False
         cmd = self.controller.set_first_person_discrete_target(x, y, z)
         if self.controller.pose_mode != "first_person":
             self.set_mode("first_person")
@@ -2924,13 +3001,19 @@ class ElfControlThread(threading.Thread, ControlContext):
         self.uart_sink.send_arm_target(tx, ty, tz, k1, k2, 0x01)
         print(f"[Ctrl] Servo test frame sent k1={k1} k2={k2}")
 
-    def set_mode(self, mode: str):
+    def set_mode(self, mode: str, source: str = "local") -> bool:
+        if self._remote_control_locked and source != "remote":
+            print(f"[RemoteLock] blocked mode={mode} from {source}")
+            return False
         home_cmd = self.controller.set_pose_mode(mode)
+        if source == "remote":
+            self._remote_control_locked = True
         if home_cmd is not None and self.uart_sink.arm_powered:
             self.uart_sink.send_arm_target(
                 home_cmd["x"], home_cmd["y"], home_cmd["z"],
                 home_cmd["servo2"], home_cmd["servo1"], home_cmd["flag"]
             )
+        return True
 
     def switch_stream_mode(self, mode: str) -> Dict[str, Any]:
         reporter = getattr(self, "cloud_reporter", None)
@@ -2968,6 +3051,7 @@ class ElfControlThread(threading.Thread, ControlContext):
                 "arm_target_yaw": round(c.arm_target_yaw, 2),
                 "arm_target_pitch": round(c.arm_target_pitch, 2),
                 "pose_mode": c.pose_mode,
+                "remote_control_locked": self._remote_control_locked,
                 "head_stationary": c.head_stationary,
                 "arm_stable": c.arm_stable,
                 "head_center_set": c.head_center_set,
@@ -2990,8 +3074,8 @@ class ElfControlThread(threading.Thread, ControlContext):
         self.imu2_source.start()
         self.uart_sink.start()
 
-        # Default startup leaves the arm powered off.  The FF AA verification
-        # frame is sent only after an explicit power_on command/voice trigger.
+        # Startup remains powered off.  Voice or HTTP power-on runs the safe
+        # homing and A-init sequence before normal arm commands are unblocked.
         if self.uart_sink.init_success:
             print("[UART-Handshake] init_success received; arm remains powered off")
         else:
@@ -3090,7 +3174,8 @@ class ElfControlThread(threading.Thread, ControlContext):
         )
 
         if cmd is not None and self.uart_sink.arm_powered:
-            info = cmd["info"]
+            # Calibration/scenario commands intentionally have no diagnostic
+            # "info" payload; only the wire fields below are mandatory.
             flag = cmd["flag"]
             ok = self.uart_sink.send_arm_target(
                 cmd["x"], cmd["y"], cmd["z"],
